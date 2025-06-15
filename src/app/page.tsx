@@ -1,102 +1,90 @@
-import Image from "next/image";
+import Link from "next/link";
 
 export default function Home() {
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+      <main className="container mx-auto px-4 py-16">
+        <div className="text-center max-w-4xl mx-auto">
+          {/* Header */}
+          <h1 className="text-5xl font-bold text-gray-900 mb-6">
+            AI-Powered Audio Transcription
+          </h1>
+          <p className="text-xl text-gray-600 mb-8 leading-relaxed">
+            Real-time speech-to-text transcription using OpenAI&apos;s latest 
+            GPT-4o transcribe models. Stream audio directly from your browser 
+            and get instant, accurate transcriptions.
+          </p>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+          {/* Features */}
+          <div className="grid md:grid-cols-2 gap-8 my-12">
+            <div className="bg-white p-6 rounded-lg shadow-md">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">
+                GPT-4o Mini Transcribe
+              </h3>
+              <p className="text-gray-600 mb-4">
+                Fast and cost-effective transcription at ~$0.003 per minute. 
+                Perfect for everyday use and high-volume applications.
+              </p>
+              <div className="text-green-600 font-semibold">50% cheaper than Whisper</div>
+            </div>
+            
+            <div className="bg-white p-6 rounded-lg shadow-md">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">
+                GPT-4o Transcribe
+              </h3>
+              <p className="text-gray-600 mb-4">
+                Premium accuracy transcription at ~$0.006 per minute. 
+                Lower word error rate for professional applications.
+              </p>
+              <div className="text-blue-600 font-semibold">Higher accuracy & multilingual</div>
+            </div>
+          </div>
+
+          {/* CTA */}
+          <div className="space-y-4">
+            <Link
+              href="/recorder"
+              className="inline-block bg-blue-600 hover:bg-blue-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
+            >
+              Start Recording →
+            </Link>
+            <p className="text-sm text-gray-500">
+              No signup required. Just add your OpenAI API key to get started.
+            </p>
+          </div>
+
+          {/* Technical Features */}
+          <div className="mt-16 bg-white p-8 rounded-lg shadow-md">
+            <h2 className="text-2xl font-bold text-gray-900 mb-6">Features</h2>
+            <div className="grid md:grid-cols-3 gap-6 text-left">
+              <div>
+                <h4 className="font-semibold text-gray-900 mb-2">Real-time Streaming</h4>
+                <p className="text-gray-600 text-sm">
+                  Audio is streamed directly to OpenAI for processing as you speak
+                </p>
+              </div>
+              <div>
+                <h4 className="font-semibold text-gray-900 mb-2">Browser-based</h4>
+                <p className="text-gray-600 text-sm">
+                  No downloads required. Works in any modern web browser
+                </p>
+              </div>
+              <div>
+                <h4 className="font-semibold text-gray-900 mb-2">Secure</h4>
+                <p className="text-gray-600 text-sm">
+                  API keys are handled server-side for maximum security
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
+      
+      <footer className="py-8 text-center text-gray-500 text-sm">
+        <p>
+          Built with Next.js and OpenAI API. 
+          Configure your API key in <code className="bg-gray-100 px-1 rounded">.env.local</code>
+        </p>
       </footer>
     </div>
   );
