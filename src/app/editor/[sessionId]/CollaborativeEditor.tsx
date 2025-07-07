@@ -41,8 +41,8 @@ export default function CollaborativeEditor({ sessionId }: CollaborativeEditorPr
       setIsConnected(false);
     });
 
-    wsProvider.on('connection-error', (error: Error) => {
-      console.error('[WebSocket Provider] Connection error:', error);
+    wsProvider.on('connection-error', (event: Event) => {
+      console.error('[WebSocket Provider] Connection error:', event);
       setIsConnected(false);
     });
 
@@ -81,12 +81,12 @@ export default function CollaborativeEditor({ sessionId }: CollaborativeEditorPr
   });
 
   // Initialize TipTap editor only when provider is fully ready
-  const editor = useEditor(
-    isEditorReady && provider ? {
-      extensions: [
-        StarterKit.configure({
-          history: false, // Disable history for collaboration
-        }),
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({
+        history: false, // Disable history for collaboration
+      }),
+      ...(isEditorReady && provider ? [
         Collaboration.configure({
           document: ydoc,
         }),
@@ -94,20 +94,19 @@ export default function CollaborativeEditor({ sessionId }: CollaborativeEditorPr
           provider: provider,
           user: userInfo,
         }),
-      ],
-      content: `
-        <h2>共同編集画面へようこそ</h2>
-        <p>この画面では複数の人が同時に文書を編集できます。</p>
-        <p>リアルタイム文字起こしの結果がここに表示され、みんなで編集・修正できます。</p>
-      `,
-      editorProps: {
-        attributes: {
-          class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
-        },
+      ] : []),
+    ],
+    content: `
+      <h2>共同編集画面へようこそ</h2>
+      <p>この画面では複数の人が同時に文書を編集できます。</p>
+      <p>リアルタイム文字起こしの結果がここに表示され、みんなで編集・修正できます。</p>
+    `,
+    editorProps: {
+      attributes: {
+        class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
       },
-    } : null,
-    [provider, isEditorReady, ydoc, userInfo]
-  );
+    },
+  }, [provider, isEditorReady, ydoc, userInfo]);
 
   // Listen for transcription data from realtime page
   useEffect(() => {
