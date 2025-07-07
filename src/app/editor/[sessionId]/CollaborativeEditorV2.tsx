@@ -38,8 +38,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       setIsConnected(false);
     });
 
-    wsProvider.on('connection-error', (error: Error) => {
-      console.error('[WebSocket Provider V2] Connection error:', error);
+    wsProvider.on('connection-error', (event: Event) => {
+      console.error('[WebSocket Provider V2] Connection error:', event);
       setIsConnected(false);
     });
 
