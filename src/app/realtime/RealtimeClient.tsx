@@ -68,7 +68,7 @@ type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage;
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | AudioWorkletNode | null>(null);
   const recordingStateRef = useRef<boolean>(false);
   
   const [text, setText] = useState("");
@@ -218,7 +218,7 @@ export default function RealtimeClient() {
                     const ydoc = new Y.Doc();
                     const provider = new WebsocketProvider('wss://demos.yjs.dev/ws', currentSessionId, ydoc);
                     
-                    provider.on('status', (event: any) => {
+                    provider.on('status', (event: { status: string }) => {
                       console.log('[Realtime] Yjs status:', event.status);
                       if (event.status === 'connected') {
                         // Get the prosemirror fragment
@@ -445,7 +445,7 @@ export default function RealtimeClient() {
         }
         
         const pcm16 = floatTo16BitPCM(processedData);
-        const base64Audio = arrayBufferToBase64(pcm16.buffer);
+        const base64Audio = arrayBufferToBase64(pcm16.buffer as ArrayBuffer);
 
         // Log audio data size and validation
         if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
@@ -538,7 +538,7 @@ export default function RealtimeClient() {
     if (processorRef.current) {
       console.log('[Audio] 🔌 Disconnecting audio processor');
       // If it's an AudioWorkletNode, send stop message
-      if (processorRef.current.port) {
+      if ('port' in processorRef.current && processorRef.current.port) {
         processorRef.current.port.postMessage({ type: 'stop' });
       }
       processorRef.current.disconnect();
