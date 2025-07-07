@@ -1,22 +1,24 @@
 # AI-Powered Audio Transcription
 
-A real-time audio transcription application built with Next.js 14 and OpenAI's latest GPT-4o transcribe models. Stream audio directly from your browser and get instant, accurate transcriptions with server-side API key management for security.
+A comprehensive audio transcription application built with Next.js 14 and OpenAI's latest models. Supports both batch processing and real-time streaming transcription with server-side API key management for security.
 
 ## Features
 
-- **Real-time Streaming**: Audio is processed as you speak using browser MediaRecorder API
-- **Multiple Models**: Choose between GPT-4o Mini (faster/cheaper) and GPT-4o (higher accuracy)
+- **Dual Modes**: Choose between batch processing or real-time streaming
+- **Multiple Models**: Support for both transcribe and realtime API models
 - **Browser-based**: No downloads required, works in any modern web browser
 - **Secure**: API keys are handled server-side for maximum security
-- **Cost-effective**: GPT-4o Mini is 50% cheaper than traditional Whisper models
+- **WebSocket Streaming**: True real-time audio streaming with instant transcription
 - **Responsive UI**: Clean, mobile-friendly interface built with Tailwind CSS
 
 ## Model Comparison
 
-| Model | Cost/minute | Features |
-|-------|-------------|----------|
-| GPT-4o Mini Transcribe | ~$0.003 | Fast, cost-effective, good for high-volume |
-| GPT-4o Transcribe | ~$0.006 | Higher accuracy, better multilingual support |
+| Model | Cost/minute | Type | Features |
+|-------|-------------|------|----------|
+| GPT-4o Mini Transcribe | ~$0.003 | Batch | Fast, cost-effective, good for high-volume |
+| GPT-4o Transcribe | ~$0.006 | Batch | Higher accuracy, better multilingual support |
+| GPT-4o Mini Realtime | ~$0.06 input / $0.24 output | Streaming | Real-time processing, instant results |
+| GPT-4o Realtime | ~$0.06 input / $0.24 output | Streaming | Premium real-time with highest accuracy |
 
 ## Prerequisites
 
@@ -32,8 +34,8 @@ A real-time audio transcription application built with Next.js 14 and OpenAI's l
    npx create-next-app@latest my-transcription-app --typescript --tailwind --eslint --app --use-npm --src-dir
    cd my-transcription-app
    
-   # Install OpenAI SDK
-   npm install openai
+   # Install dependencies
+   npm install openai ws @types/ws
    ```
 
 2. **Configure environment variables:**
@@ -50,17 +52,37 @@ A real-time audio transcription application built with Next.js 14 and OpenAI's l
    ```bash
    npm run dev
    ```
+   
+   Note: This uses a custom server with WebSocket support for real-time functionality.
 
 4. **Open your browser:**
    Navigate to [http://localhost:3000](http://localhost:3000)
 
 ## Usage
 
-1. **Select Model**: Choose between GPT-4o Mini (faster/cheaper) or GPT-4o (higher accuracy)
+The application offers two transcription modes:
+
+### Batch Processing Mode (`/recorder`)
+- Record audio and process when recording stops
+- More cost-effective for longer recordings
+- Uses standard file upload
+
+1. **Select Model**: Choose between GPT-4o Mini (~$0.003/min) or GPT-4o (~$0.006/min)
 2. **Start Recording**: Click "Start Recording" and allow microphone access
 3. **Speak**: Talk clearly into your microphone
-4. **Real-time Results**: Watch transcription appear in real-time
-5. **Stop Recording**: Click "Stop Recording" when finished
+4. **Stop Recording**: Click "Stop Recording" when finished
+5. **Processing**: Wait for transcription to complete
+
+### Real-time Streaming Mode (`/realtime`)
+- True streaming transcription as you speak
+- Higher cost but instant results
+- Uses WebSocket connection
+
+1. **Connect**: Establish WebSocket connection to Realtime API
+2. **Select Model**: Choose between realtime models (~$0.06-0.24/min)
+3. **Start Streaming**: Begin real-time audio streaming
+4. **Speak**: See transcription appear instantly as you talk
+5. **Stop Streaming**: End the real-time session
 
 ## API Endpoints
 

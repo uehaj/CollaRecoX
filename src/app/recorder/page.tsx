@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef, useState, useCallback } from "react";
+import React, { useRef, useState, useCallback, useEffect } from "react";
 
 type TranscriptionModel = "gpt-4o-mini-transcribe" | "gpt-4o-transcribe";
 
@@ -11,6 +11,8 @@ export default function RecorderPage() {
   const [model, setModel] = useState<TranscriptionModel>("gpt-4o-mini-transcribe");
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
 
   // Function to process audio blob after recording stops
   const processAudioBlob = useCallback(async (audioBlob: Blob) => {
@@ -67,19 +69,57 @@ export default function RecorderPage() {
     }
   }, [model]);
 
+  // Get available audio input devices
+  const getAudioDevices = useCallback(async () => {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices) {
+        return;
+      }
+
+      // Request permission first
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Get all devices
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter(device => device.kind === 'audioinput');
+      
+      setAudioDevices(audioInputs);
+      
+      // Set default device if none selected
+      if (audioInputs.length > 0 && !selectedDeviceId) {
+        setSelectedDeviceId(audioInputs[0].deviceId);
+      }
+    } catch (error) {
+      console.error('Error getting audio devices:', error);
+      setError('Failed to access audio devices. Please grant microphone permission.');
+    }
+  }, [selectedDeviceId]);
+
+  // Load audio devices on component mount
+  useEffect(() => {
+    getAudioDevices();
+  }, [getAudioDevices]);
+
   const startRecording = useCallback(async () => {
     try {
       setError(null);
       setText("");
       
       // Request microphone access
+      const audioConstraints: MediaStreamConstraints['audio'] = {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+      };
+
+      // Use selected device if available
+      if (selectedDeviceId) {
+        (audioConstraints as MediaTrackConstraints).deviceId = { exact: selectedDeviceId };
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        } 
+        audio: audioConstraints
       });
 
       // Check if browser supports the preferred audio format
@@ -152,7 +192,7 @@ export default function RecorderPage() {
       setIsRecording(false);
       setIsProcessing(false);
     }
-  }, [processAudioBlob]);
+  }, [processAudioBlob, selectedDeviceId]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecording) {
@@ -197,6 +237,45 @@ export default function RecorderPage() {
               GPT-4o Transcribe (~$0.006/min - Higher Accuracy)
             </option>
           </select>
+        </div>
+
+        {/* Audio Input Device Selection */}
+        <div className="bg-white p-6 rounded-lg shadow-md">
+          <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
+            Select Audio Input Device:
+          </label>
+          <select
+            id="device-select"
+            value={selectedDeviceId}
+            onChange={(e) => setSelectedDeviceId(e.target.value)}
+            disabled={isRecording}
+            className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+          >
+            {audioDevices.length === 0 ? (
+              <option value="">Loading devices...</option>
+            ) : (
+              audioDevices.map((device) => (
+                <option key={device.deviceId} value={device.deviceId}>
+                  {device.label || `Microphone ${device.deviceId.slice(0, 8)}...`}
+                </option>
+              ))
+            )}
+          </select>
+          <div className="mt-2 flex items-center space-x-2">
+            <button
+              onClick={getAudioDevices}
+              disabled={isRecording}
+              className="px-3 py-1 text-sm bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Refresh Devices
+            </button>
+            <p className="text-xs text-gray-500">
+              {audioDevices.length} device(s) found
+            </p>
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            Note: Input device can only be changed when not recording
+          </p>
         </div>
 
         {/* Controls */}
