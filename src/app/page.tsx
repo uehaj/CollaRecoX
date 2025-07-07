@@ -16,16 +16,16 @@ export default function Home() {
           </p>
 
           {/* Features */}
-          <div className="grid md:grid-cols-2 gap-8 my-12">
+          <div className="grid md:grid-cols-3 gap-6 my-12">
             <div className="bg-white p-6 rounded-lg shadow-md">
               <h3 className="text-lg font-semibold text-gray-900 mb-3">
                 GPT-4o Mini Transcribe
               </h3>
               <p className="text-gray-600 mb-4">
-                Fast and cost-effective transcription at ~$0.003 per minute. 
+                Fast and cost-effective batch transcription at ~$0.003 per minute. 
                 Perfect for everyday use and high-volume applications.
               </p>
-              <div className="text-green-600 font-semibold">50% cheaper than Whisper</div>
+              <div className="text-green-600 font-semibold">Most affordable option</div>
             </div>
             
             <div className="bg-white p-6 rounded-lg shadow-md">
@@ -33,21 +33,40 @@ export default function Home() {
                 GPT-4o Transcribe
               </h3>
               <p className="text-gray-600 mb-4">
-                Premium accuracy transcription at ~$0.006 per minute. 
+                Premium accuracy batch transcription at ~$0.006 per minute. 
                 Lower word error rate for professional applications.
               </p>
               <div className="text-blue-600 font-semibold">Higher accuracy & multilingual</div>
             </div>
+
+            <div className="bg-white p-6 rounded-lg shadow-md border-2 border-orange-200">
+              <h3 className="text-lg font-semibold text-gray-900 mb-3">
+                Realtime API
+              </h3>
+              <p className="text-gray-600 mb-4">
+                True real-time streaming transcription at ~$0.06-0.24 per minute. 
+                Instant results as you speak.
+              </p>
+              <div className="text-orange-600 font-semibold">Premium real-time</div>
+            </div>
           </div>
 
           {/* CTA */}
-          <div className="space-y-4">
-            <Link
-              href="/recorder"
-              className="inline-block bg-blue-600 hover:bg-blue-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
-            >
-              Start Recording →
-            </Link>
+          <div className="space-y-6">
+            <div className="flex flex-col sm:flex-row gap-4 justify-center">
+              <Link
+                href="/recorder"
+                className="inline-block bg-blue-600 hover:bg-blue-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
+              >
+                Batch Recording →
+              </Link>
+              <Link
+                href="/realtime"
+                className="inline-block bg-orange-600 hover:bg-orange-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
+              >
+                Real-time Streaming →
+              </Link>
+            </div>
             <p className="text-sm text-gray-500">
               No signup required. Just add your OpenAI API key to get started.
             </p>
