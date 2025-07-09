@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "NODE_ENV=production node server.js",
     "next-dev": "next dev",
-    "lint": "next lint"
+    "lint": "next lint",
+    "server": "node server.js -p 5001",
+    "server:prod": "NODE_ENV=production node server.js -p 5001"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
