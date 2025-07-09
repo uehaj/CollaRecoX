@@ -216,7 +216,7 @@ export default function RealtimeClient() {
                 import('yjs').then(Y => {
                   import('y-websocket').then(({ WebsocketProvider }) => {
                     const ydoc = new Y.Doc();
-                    const provider = new WebsocketProvider('wss://demos.yjs.dev/ws', currentSessionId, ydoc);
+                    const provider = new WebsocketProvider(`ws://localhost:5001/api/yjs-ws?sessionId=${currentSessionId}`, `transcribe-editor-${currentSessionId}`, ydoc);
                     
                     provider.on('status', (event: { status: string }) => {
                       console.log('[Realtime] Yjs status:', event.status);
