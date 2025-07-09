@@ -3,6 +3,8 @@ const { parse } = require('url');
 const next = require('next');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
+const Y = require('yjs');
+const { setupWSConnection } = require('y-websocket/bin/utils');
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
@@ -23,12 +25,21 @@ app.prepare().then(() => {
     }
   });
 
+  // Create YJS WebSocket server
+  const yjsWss = new WebSocketServer({ 
+    server,
+    path: '/api/yjs-ws'
+  });
+
   // Handle WebSocket upgrades properly
   server.on('upgrade', (request, socket, head) => {
     const pathname = parse(request.url).pathname;
     
     if (pathname === '/api/realtime-ws') {
-      // Let our WebSocket server handle this
+      // Let realtime WebSocket server handle this
+      return;
+    } else if (pathname === '/api/yjs-ws') {
+      // Let YJS WebSocket server handle this
       return;
     } else if (pathname === '/_next/webpack-hmr') {
       // Let Next.js handle HMR WebSocket
@@ -481,9 +492,30 @@ app.prepare().then(() => {
     });
   });
 
+  // Handle YJS WebSocket connections
+  yjsWss.on('connection', (ws, request) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    const sessionId = url.searchParams.get('sessionId') || 'default';
+    
+    console.log(`YJS client connected to session: ${sessionId}`);
+    
+    // Setup YJS WebSocket connection with session-specific document name
+    const docName = `transcribe-editor-${sessionId}`;
+    setupWSConnection(ws, request, { docName });
+    
+    ws.on('close', () => {
+      console.log(`YJS client disconnected from session: ${sessionId}`);
+    });
+    
+    ws.on('error', (error) => {
+      console.error(`YJS WebSocket error for session ${sessionId}:`, error);
+    });
+  });
+
   server.listen(port, (err) => {
     if (err) throw err;
     console.log(`> Ready on http://${hostname}:${port}`);
     console.log(`> WebSocket server ready on ws://${hostname}:${port}/api/realtime-ws`);
+    console.log(`> YJS WebSocket server ready on ws://${hostname}:${port}/api/yjs-ws`);
   });
 });
