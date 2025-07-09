@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node server.js -p 5001",
+    "dev": "node server.js -h 0.0.0.0 -p 8000",
     "build": "next build",
-    "start": "NODE_ENV=production node server.js",
+    "start": "PORT=8000 NODE_ENV=production node server.js -h 0.0.0.0 -p 8000",
     "next-dev": "next dev",
     "lint": "next lint",
     "server": "node server.js -p 5001",

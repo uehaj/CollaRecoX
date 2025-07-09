@@ -7,8 +7,8 @@ const Y = require('yjs');
 const { setupWSConnection } = require('y-websocket/bin/utils');
 
 const dev = process.env.NODE_ENV !== 'production';
-const hostname = 'localhost';
-const port = parseInt(process.argv.find(arg => arg.startsWith('-p'))?.replace('-p', '')) || 5001;
+const hostname = '0.0.0.0';
+const port = parseInt(process.argv.find(arg => arg.startsWith('-p'))?.replace('-p', '')) || 8000;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
