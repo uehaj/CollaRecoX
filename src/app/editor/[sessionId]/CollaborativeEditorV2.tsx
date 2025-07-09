@@ -21,7 +21,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
-    const websocketUrl = 'wss://demos.yjs.dev/ws';
+    const websocketUrl = `ws://localhost:5001/api/yjs-ws?sessionId=${sessionId}`;
     const roomName = `transcribe-editor-v2-${sessionId}`;
     
     console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
