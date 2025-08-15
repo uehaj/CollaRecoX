@@ -1,11 +1,39 @@
+// YJS重複インポート防止パッチ（最優先で読み込み）
+require('./yjs-locker');
+
 const { createServer } = require('http');
 const { parse } = require('url');
 const next = require('next');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
-const Y = require('yjs');
-const { setupWSConnection } = require('y-websocket/bin/utils');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+
+// Import y-websocket first (this loads Y.js internally)  
+const wsUtils = require('y-websocket/bin/utils');
+const { setupWSConnection } = wsUtils;
+
+// Get the FIRST loaded Y.js instance to avoid constructor conflicts
+// This prevents the "Yjs was already imported" warning
+let Y;
+const yjsPath = require.resolve('yjs');
+if (require.cache[yjsPath]) {
+  // Use existing Y.js instance from cache
+  Y = require.cache[yjsPath].exports;
+  console.log('[YJS] Using existing Y.js instance from cache');
+} else {
+  // Fallback: load fresh (shouldn't happen with y-websocket loaded first)
+  Y = require('yjs');
+  console.log('[YJS] Loaded fresh Y.js instance');
+}
+
+// Check for required environment variables
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ ERROR: OPENAI_API_KEY environment variable is required');
+  console.error('Please set your OpenAI API key:');
+  console.error('export OPENAI_API_KEY="your-api-key-here"');
+  console.error('You can find your API key at: https://platform.openai.com/account/api-keys');
+  process.exit(1);
+}
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
@@ -22,11 +50,173 @@ console.log('Using port:', port);
 const app = next({ dev, hostname });
 const handle = app.getRequestHandler();
 
+// Store active YJS documents for direct document manipulation
+const yjsDocuments = new Map();
+let yjsWss = null; // YJS WebSocket server reference
+
+// Function to send text insertion command to TipTap clients via awareness
+function sendTextInsertionCommand(sessionId, text) {
+  try {
+    console.log(`[TipTap SDK] Sending text insertion command to session ${sessionId}: "${text}"`);
+    
+    // Use the correct room name that matches the client connection
+    const docName = `transcribe-editor-v2-${sessionId}`;
+    
+    // Access the y-websocket managed document
+    // y-websocket stores documents using wsUtils.docs Map
+    const docs = wsUtils.docs || new Map();
+    let ydoc = docs.get(docName);
+    
+    if (!ydoc) {
+      // Create new document if it doesn't exist
+      ydoc = new Y.Doc();
+      docs.set(docName, ydoc);
+      console.log(`[TipTap SDK] Created new y-websocket document: ${docName}`);
+    }
+    
+    // Get the awareness instance for the document
+    const awareness = yjsWss.awareness || new Map();
+    
+    // Instead of directly manipulating YJS, send command to TipTap clients via awareness
+    // This approach uses the awareness API to broadcast text insertion commands
+    if (yjsWss.clients) {
+      let commandSent = false;
+      
+      yjsWss.clients.forEach((client) => {
+        if (client.readyState === 1) { // WebSocket.OPEN
+          try {
+            // Send text insertion command as awareness update
+            const message = {
+              type: 'awareness',
+              command: 'insertText',
+              text: text,
+              timestamp: Date.now()
+            };
+            
+            client.send(JSON.stringify(message));
+            commandSent = true;
+            console.log(`[TipTap SDK] ✅ Text insertion command sent to client: "${text}"`);
+          } catch (error) {
+            console.error(`[TipTap SDK] Error sending command to client:`, error);
+          }
+        }
+      });
+      
+      if (!commandSent) {
+        console.log(`[TipTap SDK] ⚠️ No active clients to send command to`);
+        
+        // Fallback: Still insert into YJS document directly for persistence
+        const ytext = ydoc.getText('default');
+        ydoc.transact(() => {
+          const currentLength = ytext.length;
+          const textToAdd = currentLength > 0 ? ' ' + text : text;
+          ytext.insert(currentLength, textToAdd);
+          console.log(`[TipTap SDK] 📝 Fallback: Text added directly to YJS document: "${text}"`);
+        });
+      }
+    } else {
+      console.log(`[TipTap SDK] ⚠️ No WebSocket server clients available`);
+      
+      // Fallback: Insert directly into YJS document
+      const ytext = ydoc.getText('default');
+      ydoc.transact(() => {
+        const currentLength = ytext.length;
+        const textToAdd = currentLength > 0 ? ' ' + text : text;
+        ytext.insert(currentLength, textToAdd);
+        console.log(`[TipTap SDK] 📝 Fallback: Text added directly to YJS document: "${text}"`);
+      });
+    }
+    
+  } catch (error) {
+    console.error(`[TipTap SDK] ❌ Error sending text insertion command:`, error);
+  }
+}
+
+// Function to add connection message to YJS document when editing session opens
+function addConnectionMessage(sessionId) {
+  const connectionMessage = '接続しました';
+  console.log(`[Connection Test] Adding connection message to session ${sessionId}: "${connectionMessage}"`);
+  sendTextInsertionCommand(sessionId, connectionMessage);
+}
+
+// Helper function to add text to a prosemirror document
+function addTextToProsemirrorDoc(ydoc, text, sessionId) {
+  // Get the prosemirror fragment
+  const prosemirrorFragment = ydoc.getXmlFragment('prosemirror');
+  
+  // Find the last paragraph or create one
+  let lastParagraph = null;
+  for (let i = prosemirrorFragment.length - 1; i >= 0; i--) {
+    const item = prosemirrorFragment.get(i);
+    if (item instanceof Y.XmlElement && item.nodeName === 'paragraph') {
+      lastParagraph = item;
+      break;
+    }
+  }
+  
+  if (!lastParagraph) {
+    // Create a new paragraph if none exists
+    lastParagraph = new Y.XmlElement('paragraph');
+    prosemirrorFragment.push([lastParagraph]);
+    console.log(`[YJS] Created new paragraph for session: ${sessionId}`);
+  }
+  
+  // Add text to the paragraph
+  const textContent = lastParagraph.firstChild;
+  if (textContent instanceof Y.XmlText) {
+    textContent.insert(textContent.length, text + ' ');
+  } else {
+    const newText = new Y.XmlText();
+    newText.insert(0, text + ' ');
+    lastParagraph.push([newText]);
+  }
+  
+  // Debug: Show current document content
+  const fragment = ydoc.getXmlFragment('prosemirror');
+  console.log(`[YJS] Document fragments count: ${fragment.length}`);
+  for (let i = 0; i < fragment.length; i++) {
+    const item = fragment.get(i);
+    if (item instanceof Y.XmlElement && item.nodeName === 'paragraph') {
+      const textChild = item.firstChild;
+      if (textChild instanceof Y.XmlText) {
+        console.log(`[YJS] Paragraph ${i} content: "${textChild.toString()}"`);
+      }
+    }
+  }
+}
+
 app.prepare().then(() => {
+  console.log('Next.js app prepared successfully');
   const server = createServer(async (req, res) => {
     // WebSocketパスはNext.jsに送らず、アップグレード処理を待つ
     if (req.url?.startsWith('/api/realtime-ws') || req.url?.startsWith('/api/yjs-ws')) {
       // WebSocketアップグレードを待つ（何もしない）
+      return;
+    }
+    
+    // Handle internal API endpoint for connection test
+    if (req.url === '/api/internal/add-connection-message' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk.toString();
+      });
+      req.on('end', () => {
+        try {
+          const { sessionId } = JSON.parse(body);
+          if (sessionId) {
+            addConnectionMessage(sessionId);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true }));
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Session ID required' }));
+          }
+        } catch (error) {
+          console.error('[Internal API] Error processing connection message:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
+      });
       return;
     }
     
@@ -46,7 +236,7 @@ app.prepare().then(() => {
     noServer: true
   });
   
-  const yjsWss = new WebSocketServer({ 
+  yjsWss = new WebSocketServer({ 
     noServer: true
   });
 
@@ -88,6 +278,9 @@ app.prepare().then(() => {
     
     // Transcription prompt tracking
     let transcriptionPrompt = '';
+    
+    // Session management for YJS integration
+    let currentSessionId = null;
     
     // Validate model - try both old and new naming conventions
     const validModels = [
@@ -192,6 +385,14 @@ app.prepare().then(() => {
               text: message.transcript,
               item_id: message.item_id
             }));
+            
+            // Send text insertion command to TipTap clients if session is active
+            console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
+            if (currentSessionId && message.transcript) {
+              sendTextInsertionCommand(currentSessionId, message.transcript);
+            } else {
+              console.log(`[Debug] ❌ TipTap command NOT sent - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${message.transcript ? 'HAS_CONTENT' : 'EMPTY'}`);
+            }
             break;
             
           case 'conversation.item.input_audio_transcription.failed':
@@ -335,6 +536,17 @@ app.prepare().then(() => {
         const message = JSON.parse(data.toString());
         
         switch (message.type) {
+          case 'set_session_id':
+            // Set current session ID for YJS integration
+            if (message.sessionId) {
+              currentSessionId = message.sessionId;
+              console.log(`📋 Set current session ID: ${currentSessionId}`);
+              console.log(`[Debug] Session ID successfully stored for transcription integration`);
+            } else {
+              console.log(`[Debug] ❌ set_session_id message received but sessionId is empty:`, message);
+            }
+            break;
+            
           case 'set_prompt':
             // Update transcription prompt
             if (message.prompt !== undefined) {
@@ -392,8 +604,14 @@ app.prepare().then(() => {
               type: 'input_audio_buffer.append',
               audio: message.audio // Base64 encoded PCM16 audio
             };
-            openaiWs.send(JSON.stringify(audioEvent));
-            console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+            
+            // Check WebSocket state before sending
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(audioEvent));
+              console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready (state: ${openaiWs.readyState}), skipping audio chunk`);
+            }
             
             // Clear any existing timer
             if (autoCommitTimer) {
@@ -413,8 +631,14 @@ app.prepare().then(() => {
               const commitEvent = {
                 type: 'input_audio_buffer.commit'
               };
-              openaiWs.send(JSON.stringify(commitEvent));
-              console.log('✅ Audio buffer committed, waiting for automatic transcription...');
+              
+              if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                openaiWs.send(JSON.stringify(commitEvent));
+                console.log('✅ Audio buffer committed, waiting for automatic transcription...');
+              } else {
+                console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
+                responseInProgress = false; // Reset flag
+              }
               
               // Don't reset buffer tracking immediately - let transcription complete first
               // audioBufferDuration = 0;
@@ -434,8 +658,14 @@ app.prepare().then(() => {
                   const commitEvent = {
                     type: 'input_audio_buffer.commit'
                   };
-                  openaiWs.send(JSON.stringify(commitEvent));
-                  console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
+                  
+                  if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                    openaiWs.send(JSON.stringify(commitEvent));
+                    console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
+                  } else {
+                    console.log(`⚠️ OpenAI WebSocket not ready for timer commit (state: ${openaiWs.readyState})`);
+                    responseInProgress = false; // Reset flag
+                  }
                   
                   // Don't reset buffer tracking immediately
                   // audioBufferDuration = 0;
@@ -458,8 +688,14 @@ app.prepare().then(() => {
               const commitEvent = {
                 type: 'input_audio_buffer.commit'
               };
-              openaiWs.send(JSON.stringify(commitEvent));
-              console.log('✅ Audio buffer committed (manual), waiting for automatic transcription...');
+              
+              if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                openaiWs.send(JSON.stringify(commitEvent));
+                console.log('✅ Audio buffer committed (manual), waiting for automatic transcription...');
+              } else {
+                console.log(`⚠️ OpenAI WebSocket not ready for manual commit (state: ${openaiWs.readyState})`);
+                responseInProgress = false; // Reset flag
+              }
               
               // Don't reset buffer tracking immediately
               // audioBufferDuration = 0;
@@ -474,12 +710,17 @@ app.prepare().then(() => {
             const clearEvent = {
               type: 'input_audio_buffer.clear'
             };
-            openaiWs.send(JSON.stringify(clearEvent));
+            
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(clearEvent));
+              console.log('Audio buffer cleared');
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready for clear (state: ${openaiWs.readyState})`);
+            }
             
             // Reset buffer tracking
             audioBufferDuration = 0;
             audioChunkCount = 0;
-            console.log('Audio buffer cleared');
             break;
             
           default:
@@ -514,18 +755,18 @@ app.prepare().then(() => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     const sessionId = url.searchParams.get('sessionId') || 'default';
     
-    console.log(`YJS client connected to session: ${sessionId}`);
+    console.log(`[YJS WebSocket] Client connected to session: ${sessionId}`);
     
-    // Setup YJS WebSocket connection with session-specific document name
-    const docName = `transcribe-editor-${sessionId}`;
-    setupWSConnection(ws, request, { docName });
+    // Let y-websocket handle the connection setup
+    // It will automatically create and manage documents based on the URL path
+    setupWSConnection(ws, request);
     
     ws.on('close', () => {
-      console.log(`YJS client disconnected from session: ${sessionId}`);
+      console.log(`[YJS WebSocket] Client disconnected from session: ${sessionId}`);
     });
     
     ws.on('error', (error) => {
-      console.error(`YJS WebSocket error for session ${sessionId}:`, error);
+      console.error(`[YJS WebSocket] Error for session ${sessionId}:`, error);
     });
   });
 
