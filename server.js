@@ -51,39 +51,7 @@ app.prepare().then(() => {
   console.log('Next.js app prepared successfully');
 
   const server = createServer(async (req, res) => {
-    // REST: /api/rooms/:sessionId/insert-text
-    if (req.url?.startsWith('/api/rooms/') && req.method === 'POST') {
-      const urlParts = req.url.split('/');
-      if (urlParts.length >= 5 && urlParts[4] === 'insert-text') {
-        const sessionId = urlParts[3];
-        let body = '';
-        req.on('data', chunk => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { text } = JSON.parse(body || '{}');
-            if (!sessionId || !text) {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              return res.end(JSON.stringify({ error: 'Session ID and text required' }));
-            }
-            const roomName = `transcribe-editor-v2-${sessionId}`;
-            console.log(`[REST API] Broadcasting insert-text to room: ${roomName}, text: "${text}"`);
-
-            // ★ とりあえずREST APIは成功レスポンスのみ（stateless送信は後で実装）
-            console.log(`[REST API] ✅ Would broadcast to room: ${roomName}`);
-
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
-          } catch (e) {
-            console.error('[REST API] Error:', e);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Internal server error' }));
-          }
-        });
-        return;
-      }
-    }
-
-    // その他は Next.js へ
+    // Next.js へ
     try {
       const parsedUrl = parse(req.url, true);
       await handle(req, res, parsedUrl);
