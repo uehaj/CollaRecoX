@@ -65,6 +65,29 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     };
   }, [sessionId, ydoc]);
 
+  // Create editor with collaboration (no cursor for now)
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({
+        history: false, // Disable history for collaboration
+      }),
+      Collaboration.configure({
+        document: ydoc,
+      }),
+    ],
+    content: `
+      <h2>共同編集画面 V2</h2>
+      <p>この画面では複数の人が同時に文書を編集できます。</p>
+      <p>リアルタイム文字起こしの結果がここに表示され、みんなで編集・修正できます。</p>
+      <p><strong>注意:</strong> この版はカーソル同期なしの安定版です。</p>
+    `,
+    editorProps: {
+      attributes: {
+        class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
+      },
+    },
+  });
+
   // Add text insertion command handler using TipTap SDK
   useEffect(() => {
     if (!provider || !editor) return;
@@ -90,30 +113,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // Cleanup if needed
     };
   }, [provider, editor]);
-
-  // Create editor with collaboration (no cursor for now)
-  const editor = useEditor({
-    extensions: [
-      StarterKit.configure({
-        history: false, // Disable history for collaboration
-      }),
-      Collaboration.configure({
-        document: ydoc,
-      }),
-    ],
-    content: `
-      <h2>共同編集画面 V2</h2>
-      <p>この画面では複数の人が同時に文書を編集できます。</p>
-      <p>リアルタイム文字起こしの結果がここに表示され、みんなで編集・修正できます。</p>
-      <p><strong>注意:</strong> この版はカーソル同期なしの安定版です。</p>
-    `,
-    editorProps: {
-      attributes: {
-        class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
-      },
-    },
-  });
-
 
   if (!editor) {
     return (
