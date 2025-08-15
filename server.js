@@ -16,12 +16,12 @@ const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
 
 // Port
-let port = 5001;
+let port = 8888;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
 if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
-  port = parseInt(process.argv[portArgIndex + 1]) || 5001;
+  port = parseInt(process.argv[portArgIndex + 1]) || 8888;
 } else if (process.env.PORT) {
-  port = parseInt(process.env.PORT) || 5001;
+  port = parseInt(process.env.PORT) || 8888;
 }
 console.log('Using port:', port);
 
