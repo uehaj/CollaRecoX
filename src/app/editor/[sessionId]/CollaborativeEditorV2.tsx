@@ -70,23 +70,26 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     if (!provider || !editor) return;
 
     // Listen for text insertion commands from server via awareness
-    provider.awareness.on('change', () => {
-      const states = provider.awareness.getStates();
-      states.forEach((state, clientId) => {
-        if (state.insertText && clientId !== provider.awareness.clientID) {
-          console.log('[TipTap SDK] Received text insertion command:', state.insertText);
-          editor.commands.insertContent(' ' + state.insertText);
-          
-          // Clear the command to prevent re-execution
-          provider.awareness.setLocalStateField('insertText', null);
-        }
+    if (provider.awareness) {
+      provider.awareness.on('change', () => {
+        if (!provider.awareness) return;
+        const states = provider.awareness.getStates();
+        states.forEach((state, clientId) => {
+          if (state.insertText && clientId !== provider.awareness?.clientID) {
+            console.log('[TipTap SDK] Received text insertion command:', state.insertText);
+            editor.commands.insertContent(' ' + state.insertText);
+            
+            // Clear the command to prevent re-execution
+            provider.awareness?.setLocalStateField('insertText', null);
+          }
+        });
       });
-    });
+    }
 
     return () => {
       // Cleanup if needed
     };
-  }, [provider]);
+  }, [provider, editor]);
 
   // Create editor with collaboration (no cursor for now)
   const editor = useEditor({
