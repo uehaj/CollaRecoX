@@ -5,7 +5,7 @@ import { EditorContent, useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import * as Y from 'yjs';
-import { WebsocketProvider } from 'y-websocket';
+import { HocuspocusProvider } from '@hocuspocus/provider';
 
 interface CollaborativeEditorV2Props {
   sessionId: string;
@@ -13,11 +13,11 @@ interface CollaborativeEditorV2Props {
 
 export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditorV2Props) {
   const [ydoc] = useState(() => new Y.Doc());
-  const [provider, setProvider] = useState<WebsocketProvider | null>(null);
+  const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [userCount, setUserCount] = useState(1);
 
-  // Initialize WebSocket provider
+  // Initialize Hocuspocus provider
   useEffect(() => {
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
@@ -26,36 +26,40 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     
     console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
     
-    const wsProvider = new WebsocketProvider(websocketUrl, roomName, ydoc);
+    const hocusProvider = new HocuspocusProvider({
+      url: websocketUrl,
+      name: roomName,
+      document: ydoc,
+    });
     
-    wsProvider.on('status', (event: { status: string }) => {
-      console.log('[WebSocket Provider V2] Status:', event.status);
+    hocusProvider.on('status', (event: { status: string }) => {
+      console.log('[Hocuspocus Provider V2] Status:', event.status);
       setIsConnected(event.status === 'connected');
     });
 
-    wsProvider.on('connection-close', () => {
-      console.log('[WebSocket Provider V2] Connection closed');
+    hocusProvider.on('connect', () => {
+      console.log('[Hocuspocus Provider V2] Connected');
+      setIsConnected(true);
+    });
+
+    hocusProvider.on('disconnect', () => {
+      console.log('[Hocuspocus Provider V2] Disconnected');
       setIsConnected(false);
     });
 
-    wsProvider.on('connection-error', (event: Event) => {
-      console.error('[WebSocket Provider V2] Connection error:', event);
-      setIsConnected(false);
-    });
-
-    // Track user count (without cursor extension)
-    wsProvider.awareness.on('change', () => {
-      const count = wsProvider.awareness.getStates().size;
+    // Track user count
+    hocusProvider.awareness?.on('change', () => {
+      const count = hocusProvider.awareness?.getStates().size || 1;
       console.log('[Awareness V2] User count changed:', count);
       setUserCount(count);
     });
 
-    setProvider(wsProvider);
+    setProvider(hocusProvider);
 
     return () => {
-      console.log('[Collaborative Editor V2] 🧹 Cleaning up WebSocket provider');
-      if (wsProvider) {
-        wsProvider.destroy();
+      console.log('[Collaborative Editor V2] 🧹 Cleaning up Hocuspocus provider');
+      if (hocusProvider) {
+        hocusProvider.destroy();
       }
       setProvider(null);
     };
