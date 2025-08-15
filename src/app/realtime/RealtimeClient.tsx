@@ -113,6 +113,7 @@ export default function RealtimeClient() {
     return basePrompt;
   }, [promptMode, customPrompt, selectedPromptPreset, autoLineBreak]);
 
+
   // Audio processing utility functions
   const floatTo16BitPCM = useCallback((float32Array: Float32Array): Int16Array => {
     const int16Array = new Int16Array(float32Array.length);
@@ -173,9 +174,7 @@ export default function RealtimeClient() {
     }
 
     const currentPrompt = getCurrentPrompt();
-    const wsUrl = process.env.NODE_ENV === 'production' 
-      ? `wss://${window.location.host}/api/realtime-ws?model=${model}`
-      : `ws://localhost:8888/api/realtime-ws?model=${model}`;
+    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws?model=${model}`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
     const ws = new WebSocket(wsUrl);
@@ -185,6 +184,15 @@ export default function RealtimeClient() {
       console.log('[WebSocket] ✅ Connected successfully');
       setIsConnected(true);
       setError(null);
+      
+      // Send session ID to server if available
+      if (currentSessionId) {
+        ws.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: currentSessionId
+        }));
+        console.log('[WebSocket] 📋 Sent session ID to server:', currentSessionId);
+      }
       
       // Send prompt configuration to server
       if (currentPrompt) {
@@ -209,69 +217,6 @@ export default function RealtimeClient() {
           case 'transcription':
             console.log('[Transcription] 📝 Received text:', message.text);
             setText(prev => prev + message.text + ' ');
-            
-            // Send transcription to current editor session via Yjs
-            if (currentSessionId) {
-              console.log('[Realtime] 📡 Sending to Yjs session:', currentSessionId);
-              try {
-                // Import Yjs and connect to the same document
-                import('yjs').then(Y => {
-                  import('y-websocket').then(({ WebsocketProvider }) => {
-                    const ydoc = new Y.Doc();
-                    const yjsWsUrl = process.env.NODE_ENV === 'production' 
-                      ? `wss://${window.location.host}/api/yjs-ws?sessionId=${currentSessionId}`
-                      : `ws://localhost:8888/api/yjs-ws?sessionId=${currentSessionId}`;
-                    const provider = new WebsocketProvider(yjsWsUrl, `transcribe-editor-${currentSessionId}`, ydoc);
-                    
-                    provider.on('status', (event: { status: string }) => {
-                      console.log('[Realtime] Yjs status:', event.status);
-                      if (event.status === 'connected') {
-                        // Get the prosemirror fragment
-                        const type = ydoc.getXmlFragment('prosemirror');
-                        
-                        // Wait a bit for document to sync, then append text
-                        setTimeout(() => {
-                          // Find the last paragraph or create one
-                          let lastP = null;
-                          for (let i = type.length - 1; i >= 0; i--) {
-                            const item = type.get(i);
-                            if (item instanceof Y.XmlElement && item.nodeName === 'paragraph') {
-                              lastP = item;
-                              break;
-                            }
-                          }
-                          
-                          if (!lastP) {
-                            // Create a new paragraph if none exists
-                            lastP = new Y.XmlElement('paragraph');
-                            type.push([lastP]);
-                          }
-                          
-                          // Add text to the paragraph
-                          const textContent = lastP.firstChild;
-                          if (textContent instanceof Y.XmlText) {
-                            textContent.insert(textContent.length, message.text + ' ');
-                          } else {
-                            const newText = new Y.XmlText();
-                            newText.insert(0, message.text + ' ');
-                            lastP.push([newText]);
-                          }
-                          
-                          console.log('[Realtime] ✅ Text added to Yjs document');
-                          
-                          // Clean up connection
-                          setTimeout(() => {
-                            provider.destroy();
-                          }, 500);
-                        }, 500);
-                      }
-                    });
-                  });
-                });
-              } catch (error) {
-                console.error('[Realtime] ❌ Yjs error:', error);
-              }
-            }
             break;
             
           case 'speech_started':
@@ -624,12 +569,41 @@ export default function RealtimeClient() {
     return currentSessionId;
   }, [currentSessionId]);
 
-  const createOrOpenEditingSession = useCallback(() => {
+  const createOrOpenEditingSession = useCallback(async () => {
     const sessionId = generateSessionId();
     const editorUrl = `${window.location.origin}/editor/${sessionId}`;
     
     console.log('[Session] 🚀 Opening editing session:', sessionId);
     console.log('[Session] 📍 Editor URL:', editorUrl);
+    
+    // Send session ID to server if WebSocket is connected
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({
+        type: 'set_session_id',
+        sessionId: sessionId
+      }));
+      console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+    }
+    
+    // Add connection test message to YJS document
+    try {
+      console.log('[Session] 📝 Adding connection test message to session:', sessionId);
+      const response = await fetch('/api/connection-test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+      
+      if (response.ok) {
+        console.log('[Session] ✅ Connection test message added successfully');
+      } else {
+        console.warn('[Session] ⚠️ Failed to add connection test message:', await response.text());
+      }
+    } catch (error) {
+      console.error('[Session] ❌ Error adding connection test message:', error);
+    }
     
     // Open new tab with editor
     window.open(editorUrl, '_blank');
@@ -637,9 +611,20 @@ export default function RealtimeClient() {
 
   const connectToExistingSession = useCallback(() => {
     if (existingSessionInput.trim()) {
-      setCurrentSessionId(existingSessionInput.trim());
+      const sessionId = existingSessionInput.trim();
+      setCurrentSessionId(sessionId);
       setExistingSessionInput('');
-      console.log('[Session] 🔗 Connected to existing session:', existingSessionInput.trim());
+      console.log('[Session] 🔗 Connected to existing session:', sessionId);
+      
+      // Send session ID to server if WebSocket is connected
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: sessionId
+        }));
+        console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+      }
+      
     }
   }, [existingSessionInput]);
 
@@ -655,9 +640,19 @@ export default function RealtimeClient() {
 
   const saveSessionId = useCallback(() => {
     if (sessionIdInput.trim()) {
-      setCurrentSessionId(sessionIdInput.trim());
+      const sessionId = sessionIdInput.trim();
+      setCurrentSessionId(sessionId);
       setIsEditingSessionId(false);
-      console.log('[Session] 💾 Session ID updated to:', sessionIdInput.trim());
+      console.log('[Session] 💾 Session ID updated to:', sessionId);
+      
+      // Send session ID to server if WebSocket is connected
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: sessionId
+        }));
+        console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+      }
     }
   }, [sessionIdInput]);
 
@@ -977,6 +972,16 @@ export default function RealtimeClient() {
               </div>
             </div>
           )}
+          
+          {/* Create/Open Session Button */}
+          <div className="flex justify-center">
+            <button
+              onClick={createOrOpenEditingSession}
+              className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
+            >
+              {currentSessionId ? '編集セッションを開く' : '編集セッションの作成'}
+            </button>
+          </div>
         </div>
 
         {/* Controls */}
@@ -1004,13 +1009,6 @@ export default function RealtimeClient() {
             className="px-6 py-3 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
           >
             Clear Text
-          </button>
-          
-          <button
-            onClick={createOrOpenEditingSession}
-            className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
-          >
-            {currentSessionId ? '編集セッションを開く' : '編集セッションの作成'}
           </button>
           </div>
         </div>

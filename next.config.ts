@@ -1,5 +1,15 @@
 import type { NextConfig } from "next";
 
+// Next.jsサーバーサイドでもyjs-lockerを適用
+if (typeof require !== 'undefined') {
+  try {
+    require('./yjs-locker');
+    console.log('[next.config] yjs-locker applied to Next.js');
+  } catch (err: any) {
+    console.warn('[next.config] Failed to apply yjs-locker:', err?.message || err);
+  }
+}
+
 const nextConfig: NextConfig = {
   // Disable React StrictMode in development to reduce duplicate component mounting
   reactStrictMode: false,
@@ -13,6 +23,15 @@ const nextConfig: NextConfig = {
         aggregateTimeout: 300,
       };
     }
+    
+    // Fix YJS duplicate import issue
+    config.resolve = config.resolve || {};
+    config.resolve.alias = {
+      ...config.resolve.alias,
+      'yjs/dist/yjs.mjs': 'yjs',
+      'yjs/dist/yjs.cjs': 'yjs',
+    };
+    
     return config;
   },
 };

@@ -53,3 +53,5 @@ a.env~
 .env~
 .env.local~
 .env.local.bak
+working
+server.pid

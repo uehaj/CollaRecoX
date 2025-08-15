@@ -21,7 +21,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
-    const websocketUrl = `ws://localhost:5001/api/yjs-ws?sessionId=${sessionId}`;
+    const websocketUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/yjs-ws`;
     const roomName = `transcribe-editor-v2-${sessionId}`;
     
     console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
@@ -60,6 +60,29 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       setProvider(null);
     };
   }, [sessionId, ydoc]);
+
+  // Add text insertion command handler using TipTap SDK
+  useEffect(() => {
+    if (!provider || !editor) return;
+
+    // Listen for text insertion commands from server via awareness
+    provider.awareness.on('change', () => {
+      const states = provider.awareness.getStates();
+      states.forEach((state, clientId) => {
+        if (state.insertText && clientId !== provider.awareness.clientID) {
+          console.log('[TipTap SDK] Received text insertion command:', state.insertText);
+          editor.commands.insertContent(' ' + state.insertText);
+          
+          // Clear the command to prevent re-execution
+          provider.awareness.setLocalStateField('insertText', null);
+        }
+      });
+    });
+
+    return () => {
+      // Cleanup if needed
+    };
+  }, [provider]);
 
   // Create editor with collaboration (no cursor for now)
   const editor = useEditor({
