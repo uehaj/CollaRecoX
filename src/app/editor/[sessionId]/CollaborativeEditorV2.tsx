@@ -12,7 +12,12 @@ interface CollaborativeEditorV2Props {
 }
 
 export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditorV2Props) {
-  const [ydoc] = useState(() => new Y.Doc());
+  const [ydoc] = useState(() => {
+    // Ensure unique document per session
+    const doc = new Y.Doc();
+    console.log('[Collaborative Editor V2] 📄 Created new Y.Doc for session:', sessionId);
+    return doc;
+  });
   const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [userCount, setUserCount] = useState(1);
@@ -45,9 +50,17 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       setIsConnected(true);
     });
 
-    hocusProvider.on('disconnect', () => {
-      console.log('[Hocuspocus Provider V2] Disconnected');
+    hocusProvider.on('disconnect', (event: unknown) => {
+      console.log('[Hocuspocus Provider V2] Disconnected:', event);
       setIsConnected(false);
+    });
+
+    hocusProvider.on('close', (event: unknown) => {
+      console.error('[Hocuspocus Provider V2] Connection closed:', event);
+    });
+
+    hocusProvider.on('error', (event: unknown) => {
+      console.error('[Hocuspocus Provider V2] Error:', event);
     });
 
     // Track user count
@@ -62,9 +75,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return () => {
       console.log('[Collaborative Editor V2] 🧹 Cleaning up Hocuspocus provider');
       if (hocusProvider) {
-        hocusProvider.destroy();
+        try {
+          hocusProvider.disconnect();
+          hocusProvider.destroy();
+        } catch (error) {
+          console.error('[Collaborative Editor V2] ❌ Error during cleanup:', error);
+        }
       }
       setProvider(null);
+      setIsConnected(false);
     };
   }, [sessionId, ydoc]);
 
@@ -76,6 +95,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       }),
       Collaboration.configure({
         document: ydoc,
+        field: `content-${sessionId}`, // Use session-specific field name
       }),
     ],
     content: `
@@ -95,7 +115,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     if (!ydoc) return;
 
-    const ytext = ydoc.getText('default');
+    // Use session-specific text field name to avoid conflicts
+    const textFieldName = `content-${sessionId}`;
+    const ytext = ydoc.getText(textFieldName);
     
     const onChange = () => {
       console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
@@ -106,7 +128,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return () => {
       ytext.unobserve(onChange);
     };
-  }, [ydoc]);
+  }, [ydoc, sessionId]);
 
   if (!editor) {
     return (

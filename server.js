@@ -625,14 +625,16 @@ app.prepare().then(() => {
       
       if (document && document.getYDoc) {
         const ydoc = document.getYDoc();
-        const ytext = ydoc.getText('default');
+        // Use session-specific field name to match client
+        const fieldName = `content-${sessionId}`;
+        const ytext = ydoc.getText(fieldName);
         
         // Add text to document
         const currentLength = ytext.length;
         const textToAdd = currentLength > 0 ? ` ${text}` : text;
         ytext.insert(currentLength, textToAdd);
         
-        console.log(`[Hocuspocus Integration] ✅ Text added directly to document: ${roomName}`);
+        console.log(`[Hocuspocus Integration] ✅ Text added to field '${fieldName}' in document: ${roomName}`);
       } else {
         console.log(`[Hocuspocus Integration] ⚠️ Document not found or not accessible: ${roomName}`);
       }
