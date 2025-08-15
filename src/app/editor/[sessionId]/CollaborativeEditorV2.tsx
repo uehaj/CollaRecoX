@@ -21,7 +21,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
-    const websocketUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/yjs-ws`;
+    const websocketUrl = `ws://localhost:8888/api/yjs-ws`;
     const roomName = `transcribe-editor-v2-${sessionId}`;
     
     console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
@@ -88,31 +88,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     },
   });
 
-  // Add text insertion command handler using TipTap SDK
+  // Document change listener for debugging
   useEffect(() => {
-    if (!provider || !editor) return;
+    if (!ydoc) return;
 
-    // Listen for text insertion commands from server via awareness
-    if (provider.awareness) {
-      provider.awareness.on('change', () => {
-        if (!provider.awareness) return;
-        const states = provider.awareness.getStates();
-        states.forEach((state, clientId) => {
-          if (state.insertText && clientId !== provider.awareness?.clientID) {
-            console.log('[TipTap SDK] Received text insertion command:', state.insertText);
-            editor.commands.insertContent(' ' + state.insertText);
-            
-            // Clear the command to prevent re-execution
-            provider.awareness?.setLocalStateField('insertText', null);
-          }
-        });
-      });
-    }
+    const ytext = ydoc.getText('default');
+    
+    const onChange = () => {
+      console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
+    };
+
+    ytext.observe(onChange);
 
     return () => {
-      // Cleanup if needed
+      ytext.unobserve(onChange);
     };
-  }, [provider, editor]);
+  }, [ydoc]);
 
   if (!editor) {
     return (

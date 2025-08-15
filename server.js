@@ -252,7 +252,7 @@ app.prepare().then(() => {
             // Send text to Hocuspocus document if session is active
             console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
             if (currentSessionId && message.transcript) {
-              sendTextToHocuspocus(currentSessionId, message.transcript);
+              sendTextToHocuspocusDocument(currentSessionId, message.transcript);
             } else {
               console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${message.transcript ? 'HAS_CONTENT' : 'EMPTY'}`);
             }
@@ -614,23 +614,31 @@ app.prepare().then(() => {
   });
 
   // Function to send text to Hocuspocus document
-  function sendTextToHocuspocus(sessionId, text) {
+  function sendTextToHocuspocusDocument(sessionId, text) {
     try {
-      console.log(`[Hocuspocus Integration] Sending text to session ${sessionId}: "${text}"`);
+      console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${text}"`);
       
       const roomName = `transcribe-editor-v2-${sessionId}`;
       
-      // Use stateless message to send text insertion command
-      hocuspocus.broadcastStateless(roomName, {
-        type: 'insertText',
-        text: text,
-        timestamp: Date.now()
-      });
+      // Get or create document directly
+      const document = hocuspocus.documents.get(roomName) || hocuspocus.createDocument(roomName);
       
-      console.log(`[Hocuspocus Integration] ✅ Text sent to room: ${roomName}`);
+      if (document && document.getYDoc) {
+        const ydoc = document.getYDoc();
+        const ytext = ydoc.getText('default');
+        
+        // Add text to document
+        const currentLength = ytext.length;
+        const textToAdd = currentLength > 0 ? ` ${text}` : text;
+        ytext.insert(currentLength, textToAdd);
+        
+        console.log(`[Hocuspocus Integration] ✅ Text added directly to document: ${roomName}`);
+      } else {
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found or not accessible: ${roomName}`);
+      }
       
     } catch (error) {
-      console.error(`[Hocuspocus Integration] ❌ Error sending text:`, error);
+      console.error(`[Hocuspocus Integration] ❌ Error adding text to document:`, error);
     }
   }
 
