@@ -569,7 +569,7 @@ export default function RealtimeClient() {
     return currentSessionId;
   }, [currentSessionId]);
 
-  const createOrOpenEditingSession = useCallback(async () => {
+  const createOrOpenEditingSession = useCallback(() => {
     const sessionId = generateSessionId();
     const editorUrl = `${window.location.origin}/editor/${sessionId}`;
     
@@ -583,26 +583,6 @@ export default function RealtimeClient() {
         sessionId: sessionId
       }));
       console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
-    }
-    
-    // Add connection test message to YJS document
-    try {
-      console.log('[Session] 📝 Adding connection test message to session:', sessionId);
-      const response = await fetch('/api/connection-test', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ sessionId }),
-      });
-      
-      if (response.ok) {
-        console.log('[Session] ✅ Connection test message added successfully');
-      } else {
-        console.warn('[Session] ⚠️ Failed to add connection test message:', await response.text());
-      }
-    } catch (error) {
-      console.error('[Session] ❌ Error adding connection test message:', error);
     }
     
     // Open new tab with editor
