@@ -128,8 +128,7 @@ app.prepare().then(() => {
   realtimeWss.on('connection', function connection(clientWs, request) {
     console.log('Client connected to realtime WebSocket');
     
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    const model = url.searchParams.get('model') || 'gpt-4o-realtime-preview';
+    // No need to parse model parameter - using fixed model
     
     // Audio buffer tracking
     let audioBufferDuration = 0; // in milliseconds
@@ -142,27 +141,17 @@ app.prepare().then(() => {
     // Transcription prompt tracking
     let transcriptionPrompt = '';
     
+    // Transcription model tracking
+    let transcriptionModel = 'gpt-4o-transcribe'; // Default model
+    
     // Session management for Hocuspocus integration
     let currentSessionId = null;
     
-    // Validate model
-    const validModels = [
-      'gpt-4o-realtime-preview', 
-      'gpt-4o-mini-realtime-preview',
-      'gpt-4o-realtime-preview-2024-10-01', 
-      'gpt-4o-mini-realtime-preview-2024-10-01'
-    ];
-    if (!validModels.includes(model)) {
-      clientWs.send(JSON.stringify({
-        type: 'error',
-        error: 'Invalid model. Use gpt-4o-realtime-preview or gpt-4o-mini-realtime-preview'
-      }));
-      clientWs.close();
-      return;
-    }
-
-    // Connect to OpenAI Realtime API with model parameter
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
+    // Fixed Realtime model for audio transcription (lightweight and cost-effective)
+    const fixedRealtimeModel = 'gpt-4o-mini-realtime-preview';
+    
+    // Connect to OpenAI Realtime API with fixed model
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${fixedRealtimeModel}`;
     console.log('Connecting to OpenAI Realtime API:', openaiUrl);
     
     // Create proxy agent if HTTPS_PROXY is set
@@ -176,8 +165,8 @@ app.prepare().then(() => {
       agent: proxyAgent
     });
 
-    // Function to create session configuration with optional prompt
-    const createSessionConfig = (prompt = '') => ({
+    // Function to create session configuration with optional prompt and transcription model
+    const createSessionConfig = (prompt = '', transcriptionModel = 'gpt-4o-transcribe') => ({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
@@ -185,7 +174,7 @@ app.prepare().then(() => {
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         input_audio_transcription: {
-          model: 'gpt-4o-transcribe',
+          model: transcriptionModel,
           ...(prompt ? { prompt: prompt } : {})
         },
         turn_detection: {
@@ -199,8 +188,8 @@ app.prepare().then(() => {
       }
     });
 
-    // Initial session configuration (will be updated when prompt is received)
-    let sessionConfig = createSessionConfig();
+    // Initial session configuration (will be updated when prompt/model is received)
+    let sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
 
     openaiWs.on('open', () => {
       console.log('🔗 Connected to OpenAI Realtime API');
@@ -417,13 +406,40 @@ app.prepare().then(() => {
               console.log('📝 Received transcription prompt:', transcriptionPrompt || '(empty)');
               
               // Update session configuration with new prompt
-              sessionConfig = createSessionConfig(transcriptionPrompt);
+              sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
               
               // Send updated session config to OpenAI if connection is open
               if (openaiWs.readyState === 1) { // WebSocket.OPEN
                 console.log('🔄 Updating OpenAI session with new prompt...');
                 openaiWs.send(JSON.stringify(sessionConfig));
                 console.log('✅ Session updated with transcription prompt');
+              }
+            }
+            break;
+            
+          case 'set_transcription_model':
+            // Update transcription model
+            if (message.model) {
+              const validTranscriptionModels = ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'];
+              if (validTranscriptionModels.includes(message.model)) {
+                transcriptionModel = message.model;
+                console.log('🎤 Received transcription model:', transcriptionModel);
+                
+                // Update session configuration with new model
+                sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
+                
+                // Send updated session config to OpenAI if connection is open
+                if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                  console.log('🔄 Updating OpenAI session with new transcription model...');
+                  openaiWs.send(JSON.stringify(sessionConfig));
+                  console.log('✅ Session updated with transcription model');
+                }
+              } else {
+                console.error('❌ Invalid transcription model:', message.model);
+                clientWs.send(JSON.stringify({
+                  type: 'error',
+                  error: `Invalid transcription model. Use: ${validTranscriptionModels.join(', ')}`
+                }));
               }
             }
             break;

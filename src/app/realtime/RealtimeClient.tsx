@@ -4,8 +4,6 @@ import React, { useRef, useState, useCallback, useEffect } from "react";
 import { HocuspocusProvider } from '@hocuspocus/provider';
 import * as Y from 'yjs';
 
-type RealtimeModel = "gpt-4o-realtime-preview" | "gpt-4o-mini-realtime-preview";
-
 interface PromptPreset {
   id: string;
   name: string;
@@ -80,7 +78,6 @@ export default function RealtimeClient() {
   const [text, setText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [model, setModel] = useState<RealtimeModel>("gpt-4o-mini-realtime-preview");
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -90,6 +87,7 @@ export default function RealtimeClient() {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [promptMode, setPromptMode] = useState<'preset' | 'custom'>('preset');
   const [autoLineBreak, setAutoLineBreak] = useState<boolean>(false);
+  const [transcriptionModel, setTranscriptionModel] = useState<string>('gpt-4o-transcribe');
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
@@ -180,7 +178,7 @@ export default function RealtimeClient() {
     }
 
     const currentPrompt = getCurrentPrompt();
-    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws?model=${model}`;
+    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
     const ws = new WebSocket(wsUrl);
@@ -208,6 +206,13 @@ export default function RealtimeClient() {
         }));
         console.log('[WebSocket] 📝 Sent transcription prompt to server');
       }
+      
+      // Send transcription model configuration to server
+      ws.send(JSON.stringify({
+        type: 'set_transcription_model',
+        model: transcriptionModel
+      }));
+      console.log('[WebSocket] 🎤 Sent transcription model to server:', transcriptionModel);
     };
 
     ws.onmessage = (event) => {
@@ -260,7 +265,7 @@ export default function RealtimeClient() {
       setIsConnected(false);
       setIsRecording(false);
     };
-  }, [model, getCurrentPrompt, currentSessionId]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel]);
 
   const disconnectWebSocket = useCallback(() => {
     if (websocketRef.current) {
@@ -979,29 +984,32 @@ export default function RealtimeClient() {
           </p>
         </div>
 
-        {/* Model Selection and Audio Device Selection - Responsive 2-column layout */}
+        {/* Audio Device Selection and Transcription Model Selection - Responsive 2-column layout */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Model Selection */}
+          {/* Transcription Model Selection */}
           <div className="bg-white p-6 rounded-lg shadow-md">
-            <label htmlFor="model-select" className="block text-sm font-medium text-gray-700 mb-2">
-              Select Realtime Model:
+            <label htmlFor="transcription-model-select" className="block text-sm font-medium text-gray-700 mb-2">
+              音声認識モデル:
             </label>
             <select
-              id="model-select"
-              value={model}
-              onChange={(e) => setModel(e.target.value as RealtimeModel)}
+              id="transcription-model-select"
+              value={transcriptionModel}
+              onChange={(e) => setTranscriptionModel(e.target.value)}
               disabled={isRecording || isConnected}
               className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
             >
-              <option value="gpt-4o-mini-realtime-preview">
-                GPT-4o Mini Realtime (~$0.06/min input, $0.24/min output)
+              <option value="whisper-1">
+                Whisper-1 (従来モデル)
               </option>
-              <option value="gpt-4o-realtime-preview">
-                GPT-4o Realtime (~$0.06/min input, $0.24/min output)
+              <option value="gpt-4o-mini-transcribe">
+                GPT-4o Mini Transcribe (軽量・高速)
+              </option>
+              <option value="gpt-4o-transcribe">
+                GPT-4o Transcribe (高精度)
               </option>
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Note: Model can only be changed when disconnected
+              接続前に音声認識モデルを選択してください
             </p>
           </div>
 
