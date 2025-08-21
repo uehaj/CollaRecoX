@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect } from "react";
+import { HocuspocusProvider } from '@hocuspocus/provider';
+import * as Y from 'yjs';
 
 type RealtimeModel = "gpt-4o-realtime-preview" | "gpt-4o-mini-realtime-preview";
 
@@ -70,6 +72,10 @@ export default function RealtimeClient() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | AudioWorkletNode | null>(null);
   const recordingStateRef = useRef<boolean>(false);
+  
+  // Hocuspocus client refs for test functionality
+  const hocuspocusProviderRef = useRef<HocuspocusProvider | null>(null);  
+  const hocuspocusDocRef = useRef<Y.Doc | null>(null);
   
   const [text, setText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
@@ -522,9 +528,41 @@ export default function RealtimeClient() {
     console.log('[Audio] ✅ Audio stream stopped successfully');
   }, []);
 
+  // Function to send status messages to collaborative document
+  const sendStatusToCollaboration = useCallback((message: string) => {
+    if (!currentSessionId || !hocuspocusDocRef.current || !hocuspocusProviderRef.current) {
+      return;
+    }
+
+    try {
+      const fieldName = `content-${currentSessionId}`;
+      const fragment = hocuspocusDocRef.current.getXmlFragment(fieldName);
+      
+      // Create a paragraph with the status message
+      const paragraph = new Y.XmlElement('paragraph');
+      const textNode = new Y.XmlText();
+      
+      const hasContent = fragment.length > 0;
+      const textContent = hasContent ? ` ${message}` : message;
+      textNode.insert(0, textContent);
+      paragraph.insert(0, [textNode]);
+      
+      fragment.insert(fragment.length, [paragraph]);
+      
+      console.log('[Hocuspocus Status] Status sent to collaborative document:', message);
+    } catch (error) {
+      console.error('[Hocuspocus Status] Error sending status:', error);
+    }
+  }, [currentSessionId]);
+
   // Main control functions
   const startRecording = useCallback(async () => {
     console.log('[Recording] 🎙️ Start recording requested');
+    
+    // Send start notification to collaborative document
+    const currentTime = new Date().toLocaleString('ja-JP');
+    sendStatusToCollaboration(`文字起こしを開始します (${currentTime})`);
+    
     if (!isConnected) {
       console.log('[Recording] 🔗 Not connected, connecting WebSocket first...');
       connectWebSocket();
@@ -538,12 +576,17 @@ export default function RealtimeClient() {
       console.log('[Recording] 🚀 Already connected, starting audio stream immediately');
       startAudioStream();
     }
-  }, [isConnected, connectWebSocket, startAudioStream]);
+  }, [isConnected, connectWebSocket, startAudioStream, sendStatusToCollaboration]);
 
   const stopRecording = useCallback(() => {
     console.log('[Recording] ⏹️ Stop recording requested');
+    
+    // Send stop notification to collaborative document
+    const currentTime = new Date().toLocaleString('ja-JP');
+    sendStatusToCollaboration(`文字起こしを終了します (${currentTime})`);
+    
     stopAudioStream();
-  }, [stopAudioStream]);
+  }, [stopAudioStream, sendStatusToCollaboration]);
 
   const clearText = useCallback(() => {
     console.log('[UI] 🧹 Clearing transcription text');
@@ -636,6 +679,161 @@ export default function RealtimeClient() {
     }
   }, [sessionIdInput]);
 
+  // Initialize/cleanup Hocuspocus connection for test functionality
+  const initializeHocuspocusClient = useCallback(() => {
+    if (!currentSessionId || hocuspocusProviderRef.current) {
+      return; // Already initialized or no session
+    }
+
+    console.log('[Hocuspocus Test Client] Initializing for session:', currentSessionId);
+
+    // Create Y.Doc
+    const ydoc = new Y.Doc();
+    hocuspocusDocRef.current = ydoc;
+
+    // Create provider
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
+    const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
+    const roomName = `transcribe-editor-v2-${currentSessionId}`;
+
+    const provider = new HocuspocusProvider({
+      url: websocketUrl,
+      name: roomName,
+      document: ydoc,
+    });
+
+    hocuspocusProviderRef.current = provider;
+
+    provider.on('connect', () => {
+      console.log('[Hocuspocus Test Client] Connected to collaborative session');
+    });
+
+    provider.on('disconnect', () => {
+      console.log('[Hocuspocus Test Client] Disconnected from collaborative session');
+    });
+
+    provider.on('error', (error: unknown) => {
+      console.error('[Hocuspocus Test Client] Error:', error);
+    });
+  }, [currentSessionId]);
+
+  const cleanupHocuspocusClient = useCallback(() => {
+    if (hocuspocusProviderRef.current) {
+      console.log('[Hocuspocus Test Client] Cleaning up connection');
+      hocuspocusProviderRef.current.disconnect();
+      hocuspocusProviderRef.current.destroy();
+      hocuspocusProviderRef.current = null;
+    }
+    if (hocuspocusDocRef.current) {
+      hocuspocusDocRef.current = null;
+    }
+  }, []);
+
+  // Test text send function - send directly to Hocuspocus document as a client
+  const sendTestText = useCallback(() => {
+    if (!currentSessionId) {
+      setError('セッションIDが設定されていません。先に編集セッションを作成してください。');
+      return;
+    }
+
+    // Initialize Hocuspocus client if not already done
+    initializeHocuspocusClient();
+
+    if (!hocuspocusDocRef.current || !hocuspocusProviderRef.current) {
+      setError('Hocuspocusクライアントが初期化されていません。');
+      return;
+    }
+
+    const provider = hocuspocusProviderRef.current;
+    
+    // Check if provider is connected, if not, wait for connection
+    const sendWhenReady = () => {
+      const testTexts = [
+        'テスト送信1: リアルタイム音声認識からの統合テストです。',
+        'テスト送信2: このテキストは共同編集画面に表示されるはずです。',
+        'テスト送信3: Hocuspocusサーバー経由で同期されます。',
+        'テスト送信4: 複数のユーザーがリアルタイムで確認できます。'
+      ];
+
+      const randomText = testTexts[Math.floor(Math.random() * testTexts.length)];
+      
+      try {
+        // Add text to Hocuspocus document as a collaborative client using TipTap-compatible format
+        const fieldName = `content-${currentSessionId}`;
+        
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = hocuspocusDocRef.current!.getXmlFragment(fieldName);
+        
+        // Create a simple paragraph with the test text
+        const paragraph = new Y.XmlElement('paragraph');
+        const textNode = new Y.XmlText();
+        
+        // Add space before text if the fragment already has content
+        const hasContent = fragment.length > 0;
+        const textContent = hasContent ? ` ${randomText}` : randomText;
+        textNode.insert(0, textContent);
+        paragraph.insert(0, [textNode]);
+        
+        // Insert the paragraph at the end of the document
+        fragment.insert(fragment.length, [paragraph]);
+        
+        console.log('[Hocuspocus Test Client] Text sent to collaborative document as paragraph:', randomText);
+        console.log('[Hocuspocus Test Client] Fragment length after insert:', fragment.length);
+        console.log('[Hocuspocus Test Client] Fragment content preview:', fragment.toString().substring(0, 100) + '...');
+        
+        // Also add to local display for immediate feedback
+        setText(prev => prev + randomText + ' ');
+        
+        // Clear any previous errors
+        setError(null);
+      } catch (error) {
+        console.error('[Hocuspocus Test Client] Error sending text:', error);
+        setError('テキストの送信に失敗しました。');
+      }
+    };
+
+    // Always wait for connection to ensure reliable sending
+    console.log('[Hocuspocus Test Client] Setting up connection listener for test text sending');
+    
+    // Try to send immediately first, if that fails, wait for connection
+    try {
+      sendWhenReady();
+      console.log('[Hocuspocus Test Client] Text sent immediately (provider was ready)');
+    } catch (error) {
+      console.log('[Hocuspocus Test Client] Immediate send failed, waiting for connection...', error);
+      
+      // Wait for connection and then send
+      const onConnect = () => {
+        console.log('[Hocuspocus Test Client] Connection established, sending test text');
+        provider.off('connect', onConnect);
+        try {
+          sendWhenReady();
+        } catch (retryError) {
+          console.error('[Hocuspocus Test Client] Failed to send after connection:', retryError);
+          setError('テキストの送信に失敗しました。');
+        }
+      };
+      
+      provider.on('connect', onConnect);
+      
+      // Timeout after 5 seconds if connection doesn't happen
+      setTimeout(() => {
+        provider.off('connect', onConnect);
+        setError('Hocuspocus接続タイムアウトです。編集セッションが開いているか確認してください。');
+      }, 5000);
+    }
+  }, [currentSessionId, initializeHocuspocusClient]);
+
+  // Initialize Hocuspocus when session changes
+  useEffect(() => {
+    if (currentSessionId) {
+      initializeHocuspocusClient();
+    } else {
+      cleanupHocuspocusClient();
+    }
+  }, [currentSessionId, initializeHocuspocusClient, cleanupHocuspocusClient]);
+
   // Load audio devices when component mounts
   useEffect(() => {
     console.log('[Component] 🎬 RealtimeClient component mounted, loading audio devices...');
@@ -648,8 +846,9 @@ export default function RealtimeClient() {
       console.log('[Component] 🧹 RealtimeClient component unmounting, cleaning up...');
       stopAudioStream();
       disconnectWebSocket();
+      cleanupHocuspocusClient();
     };
-  }, [stopAudioStream, disconnectWebSocket]);
+  }, [stopAudioStream, disconnectWebSocket, cleanupHocuspocusClient]);
 
   return (
     <main className="container mx-auto px-4 py-8 max-w-4xl">
@@ -954,12 +1153,21 @@ export default function RealtimeClient() {
           )}
           
           {/* Create/Open Session Button */}
-          <div className="flex justify-center">
+          <div className="flex justify-center space-x-4">
             <button
               onClick={createOrOpenEditingSession}
               className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
             >
               {currentSessionId ? '編集セッションを開く' : '編集セッションの作成'}
+            </button>
+            
+            <button
+              onClick={sendTestText}
+              disabled={!currentSessionId}
+              className="px-6 py-3 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              title={!currentSessionId ? "セッションIDを設定してください" : "テスト文字列を共同編集セッションに送信"}
+            >
+              テスト文字列送信
             </button>
           </div>
         </div>
@@ -970,7 +1178,7 @@ export default function RealtimeClient() {
             ? "bg-red-50 border-2 border-red-200" 
             : "bg-white"
         }`}>
-          <div className="flex justify-center space-x-4">
+          <div className="flex justify-center space-x-4 flex-wrap gap-2">
           <button
             onClick={isRecording ? stopRecording : startRecording}
             disabled={!isConnected && !isRecording}
@@ -980,7 +1188,7 @@ export default function RealtimeClient() {
                 : "bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
             }`}
           >
-            {isRecording ? "Stop Streaming" : "Start Streaming"}
+            {isRecording ? "文字起こし終了" : "文字起こし開始"}
           </button>
           
           <button
