@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
@@ -12,18 +12,30 @@ interface CollaborativeEditorV2Props {
 }
 
 export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditorV2Props) {
-  const [ydoc] = useState(() => {
-    // Ensure unique document per session
-    const doc = new Y.Doc();
-    console.log('[Collaborative Editor V2] 📄 Created new Y.Doc for session:', sessionId);
-    return doc;
-  });
+  // Use refs to prevent React Strict Mode from creating duplicates
+  const ydocRef = useRef<Y.Doc | null>(null);
+  const providerRef = useRef<HocuspocusProvider | null>(null);
+  const initializedRef = useRef(false);
+  
   const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [userCount, setUserCount] = useState(1);
 
+  // Initialize Y.Doc only once
+  if (!ydocRef.current) {
+    ydocRef.current = new Y.Doc();
+    console.log('[Collaborative Editor V2] 📄 Created new Y.Doc for session:', sessionId);
+  }
+
   // Initialize Hocuspocus provider
   useEffect(() => {
+    // Prevent duplicate initialization in React Strict Mode
+    if (initializedRef.current || !ydocRef.current) {
+      console.log('[Collaborative Editor V2] ⚠️ Skipping duplicate initialization');
+      return;
+    }
+    
+    initializedRef.current = true;
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
     // Use the current hostname and port, automatically detecting protocol
@@ -37,8 +49,10 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     const hocusProvider = new HocuspocusProvider({
       url: websocketUrl,
       name: roomName,
-      document: ydoc,
+      document: ydocRef.current,
     });
+    
+    providerRef.current = hocusProvider;
     
     hocusProvider.on('status', (event: { status: string }) => {
       console.log('[Hocuspocus Provider V2] Status:', event.status);
@@ -74,18 +88,20 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
     return () => {
       console.log('[Collaborative Editor V2] 🧹 Cleaning up Hocuspocus provider');
-      if (hocusProvider) {
+      if (providerRef.current) {
         try {
-          hocusProvider.disconnect();
-          hocusProvider.destroy();
+          providerRef.current.disconnect();
+          providerRef.current.destroy();
         } catch (error) {
           console.error('[Collaborative Editor V2] ❌ Error during cleanup:', error);
         }
+        providerRef.current = null;
       }
       setProvider(null);
       setIsConnected(false);
+      initializedRef.current = false;
     };
-  }, [sessionId, ydoc]);
+  }, [sessionId]);
 
   // Create editor with collaboration (no cursor for now)
   const editor = useEditor({
@@ -94,7 +110,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         history: false, // Disable history for collaboration
       }),
       Collaboration.configure({
-        document: ydoc,
+        document: ydocRef.current,
         field: `content-${sessionId}`, // Use session-specific field name
       }),
     ],
@@ -113,22 +129,35 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Document change listener for debugging
   useEffect(() => {
-    if (!ydoc) return;
+    if (!ydocRef.current) return;
 
-    // Use session-specific text field name to avoid conflicts
-    const textFieldName = `content-${sessionId}`;
-    const ytext = ydoc.getText(textFieldName);
-    
-    const onChange = () => {
-      console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
-    };
+    try {
+      // Use session-specific text field name to avoid conflicts
+      const textFieldName = `content-${sessionId}`;
+      
+      // Check if this text type already exists to avoid duplication
+      const existingText = ydocRef.current.share.has(textFieldName);
+      console.log(`[Collaborative Editor V2] 📄 Text field '${textFieldName}' exists:`, existingText);
+      
+      const ytext = ydocRef.current.getText(textFieldName);
+      
+      const onChange = () => {
+        console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
+      };
 
-    ytext.observe(onChange);
+      ytext.observe(onChange);
 
-    return () => {
-      ytext.unobserve(onChange);
-    };
-  }, [ydoc, sessionId]);
+      return () => {
+        try {
+          ytext.unobserve(onChange);
+        } catch (error) {
+          console.warn('[Collaborative Editor V2] ⚠️ Error during unobserve:', error);
+        }
+      };
+    } catch (error) {
+      console.error('[Collaborative Editor V2] ❌ Error setting up document listener:', error);
+    }
+  }, [sessionId]);
 
   if (!editor) {
     return (

@@ -185,7 +185,7 @@ app.prepare().then(() => {
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         input_audio_transcription: {
-          model: 'whisper-1',
+          model: 'gpt-4o-transcribe',
           ...(prompt ? { prompt: prompt } : {})
         },
         turn_detection: {
@@ -614,29 +614,43 @@ app.prepare().then(() => {
   });
 
   // Function to send text to Hocuspocus document
-  function sendTextToHocuspocusDocument(sessionId, text) {
+  async function sendTextToHocuspocusDocument(sessionId, text) {
     try {
       console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${text}"`);
       
       const roomName = `transcribe-editor-v2-${sessionId}`;
       
-      // Get or create document directly
-      const document = hocuspocus.documents.get(roomName) || hocuspocus.createDocument(roomName);
+      // Access existing document from server's documents collection
+      const document = hocuspocus.documents.get(roomName);
       
-      if (document && document.getYDoc) {
-        const ydoc = document.getYDoc();
+      if (document) {
         // Use session-specific field name to match client
         const fieldName = `content-${sessionId}`;
-        const ytext = ydoc.getText(fieldName);
         
-        // Add text to document
-        const currentLength = ytext.length;
-        const textToAdd = currentLength > 0 ? ` ${text}` : text;
-        ytext.insert(currentLength, textToAdd);
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = document.getXmlFragment(fieldName);
         
-        console.log(`[Hocuspocus Integration] ✅ Text added to field '${fieldName}' in document: ${roomName}`);
+        // Create a simple paragraph with the transcribed text
+        // This mimics what TipTap would create when inserting text
+        const paragraph = new (require('yjs')).XmlElement('paragraph');
+        const textNode = new (require('yjs')).XmlText();
+        
+        // Add space before text if the fragment already has content
+        const hasContent = fragment.length > 0;
+        const textContent = hasContent ? ` ${text}` : text;
+        textNode.insert(0, textContent);
+        paragraph.insert(0, [textNode]);
+        
+        // Insert the paragraph at the end of the document
+        fragment.insert(fragment.length, [paragraph]);
+        
+        console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);
       } else {
-        console.log(`[Hocuspocus Integration] ⚠️ Document not found or not accessible: ${roomName}`);
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
+        
+        // Debug: Show available documents
+        const availableDocs = Array.from(hocuspocus.documents.keys());
+        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
       }
       
     } catch (error) {
