@@ -144,6 +144,15 @@ app.prepare().then(() => {
     // Transcription model tracking
     let transcriptionModel = 'gpt-4o-transcribe'; // Default model
     
+    // Speech break detection settings
+    let speechBreakDetection = false;
+    let speechBreakMarker = '⏎';
+    
+    // VAD parameters
+    let vadThreshold = 0.3;
+    let vadSilenceDuration = 1000;
+    let vadPrefixPadding = 300;
+    
     // Session management for Hocuspocus integration
     let currentSessionId = null;
     
@@ -179,9 +188,9 @@ app.prepare().then(() => {
         },
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.3,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 1000
+          threshold: vadThreshold,
+          prefix_padding_ms: vadPrefixPadding,
+          silence_duration_ms: vadSilenceDuration
         },
         temperature: 0.6,
         max_response_output_tokens: 200
@@ -238,6 +247,11 @@ app.prepare().then(() => {
               item_id: message.item_id
             }));
             
+            // Send dummy audio completion notification
+            clientWs.send(JSON.stringify({
+              type: 'dummy_audio_completed'
+            }));
+            
             // Send text to Hocuspocus document if session is active
             console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
             if (currentSessionId && message.transcript) {
@@ -283,6 +297,12 @@ app.prepare().then(() => {
               type: 'speech_stopped',
               audio_end_ms: message.audio_end_ms
             }));
+            
+            // Create paragraph break to Hocuspocus document if enabled
+            if (speechBreakDetection && currentSessionId) {
+              console.log('🔸 Creating paragraph break in document');
+              createParagraphBreak(currentSessionId);
+            }
             break;
             
           case 'response.created':
@@ -444,6 +464,44 @@ app.prepare().then(() => {
             }
             break;
             
+          case 'set_speech_break_detection':
+            // Update speech break detection settings
+            if (message.enabled !== undefined) {
+              speechBreakDetection = message.enabled;
+              console.log('🔸 Speech break detection enabled:', speechBreakDetection);
+            }
+            if (message.marker) {
+              speechBreakMarker = message.marker;
+              console.log('🔸 Speech break marker set to:', speechBreakMarker);
+            }
+            break;
+            
+          case 'set_vad_params':
+            // Update VAD parameters
+            if (message.threshold !== undefined) {
+              vadThreshold = message.threshold;
+              console.log('🎛️ VAD threshold set to:', vadThreshold);
+            }
+            if (message.silence_duration_ms !== undefined) {
+              vadSilenceDuration = message.silence_duration_ms;
+              console.log('🎛️ VAD silence duration set to:', vadSilenceDuration + 'ms');
+            }
+            if (message.prefix_padding_ms !== undefined) {
+              vadPrefixPadding = message.prefix_padding_ms;
+              console.log('🎛️ VAD prefix padding set to:', vadPrefixPadding + 'ms');
+            }
+            
+            // Update session configuration with new VAD parameters
+            sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
+            
+            // Send updated session config to OpenAI if connection is open
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              console.log('🔄 Updating OpenAI session with new VAD parameters...');
+              openaiWs.send(JSON.stringify(sessionConfig));
+              console.log('✅ Session updated with VAD parameters');
+            }
+            break;
+            
           case 'audio_chunk':
             // Only process if we have actual audio data
             if (!message.audio || message.audio.length === 0) {
@@ -602,6 +660,22 @@ app.prepare().then(() => {
             audioChunkCount = 0;
             break;
             
+          case 'send_dummy_audio_data':
+            // Send dummy audio data directly from client (localStorage)
+            if (message.audioData) {
+              sendDummyAudioData(message.audioData, message.name || 'Client Recording', clientWs, openaiWs, () => {
+                responseInProgress = true;
+                lastCommitTime = Date.now();
+              });
+            } else {
+              console.error('❌ No audio data provided for dummy audio');
+              clientWs.send(JSON.stringify({
+                type: 'error',
+                error: 'No audio data provided for dummy audio'
+              }));
+            }
+            break;
+            
           default:
             console.log('Unhandled client message type:', message.type);
         }
@@ -646,19 +720,45 @@ app.prepare().then(() => {
         // TipTap Collaboration uses XmlFragment, not Text
         const fragment = document.getXmlFragment(fieldName);
         
-        // Create a simple paragraph with the transcribed text
-        // This mimics what TipTap would create when inserting text
-        const paragraph = new (require('yjs')).XmlElement('paragraph');
-        const textNode = new (require('yjs')).XmlText();
-        
-        // Add space before text if the fragment already has content
+        // Add text to existing paragraph or create new one if needed
         const hasContent = fragment.length > 0;
-        const textContent = hasContent ? ` ${text}` : text;
-        textNode.insert(0, textContent);
-        paragraph.insert(0, [textNode]);
         
-        // Insert the paragraph at the end of the document
-        fragment.insert(fragment.length, [paragraph]);
+        if (hasContent) {
+          // Get the last element in the fragment
+          const lastElement = fragment.get(fragment.length - 1);
+          
+          if (lastElement && lastElement.nodeName === 'paragraph') {
+            // Add text to the existing last paragraph
+            const existingTextNode = lastElement.get(0);
+            if (existingTextNode && existingTextNode instanceof (require('yjs')).XmlText) {
+              // Append text with space to existing text node
+              existingTextNode.insert(existingTextNode.length, ` ${text}`);
+              console.log(`[Hocuspocus Integration] ✅ Text appended to existing paragraph in '${fieldName}'`);
+            } else {
+              // Create new text node in existing paragraph
+              const newTextNode = new (require('yjs')).XmlText();
+              newTextNode.insert(0, ` ${text}`);
+              lastElement.insert(lastElement.length, [newTextNode]);
+              console.log(`[Hocuspocus Integration] ✅ Text added as new text node in existing paragraph '${fieldName}'`);
+            }
+          } else {
+            // Last element is not a paragraph, create new paragraph
+            const newParagraph = new (require('yjs')).XmlElement('paragraph');
+            const newTextNode = new (require('yjs')).XmlText();
+            newTextNode.insert(0, ` ${text}`);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+            console.log(`[Hocuspocus Integration] ✅ Text added as new paragraph to '${fieldName}'`);
+          }
+        } else {
+          // No content yet, create first paragraph
+          const newParagraph = new (require('yjs')).XmlElement('paragraph');
+          const newTextNode = new (require('yjs')).XmlText();
+          newTextNode.insert(0, text);
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(0, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ Text added as first paragraph to '${fieldName}'`);
+        }
         
         console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);
       } else {
@@ -671,6 +771,152 @@ app.prepare().then(() => {
       
     } catch (error) {
       console.error(`[Hocuspocus Integration] ❌ Error adding text to document:`, error);
+    }
+  }
+
+  // Function to create a paragraph break in Hocuspocus document
+  async function createParagraphBreak(sessionId) {
+    try {
+      console.log(`[Hocuspocus Integration] Creating paragraph break for session ${sessionId}`);
+      
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      
+      // Access existing document from server's documents collection
+      const document = hocuspocus.documents.get(roomName);
+      
+      if (document) {
+        // Use session-specific field name to match client
+        const fieldName = `content-${sessionId}`;
+        
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = document.getXmlFragment(fieldName);
+        
+        // Only create new paragraph if there's existing content
+        const hasContent = fragment.length > 0;
+        
+        if (hasContent) {
+          // Create a new empty paragraph for the next content
+          const newParagraph = new (require('yjs')).XmlElement('paragraph');
+          const newTextNode = new (require('yjs')).XmlText();
+          newTextNode.insert(0, ''); // Empty paragraph initially
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(fragment.length, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ New paragraph created in '${fieldName}' for speech break`);
+        } else {
+          console.log(`[Hocuspocus Integration] ⚠️ No existing content, skipping paragraph break`);
+        }
+        
+      } else {
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
+        
+        // Debug: Show available documents
+        const availableDocs = Array.from(hocuspocus.documents.keys());
+        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
+      }
+      
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error creating paragraph break:`, error);
+    }
+  }
+
+
+  // Function to send dummy audio data from client (localStorage)
+  function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress) {
+    try {
+      console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
+      
+      // Convert base64 to buffer
+      const audioBuffer = Buffer.from(base64AudioData, 'base64');
+      console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
+      
+      // Check if WebSocket is ready
+      if (openaiWs.readyState !== 1) { // WebSocket.OPEN
+        console.error(`❌ OpenAI WebSocket not ready (state: ${openaiWs.readyState})`);
+        clientWs.send(JSON.stringify({
+          type: 'error',
+          error: 'WebSocket connection not ready'
+        }));
+        return;
+      }
+      
+      // Convert audio data to base64 and send in chunks
+      const chunkSize = 4096; // Match typical audio chunk size
+      const totalChunks = Math.ceil(audioBuffer.length / chunkSize);
+      console.log(`[Dummy Audio Data] 📦 Sending ${totalChunks} chunks of ${chunkSize} bytes each`);
+      
+      let chunkIndex = 0;
+      
+      const sendNextChunk = () => {
+        if (chunkIndex >= totalChunks) {
+          console.log(`[Dummy Audio Data] ✅ All ${totalChunks} chunks sent successfully`);
+          
+          // Auto-commit the audio after sending all chunks
+          setTimeout(() => {
+            console.log(`[Dummy Audio Data] 🔄 Auto-committing client audio buffer`);
+            setResponseInProgress();
+            
+            const commitEvent = {
+              type: 'input_audio_buffer.commit'
+            };
+            
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(commitEvent));
+              console.log('✅ Client audio buffer committed, waiting for transcription...');
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
+            }
+          }, 1000); // Wait 1 second before committing
+          
+          return;
+        }
+        
+        const start = chunkIndex * chunkSize;
+        const end = Math.min(start + chunkSize, audioBuffer.length);
+        const chunk = audioBuffer.slice(start, end);
+        const base64Chunk = chunk.toString('base64');
+        
+        const audioEvent = {
+          type: 'input_audio_buffer.append',
+          audio: base64Chunk
+        };
+        
+        try {
+          openaiWs.send(JSON.stringify(audioEvent));
+          
+          if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
+            console.log(`[Dummy Audio Data] 📤 Sent chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} bytes)`);
+          }
+          
+          chunkIndex++;
+          
+          // Send next chunk after a small delay to simulate real-time streaming
+          setTimeout(sendNextChunk, 50); // 50ms delay between chunks
+          
+        } catch (error) {
+          console.error(`❌ Error sending client audio chunk ${chunkIndex}:`, error);
+          clientWs.send(JSON.stringify({
+            type: 'error',
+            error: `Failed to send client audio chunk ${chunkIndex}: ${error.message}`
+          }));
+        }
+      };
+      
+      // Start sending chunks
+      clientWs.send(JSON.stringify({
+        type: 'dummy_audio_started',
+        filename: recordingName,
+        totalSize: audioBuffer.length,
+        totalChunks: totalChunks
+      }));
+      
+      sendNextChunk();
+      
+    } catch (error) {
+      console.error(`[Dummy Audio Data] ❌ Error processing client audio data:`, error);
+      clientWs.send(JSON.stringify({
+        type: 'error',
+        error: `Failed to process client audio data: ${error.message}`
+      }));
     }
   }
 
