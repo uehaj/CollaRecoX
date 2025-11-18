@@ -1,4 +1,86 @@
-# 全体方針
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## プロジェクト概要
+
+このプロジェクトは、OpenAI GPT-4oモデルを使用した音声文字起こしアプリケーションと、リアルタイム共同編集機能を持つNext.js 15アプリケーションです。
+
+### 主要機能
+
+1. **音声文字起こし** - OpenAI GPT-4o transcribe/realtimeモデルによる音声認識
+   - `/recorder` - バッチ処理モード（録音完了後に処理）
+   - `/realtime` - リアルタイムストリーミングモード（WebSocket経由）
+
+2. **リアルタイム共同編集** - Yjs + Tiptapによる共同編集
+   - `/editor/[sessionId]` - Google Docs風の共同編集画面
+   - 外部WebSocket（wss://demos.yjs.dev/ws）を使用した同期
+
+### 技術スタック
+
+- **フレームワーク**: Next.js 15 (App Router)
+- **リアルタイム同期**: Yjs + y-websocket + Tiptap
+- **WebSocketサーバー**: カスタムNode.jsサーバー（server.js）
+- **AI**: OpenAI API (GPT-4o transcribe/realtime models)
+- **状態管理**: Jotai
+- **スタイリング**: Tailwind CSS v4
+
+## 開発コマンド
+
+```bash
+# 開発サーバーの起動（ポート5001、WebSocket対応）
+npm run dev
+
+# 標準のNext.js開発サーバー（WebSocketなし）
+npm run next-dev
+
+# プロダクションビルド
+npm run build
+
+# プロダクションサーバーの起動
+npm run start
+
+# リント
+npm run lint
+```
+
+**重要**: 開発時は `npm run dev` を使用してください。これは `server.js` を使用し、WebSocket機能（リアルタイム文字起こし用）をサポートします。
+
+## 環境変数
+
+プロジェクトルートに `.env.local` ファイルを作成し、以下を設定してください：
+
+```env
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+`.env.example` を参考にしてください。
+
+## アーキテクチャ概要
+
+### WebSocketサーバー（server.js）
+
+- Next.jsのカスタムサーバーとして動作
+- `/api/realtime-ws` パスでWebSocketをハンドリング
+- OpenAI Realtime APIへのプロキシとして機能
+- HMR（Hot Module Replacement）用のWebSocketも処理
+
+### 共同編集の仕組み
+
+- **Yjs**: CRDTベースのリアルタイムデータ同期ライブラリ
+- **y-websocket**: YjsドキュメントをWebSocket経由で同期
+- **Tiptap**: ProseMirrorベースのリッチテキストエディタ
+- **y-prosemirror**: YjsとProseMirrorのバインディング
+
+現在は外部サービス（`wss://demos.yjs.dev/ws`）を使用していますが、将来的にはserver.jsに統合可能です。
+
+### APIルート構成
+
+- `/api/transcribe` - バッチ音声文字起こし（ストリーミングレスポンス）
+- `/api/realtime` - リアルタイム文字起こし設定
+- `/api/realtime-ws` - WebSocket経由のリアルタイム音声ストリーミング
+
+## 全体方針
 
 まず、イシュー(ISSUE.md)を確認します。イシューがなければ指示をうけてイシューを作成します。
 イシュー作成後に、計画(PLAN.md)を作成し、確認をとります。
