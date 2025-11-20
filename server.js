@@ -4,18 +4,18 @@ const next = require('next');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
 const Y = require('yjs');
-const { setupWSConnection } = require('y-websocket/bin/utils');
+const { setupWSConnection } = require('@y/websocket-server/utils');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
 // Parse port from arguments or environment variable
-let port = 8888;
+let port = 5001;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
 if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
-  port = parseInt(process.argv[portArgIndex + 1]) || 8888;
+  port = parseInt(process.argv[portArgIndex + 1]) || 5001;
 } else if (process.env.PORT) {
-  port = parseInt(process.env.PORT) || 8888;
+  port = parseInt(process.env.PORT) || 5001;
 }
 console.log('Using port:', port);
 
@@ -41,26 +41,19 @@ app.prepare().then(() => {
     }
   });
 
-  // Create WebSocket servers
-  const wss = new WebSocketServer({ 
-    noServer: true
-  });
-  
-  const yjsWss = new WebSocketServer({ 
-    noServer: true
-  });
+  // Create WebSocket servers with noServer option
+  const wss = new WebSocketServer({ noServer: true });
+  const yjsWss = new WebSocketServer({ noServer: true });
 
   // Handle WebSocket upgrades properly
   server.on('upgrade', (request, socket, head) => {
     const pathname = parse(request.url).pathname;
-    
+
     if (pathname === '/api/realtime-ws') {
-      // Let realtime WebSocket server handle this
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
     } else if (pathname === '/api/yjs-ws') {
-      // Let YJS WebSocket server handle this
       yjsWss.handleUpgrade(request, socket, head, (ws) => {
         yjsWss.emit('connection', ws, request);
       });
