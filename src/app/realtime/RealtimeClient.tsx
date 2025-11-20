@@ -173,7 +173,9 @@ export default function RealtimeClient() {
     }
 
     const currentPrompt = getCurrentPrompt();
-    const wsUrl = `ws://localhost:5001/api/realtime-ws?model=${model}`;
+    const wsUrl = process.env.NODE_ENV === 'production' 
+      ? `wss://${window.location.host}/api/realtime-ws?model=${model}`
+      : `ws://localhost:8888/api/realtime-ws?model=${model}`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
     const ws = new WebSocket(wsUrl);
@@ -216,7 +218,10 @@ export default function RealtimeClient() {
                 import('yjs').then(Y => {
                   import('y-websocket').then(({ WebsocketProvider }) => {
                     const ydoc = new Y.Doc();
-                    const provider = new WebsocketProvider(`ws://localhost:5001/api/yjs-ws?sessionId=${currentSessionId}`, `transcribe-editor-${currentSessionId}`, ydoc);
+                    const yjsWsUrl = process.env.NODE_ENV === 'production' 
+                      ? `wss://${window.location.host}/api/yjs-ws?sessionId=${currentSessionId}`
+                      : `ws://localhost:8888/api/yjs-ws?sessionId=${currentSessionId}`;
+                    const provider = new WebsocketProvider(yjsWsUrl, `transcribe-editor-${currentSessionId}`, ydoc);
                     
                     provider.on('status', (event: { status: string }) => {
                       console.log('[Realtime] Yjs status:', event.status);
@@ -458,6 +463,17 @@ export default function RealtimeClient() {
           }
         }
 
+        // Check for actual audio content before sending
+        const maxPcmValue = Math.max(...Array.from(pcm16).map(Math.abs));
+        
+        // Skip silent audio chunks (threshold: 100 for 16-bit PCM)
+        if (maxPcmValue < 100) {
+          if (audioChunkCount <= 10 || audioChunkCount % 50 === 0) {
+            console.warn(`[Audio Processing] ⚠️ Skipping silent chunk #${audioChunkCount}: max PCM=${maxPcmValue}`);
+          }
+          return; // Don't send silent audio
+        }
+
         // Send audio chunk to WebSocket
         try {
           websocketRef.current.send(JSON.stringify({
@@ -467,7 +483,7 @@ export default function RealtimeClient() {
           
           // Log successful transmission every 20th chunk
           if (audioChunkCount % 20 === 0) {
-            console.log(`[WebSocket] 📤 Audio chunk #${audioChunkCount} sent successfully`);
+            console.log(`[WebSocket] 📤 Audio chunk #${audioChunkCount} sent successfully (max PCM: ${maxPcmValue})`);
           }
         } catch (sendError) {
           console.error(`[WebSocket] ❌ Failed to send audio chunk #${audioChunkCount}:`, sendError);
