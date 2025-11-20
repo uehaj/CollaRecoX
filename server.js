@@ -5,16 +5,32 @@ const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
 const Y = require('yjs');
 const { setupWSConnection } = require('y-websocket/bin/utils');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
-const port = parseInt(process.argv.find(arg => arg.startsWith('-p'))?.replace('-p', '')) || 8000;
+// Parse port from arguments or environment variable
+let port = 8888;
+const portArgIndex = process.argv.findIndex(arg => arg === '-p');
+if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
+  port = parseInt(process.argv[portArgIndex + 1]) || 8888;
+} else if (process.env.PORT) {
+  port = parseInt(process.env.PORT) || 8888;
+}
+console.log('Using port:', port);
 
-const app = next({ dev, hostname, port });
+const app = next({ dev, hostname });
 const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
   const server = createServer(async (req, res) => {
+    // WebSocketパスはNext.jsに送らず、アップグレード処理を待つ
+    if (req.url?.startsWith('/api/realtime-ws') || req.url?.startsWith('/api/yjs-ws')) {
+      // WebSocketアップグレードを待つ（何もしない）
+      return;
+    }
+    
+    // 通常のHTTPリクエストのみNext.jsに転送
     try {
       const parsedUrl = parse(req.url, true);
       await handle(req, res, parsedUrl);
@@ -25,10 +41,13 @@ app.prepare().then(() => {
     }
   });
 
-  // Create YJS WebSocket server
+  // Create WebSocket servers
+  const wss = new WebSocketServer({ 
+    noServer: true
+  });
+  
   const yjsWss = new WebSocketServer({ 
-    server,
-    path: '/api/yjs-ws'
+    noServer: true
   });
 
   // Handle WebSocket upgrades properly
@@ -37,22 +56,20 @@ app.prepare().then(() => {
     
     if (pathname === '/api/realtime-ws') {
       // Let realtime WebSocket server handle this
-      return;
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
     } else if (pathname === '/api/yjs-ws') {
       // Let YJS WebSocket server handle this
-      return;
+      yjsWss.handleUpgrade(request, socket, head, (ws) => {
+        yjsWss.emit('connection', ws, request);
+      });
     } else if (pathname === '/_next/webpack-hmr') {
       // Let Next.js handle HMR WebSocket
       handle.upgrade?.(request, socket, head);
     } else {
       socket.destroy();
     }
-  });
-
-  // Create WebSocket server
-  const wss = new WebSocketServer({ 
-    server,
-    path: '/api/realtime-ws'
   });
 
   wss.on('connection', function connection(clientWs, request) {
@@ -92,11 +109,15 @@ app.prepare().then(() => {
     const openaiUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
     console.log('Connecting to OpenAI Realtime API:', openaiUrl);
     
+    // Create proxy agent if HTTPS_PROXY is set
+    const proxyAgent = process.env.HTTPS_PROXY ? new HttpsProxyAgent(process.env.HTTPS_PROXY) : undefined;
+    
     const openaiWs = new WebSocket(openaiUrl, {
       headers: {
         'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
         'OpenAI-Beta': 'realtime=v1'
-      }
+      },
+      agent: proxyAgent
     });
 
     // Function to create session configuration with optional prompt
@@ -339,44 +360,40 @@ app.prepare().then(() => {
               return;
             }
             
-            // Track audio buffer duration (calculate based on resampled data)
-            // ScriptProcessor: 4096 samples at source rate, resampled to 24kHz
+            // Validate audio data first
             const audioData = Buffer.from(message.audio, 'base64');
-            const sampleCount = audioData.length / 2; // 16-bit = 2 bytes per sample
-            const chunkDurationMs = (sampleCount / 24000) * 1000; // duration at 24kHz
-            audioBufferDuration += chunkDurationMs;
-            audioChunkCount++;
-            lastAudioTimestamp = Date.now();
-            
-            console.log(`Audio chunk ${audioChunkCount}: buffer=${audioBufferDuration}ms, size=${message.audio.length} chars`);
-            
-            // Validate and forward audio data to OpenAI (PCM16 format at 24kHz)
-            console.log(`Audio validation: buffer size=${audioData.length} bytes, expected samples=${audioData.length/2}, duration=${(audioData.length/2/24000*1000).toFixed(2)}ms`);
-            
-            // Validate audio data content
             const int16Array = new Int16Array(audioData.buffer, audioData.byteOffset, audioData.length / 2);
             const maxSample = Math.max(...Array.from(int16Array).map(Math.abs));
             const avgSample = Array.from(int16Array).reduce((sum, val) => sum + Math.abs(val), 0) / int16Array.length;
-            console.log(`Audio content: max sample=${maxSample}, avg sample=${avgSample.toFixed(2)} (0=silence, 32767=max)`);
+            
+            audioChunkCount++;
+            
+            // Skip silent audio chunks (threshold: 100 for very quiet audio)
+            if (maxSample < 100) {
+              console.warn(`⚠️ Skipping silent audio chunk ${audioChunkCount}: max sample=${maxSample}`);
+              return;
+            }
+            
+            // Track audio buffer duration only for non-silent chunks
+            const sampleCount = audioData.length / 2; // 16-bit = 2 bytes per sample
+            const chunkDurationMs = (sampleCount / 24000) * 1000; // duration at 24kHz
+            audioBufferDuration += chunkDurationMs;
+            lastAudioTimestamp = Date.now();
+            
+            console.log(`Audio chunk ${audioChunkCount}: buffer=${audioBufferDuration}ms, size=${message.audio.length} chars, max sample=${maxSample}`);
             
             // Log first few samples for debugging
             if (audioChunkCount <= 3) {
               console.log(`First 10 samples:`, Array.from(int16Array.slice(0, 10)));
             }
             
-            // Only send if we have valid audio data with actual content
-            if (audioData.length > 0 && audioData.length % 2 === 0 && maxSample > 0) {
-              const audioEvent = {
-                type: 'input_audio_buffer.append',
-                audio: message.audio // Base64 encoded PCM16 audio
-              };
-              openaiWs.send(JSON.stringify(audioEvent));
-              console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
-            } else if (maxSample === 0) {
-              console.warn(`⚠️ Skipping silent audio chunk (max sample = 0)`);
-            } else {
-              console.warn(`❌ Invalid audio buffer: size=${audioData.length}, not sending to OpenAI`);
-            }
+            // Send valid audio data with actual content
+            const audioEvent = {
+              type: 'input_audio_buffer.append',
+              audio: message.audio // Base64 encoded PCM16 audio
+            };
+            openaiWs.send(JSON.stringify(audioEvent));
+            console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
             
             // Clear any existing timer
             if (autoCommitTimer) {
