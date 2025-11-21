@@ -105,6 +105,15 @@ app.prepare().then(() => {
         console.error('[WebSocket] ❌ Realtime WebSocket upgrade error:', upgradeError);
         socket.destroy();
       }
+    } else if (pathname === '/_next/webpack-hmr') {
+      console.log('[WebSocket] Processing HMR WebSocket upgrade request');
+      // Let Next.js handle HMR WebSocket
+      if (handle.upgrade) {
+        handle.upgrade(request, socket, head);
+      } else {
+        console.error('[WebSocket] ❌ Next.js handle.upgrade not available');
+        socket.destroy();
+      }
     } else {
       console.log(`[WebSocket] ❌ Unknown WebSocket path: ${pathname}, destroying socket`);
       socket.destroy();
