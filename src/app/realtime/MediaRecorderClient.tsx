@@ -90,7 +90,7 @@ export default function MediaRecorderClient() {
       return;
     }
 
-    const wsUrl = `ws://localhost:3000/api/realtime-ws?model=${model}`;
+    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws?model=${model}`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     const ws = new WebSocket(wsUrl);
     websocketRef.current = ws;

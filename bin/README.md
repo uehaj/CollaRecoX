@@ -37,10 +37,23 @@ WebSocketサーバーをデーモンプロセスとして起動・管理する�
 
 ```bash
 # OpenAI APIキーを設定（必須）
+# ⚠️ 重要: このAPIキーが設定されていない場合、サーバーは起動時にエラーで停止します
 export OPENAI_API_KEY="your-openai-api-key-here"
 
 # プロキシ設定（社内環境では必須）
 export HTTPS_PROXY="http://prx01.dev.ntt-tx.co.jp:8080"
+
+# 重要: localhostをプロキシから除外（404エラー回避のため必須）
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="localhost,127.0.0.1,::1"
+```
+
+**注意**: OPENAI_API_KEYが未設定の場合、サーバーは以下のエラーメッセージを表示して停止します：
+```
+❌ ERROR: OPENAI_API_KEY environment variable is required
+Please set your OpenAI API key:
+export OPENAI_API_KEY="your-api-key-here"
+You can find your API key at: https://platform.openai.com/account/api-keys
 ```
 
 ### ログファイル
@@ -117,6 +130,16 @@ sudo systemctl enable collarecox
 ## 注意事項
 
 - サーバー起動前に `npm install` を実行してください
-- OpenAI APIキーは必須です
+- OpenAI APIキーは必須です（未設定の場合は起動時にエラーで停止）
 - 社内環境では必ずプロキシ設定を行ってください
 - サーバー停止時は `./bin/start-daemon.sh stop` を使用してください（Ctrl+Cは推奨されません）
+
+## 自動機能
+
+### 自動ビルド
+- 本番ビルド（`.next/BUILD_ID`）が存在しない場合、サーバー起動時に自動的に `npm run build` を実行
+- ビルドに失敗した場合はサーバー起動を中止
+
+### 環境変数チェック
+- `OPENAI_API_KEY` が未設定の場合、起動時にエラーメッセージとともに停止
+- 設定方法とAPIキー取得先のURLを表示
