@@ -202,7 +202,7 @@ app.prepare().then(() => {
           prefix_padding_ms: vadPrefixPadding,
           silence_duration_ms: vadSilenceDuration
         },
-        temperature: 0.0,  // Deterministic (no variability needed)
+        temperature: 0.6,  // Minimum allowed value for Realtime API
         max_response_output_tokens: 1  // Minimize response generation
       }
     });
