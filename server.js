@@ -522,10 +522,11 @@ app.prepare().then(() => {
     });
   });
 
-  server.listen(port, (err) => {
+  server.listen(port, hostname, (err) => {
     if (err) throw err;
-    console.log(`> Ready on http://${hostname}:${port}`);
-    console.log(`> WebSocket server ready on ws://${hostname}:${port}/api/realtime-ws`);
-    console.log(`> YJS WebSocket server ready on ws://${hostname}:${port}/api/yjs-ws`);
+    const displayHost = hostname === '0.0.0.0' ? 'localhost' : hostname;
+    console.log(`> Ready on http://${displayHost}:${port}`);
+    console.log(`> WebSocket server ready on ws://${displayHost}:${port}/api/realtime-ws`);
+    console.log(`> YJS WebSocket server ready on ws://${displayHost}:${port}/api/yjs-ws`);
   });
 });
