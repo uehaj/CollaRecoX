@@ -31,12 +31,18 @@ export default function Home() {
 
           {/* CTA */}
           <div className="space-y-6">
-            <div className="flex justify-center">
+            <div className="flex justify-center space-x-4">
               <Link
                 href="/realtime"
                 className="inline-block bg-orange-600 hover:bg-orange-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
               >
                 Real-time Streaming →
+              </Link>
+              <Link
+                href="/dummy-recorder"
+                className="inline-block bg-green-600 hover:bg-green-700 text-white font-medium py-4 px-8 rounded-lg text-lg transition-colors shadow-lg"
+              >
+                ダミーデータ作成 →
               </Link>
             </div>
             <p className="text-sm text-gray-500">
