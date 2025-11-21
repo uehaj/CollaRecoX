@@ -1,36 +1,59 @@
+#!/usr/bin/env node
 const { createServer } = require('http');
 const { parse } = require('url');
 const next = require('next');
+const { Hocuspocus } = require('@hocuspocus/server'); // ← ここ重要（Server ではなく Hocuspocus）
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
-const Y = require('yjs');
-const { setupWSConnection } = require('@y/websocket-server/utils');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ ERROR: OPENAI_API_KEY environment variable is required');
+  process.exit(1);
+}
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
-// Parse port from arguments or environment variable
-let port = 5001;
+
+// Port
+let port = 8888;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
 if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
-  port = parseInt(process.argv[portArgIndex + 1]) || 5001;
+  port = parseInt(process.argv[portArgIndex + 1]) || 8888;
 } else if (process.env.PORT) {
-  port = parseInt(process.env.PORT) || 5001;
+  port = parseInt(process.env.PORT) || 8888;
 }
 console.log('Using port:', port);
 
 const app = next({ dev, hostname });
 const handle = app.getRequestHandler();
 
+// Hocuspocus（内蔵サーバなし）
+const hocuspocus = new Hocuspocus({
+  async onAuthenticate({ connection, document, context }) {
+    console.log(`[Hocuspocus] Authentication request for document: ${document?.name || 'unknown'}`);
+    return true;
+  },
+  async onLoadDocument({ documentName }) {
+    console.log(`[Hocuspocus] Loading document: ${documentName}`);
+    return null; // 空で開始
+  },
+  onConnect({ connection, document }) {
+    console.log(`[Hocuspocus] ✅ Client connected to document: ${document?.name || 'unknown'}`);
+  },
+  onDisconnect({ connection, document }) {
+    console.log(`[Hocuspocus] 🔌 Client disconnected from document: ${document?.name || 'unknown'}`);
+  },
+  onStateless({ payload, document }) {
+    console.log(`[Hocuspocus] 📨 Stateless for ${document.name}:`, payload);
+  },
+});
+
 app.prepare().then(() => {
+  console.log('Next.js app prepared successfully');
+
   const server = createServer(async (req, res) => {
-    // WebSocketパスはNext.jsに送らず、アップグレード処理を待つ
-    if (req.url?.startsWith('/api/realtime-ws') || req.url?.startsWith('/api/yjs-ws')) {
-      // WebSocketアップグレードを待つ（何もしない）
-      return;
-    }
-    
-    // 通常のHTTPリクエストのみNext.jsに転送
+    // Next.js へ
     try {
       const parsedUrl = parse(req.url, true);
       await handle(req, res, parsedUrl);
@@ -41,35 +64,71 @@ app.prepare().then(() => {
     }
   });
 
-  // Create WebSocket servers with noServer option
-  const wss = new WebSocketServer({ noServer: true });
-  const yjsWss = new WebSocketServer({ noServer: true });
-
-  // Handle WebSocket upgrades properly
+  // WebSocket servers
+  const yjsWss = new WebSocketServer({ noServer: true }); // For Hocuspocus
+  const realtimeWss = new WebSocketServer({ noServer: true }); // For realtime audio
+  
+  // Add comprehensive upgrade debugging
   server.on('upgrade', (request, socket, head) => {
-    const pathname = parse(request.url).pathname;
-
-    if (pathname === '/api/realtime-ws') {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
-    } else if (pathname === '/api/yjs-ws') {
-      yjsWss.handleUpgrade(request, socket, head, (ws) => {
-        yjsWss.emit('connection', ws, request);
-      });
-    } else if (pathname === '/_next/webpack-hmr') {
-      // Let Next.js handle HMR WebSocket
-      handle.upgrade?.(request, socket, head);
+    console.log(`[WebSocket] 🔄 UPGRADE EVENT TRIGGERED!`);
+    console.log(`[WebSocket] Request URL: ${request.url}`);
+    console.log(`[WebSocket] Request headers:`, request.headers);
+    
+    const { pathname } = parse(request.url);
+    console.log(`[WebSocket] Parsed pathname: ${pathname}`);
+    
+    if (pathname.startsWith('/api/yjs-ws')) {
+      console.log('[WebSocket] Processing /api/yjs-ws upgrade request');
+      try {
+        yjsWss.handleUpgrade(request, socket, head, (ws) => {
+          console.log('[WebSocket] ✅ WebSocket upgrade successful, passing to Hocuspocus');
+          try {
+            // ここが肝：Hocuspocus に WebSocket を引き渡す
+            hocuspocus.handleConnection(ws, request);
+            console.log('[WebSocket] ✅ Hocuspocus handleConnection called successfully');
+          } catch (hocuspocusError) {
+            console.error('[WebSocket] ❌ Hocuspocus handleConnection error:', hocuspocusError);
+            ws.close();
+          }
+        });
+      } catch (upgradeError) {
+        console.error('[WebSocket] ❌ WebSocket upgrade error:', upgradeError);
+        socket.destroy();
+      }
+    } else if (pathname === '/api/realtime-ws') {
+      console.log('[WebSocket] Processing /api/realtime-ws upgrade request');
+      try {
+        realtimeWss.handleUpgrade(request, socket, head, (ws) => {
+          realtimeWss.emit('connection', ws, request);
+        });
+      } catch (upgradeError) {
+        console.error('[WebSocket] ❌ Realtime WebSocket upgrade error:', upgradeError);
+        socket.destroy();
+      }
     } else {
+      console.log(`[WebSocket] ❌ Unknown WebSocket path: ${pathname}, destroying socket`);
       socket.destroy();
     }
   });
 
-  wss.on('connection', function connection(clientWs, request) {
-    console.log('Client connected to WebSocket');
+  // Additional error handlers
+  server.on('error', (error) => {
+    console.error('[Server] ❌ HTTP Server error:', error);
+  });
+
+  yjsWss.on('error', (error) => {
+    console.error('[WebSocket] ❌ YJS WebSocketServer error:', error);
+  });
+
+  realtimeWss.on('error', (error) => {
+    console.error('[WebSocket] ❌ Realtime WebSocketServer error:', error);
+  });
+
+  // Handle realtime audio WebSocket connections
+  realtimeWss.on('connection', function connection(clientWs, request) {
+    console.log('Client connected to realtime WebSocket');
     
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    const model = url.searchParams.get('model') || 'gpt-4o-realtime-preview';
+    // No need to parse model parameter - using fixed model
     
     // Audio buffer tracking
     let audioBufferDuration = 0; // in milliseconds
@@ -82,24 +141,26 @@ app.prepare().then(() => {
     // Transcription prompt tracking
     let transcriptionPrompt = '';
     
-    // Validate model - try both old and new naming conventions
-    const validModels = [
-      'gpt-4o-realtime-preview', 
-      'gpt-4o-mini-realtime-preview',
-      'gpt-4o-realtime-preview-2024-10-01', 
-      'gpt-4o-mini-realtime-preview-2024-10-01'
-    ];
-    if (!validModels.includes(model)) {
-      clientWs.send(JSON.stringify({
-        type: 'error',
-        error: 'Invalid model. Use gpt-4o-realtime-preview or gpt-4o-mini-realtime-preview'
-      }));
-      clientWs.close();
-      return;
-    }
-
-    // Connect to OpenAI Realtime API with model parameter
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
+    // Transcription model tracking
+    let transcriptionModel = 'gpt-4o-transcribe'; // Default model
+    
+    // Speech break detection settings
+    let speechBreakDetection = false;
+    let speechBreakMarker = '⏎';
+    
+    // VAD parameters
+    let vadThreshold = 0.3;
+    let vadSilenceDuration = 1000;
+    let vadPrefixPadding = 300;
+    
+    // Session management for Hocuspocus integration
+    let currentSessionId = null;
+    
+    // Fixed Realtime model for audio transcription (lightweight and cost-effective)
+    const fixedRealtimeModel = 'gpt-4o-mini-realtime-preview';
+    
+    // Connect to OpenAI Realtime API with fixed model
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${fixedRealtimeModel}`;
     console.log('Connecting to OpenAI Realtime API:', openaiUrl);
     
     // Create proxy agent if HTTPS_PROXY is set
@@ -113,8 +174,8 @@ app.prepare().then(() => {
       agent: proxyAgent
     });
 
-    // Function to create session configuration with optional prompt
-    const createSessionConfig = (prompt = '') => ({
+    // Function to create session configuration with optional prompt and transcription model
+    const createSessionConfig = (prompt = '', transcriptionModel = 'gpt-4o-transcribe') => ({
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
@@ -122,22 +183,22 @@ app.prepare().then(() => {
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
         input_audio_transcription: {
-          model: 'whisper-1',
+          model: transcriptionModel,
           ...(prompt ? { prompt: prompt } : {})
         },
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.3,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 1000
+          threshold: vadThreshold,
+          prefix_padding_ms: vadPrefixPadding,
+          silence_duration_ms: vadSilenceDuration
         },
         temperature: 0.6,
         max_response_output_tokens: 200
       }
     });
 
-    // Initial session configuration (will be updated when prompt is received)
-    let sessionConfig = createSessionConfig();
+    // Initial session configuration (will be updated when prompt/model is received)
+    let sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
 
     openaiWs.on('open', () => {
       console.log('🔗 Connected to OpenAI Realtime API');
@@ -185,6 +246,19 @@ app.prepare().then(() => {
               text: message.transcript,
               item_id: message.item_id
             }));
+            
+            // Send dummy audio completion notification
+            clientWs.send(JSON.stringify({
+              type: 'dummy_audio_completed'
+            }));
+            
+            // Send text to Hocuspocus document if session is active
+            console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
+            if (currentSessionId && message.transcript) {
+              sendTextToHocuspocusDocument(currentSessionId, message.transcript);
+            } else {
+              console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${message.transcript ? 'HAS_CONTENT' : 'EMPTY'}`);
+            }
             break;
             
           case 'conversation.item.input_audio_transcription.failed':
@@ -223,6 +297,12 @@ app.prepare().then(() => {
               type: 'speech_stopped',
               audio_end_ms: message.audio_end_ms
             }));
+            
+            // Create paragraph break to Hocuspocus document if enabled
+            if (speechBreakDetection && currentSessionId) {
+              console.log('🔸 Creating paragraph break in document');
+              createParagraphBreak(currentSessionId);
+            }
             break;
             
           case 'response.created':
@@ -328,6 +408,17 @@ app.prepare().then(() => {
         const message = JSON.parse(data.toString());
         
         switch (message.type) {
+          case 'set_session_id':
+            // Set current session ID for Hocuspocus integration
+            if (message.sessionId) {
+              currentSessionId = message.sessionId;
+              console.log(`📋 Set current session ID: ${currentSessionId}`);
+              console.log(`[Debug] Session ID successfully stored for Hocuspocus integration`);
+            } else {
+              console.log(`[Debug] ❌ set_session_id message received but sessionId is empty:`, message);
+            }
+            break;
+            
           case 'set_prompt':
             // Update transcription prompt
             if (message.prompt !== undefined) {
@@ -335,7 +426,7 @@ app.prepare().then(() => {
               console.log('📝 Received transcription prompt:', transcriptionPrompt || '(empty)');
               
               // Update session configuration with new prompt
-              sessionConfig = createSessionConfig(transcriptionPrompt);
+              sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
               
               // Send updated session config to OpenAI if connection is open
               if (openaiWs.readyState === 1) { // WebSocket.OPEN
@@ -343,6 +434,71 @@ app.prepare().then(() => {
                 openaiWs.send(JSON.stringify(sessionConfig));
                 console.log('✅ Session updated with transcription prompt');
               }
+            }
+            break;
+            
+          case 'set_transcription_model':
+            // Update transcription model
+            if (message.model) {
+              const validTranscriptionModels = ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'];
+              if (validTranscriptionModels.includes(message.model)) {
+                transcriptionModel = message.model;
+                console.log('🎤 Received transcription model:', transcriptionModel);
+                
+                // Update session configuration with new model
+                sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
+                
+                // Send updated session config to OpenAI if connection is open
+                if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                  console.log('🔄 Updating OpenAI session with new transcription model...');
+                  openaiWs.send(JSON.stringify(sessionConfig));
+                  console.log('✅ Session updated with transcription model');
+                }
+              } else {
+                console.error('❌ Invalid transcription model:', message.model);
+                clientWs.send(JSON.stringify({
+                  type: 'error',
+                  error: `Invalid transcription model. Use: ${validTranscriptionModels.join(', ')}`
+                }));
+              }
+            }
+            break;
+            
+          case 'set_speech_break_detection':
+            // Update speech break detection settings
+            if (message.enabled !== undefined) {
+              speechBreakDetection = message.enabled;
+              console.log('🔸 Speech break detection enabled:', speechBreakDetection);
+            }
+            if (message.marker) {
+              speechBreakMarker = message.marker;
+              console.log('🔸 Speech break marker set to:', speechBreakMarker);
+            }
+            break;
+            
+          case 'set_vad_params':
+            // Update VAD parameters
+            if (message.threshold !== undefined) {
+              vadThreshold = message.threshold;
+              console.log('🎛️ VAD threshold set to:', vadThreshold);
+            }
+            if (message.silence_duration_ms !== undefined) {
+              vadSilenceDuration = message.silence_duration_ms;
+              console.log('🎛️ VAD silence duration set to:', vadSilenceDuration + 'ms');
+            }
+            if (message.prefix_padding_ms !== undefined) {
+              vadPrefixPadding = message.prefix_padding_ms;
+              console.log('🎛️ VAD prefix padding set to:', vadPrefixPadding + 'ms');
+            }
+            
+            // Update session configuration with new VAD parameters
+            sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
+            
+            // Send updated session config to OpenAI if connection is open
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              console.log('🔄 Updating OpenAI session with new VAD parameters...');
+              openaiWs.send(JSON.stringify(sessionConfig));
+              console.log('✅ Session updated with VAD parameters');
             }
             break;
             
@@ -385,8 +541,14 @@ app.prepare().then(() => {
               type: 'input_audio_buffer.append',
               audio: message.audio // Base64 encoded PCM16 audio
             };
-            openaiWs.send(JSON.stringify(audioEvent));
-            console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+            
+            // Check WebSocket state before sending
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(audioEvent));
+              console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready (state: ${openaiWs.readyState}), skipping audio chunk`);
+            }
             
             // Clear any existing timer
             if (autoCommitTimer) {
@@ -406,8 +568,14 @@ app.prepare().then(() => {
               const commitEvent = {
                 type: 'input_audio_buffer.commit'
               };
-              openaiWs.send(JSON.stringify(commitEvent));
-              console.log('✅ Audio buffer committed, waiting for automatic transcription...');
+              
+              if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                openaiWs.send(JSON.stringify(commitEvent));
+                console.log('✅ Audio buffer committed, waiting for automatic transcription...');
+              } else {
+                console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
+                responseInProgress = false; // Reset flag
+              }
               
               // Don't reset buffer tracking immediately - let transcription complete first
               // audioBufferDuration = 0;
@@ -427,8 +595,14 @@ app.prepare().then(() => {
                   const commitEvent = {
                     type: 'input_audio_buffer.commit'
                   };
-                  openaiWs.send(JSON.stringify(commitEvent));
-                  console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
+                  
+                  if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                    openaiWs.send(JSON.stringify(commitEvent));
+                    console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
+                  } else {
+                    console.log(`⚠️ OpenAI WebSocket not ready for timer commit (state: ${openaiWs.readyState})`);
+                    responseInProgress = false; // Reset flag
+                  }
                   
                   // Don't reset buffer tracking immediately
                   // audioBufferDuration = 0;
@@ -451,8 +625,14 @@ app.prepare().then(() => {
               const commitEvent = {
                 type: 'input_audio_buffer.commit'
               };
-              openaiWs.send(JSON.stringify(commitEvent));
-              console.log('✅ Audio buffer committed (manual), waiting for automatic transcription...');
+              
+              if (openaiWs.readyState === 1) { // WebSocket.OPEN
+                openaiWs.send(JSON.stringify(commitEvent));
+                console.log('✅ Audio buffer committed (manual), waiting for automatic transcription...');
+              } else {
+                console.log(`⚠️ OpenAI WebSocket not ready for manual commit (state: ${openaiWs.readyState})`);
+                responseInProgress = false; // Reset flag
+              }
               
               // Don't reset buffer tracking immediately
               // audioBufferDuration = 0;
@@ -467,12 +647,33 @@ app.prepare().then(() => {
             const clearEvent = {
               type: 'input_audio_buffer.clear'
             };
-            openaiWs.send(JSON.stringify(clearEvent));
+            
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(clearEvent));
+              console.log('Audio buffer cleared');
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready for clear (state: ${openaiWs.readyState})`);
+            }
             
             // Reset buffer tracking
             audioBufferDuration = 0;
             audioChunkCount = 0;
-            console.log('Audio buffer cleared');
+            break;
+            
+          case 'send_dummy_audio_data':
+            // Send dummy audio data directly from client (localStorage)
+            if (message.audioData) {
+              sendDummyAudioData(message.audioData, message.name || 'Client Recording', clientWs, openaiWs, () => {
+                responseInProgress = true;
+                lastCommitTime = Date.now();
+              });
+            } else {
+              console.error('❌ No audio data provided for dummy audio');
+              clientWs.send(JSON.stringify({
+                type: 'error',
+                error: 'No audio data provided for dummy audio'
+              }));
+            }
             break;
             
           default:
@@ -502,31 +703,228 @@ app.prepare().then(() => {
     });
   });
 
-  // Handle YJS WebSocket connections
-  yjsWss.on('connection', (ws, request) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    const sessionId = url.searchParams.get('sessionId') || 'default';
-    
-    console.log(`YJS client connected to session: ${sessionId}`);
-    
-    // Setup YJS WebSocket connection with session-specific document name
-    const docName = `transcribe-editor-${sessionId}`;
-    setupWSConnection(ws, request, { docName });
-    
-    ws.on('close', () => {
-      console.log(`YJS client disconnected from session: ${sessionId}`);
-    });
-    
-    ws.on('error', (error) => {
-      console.error(`YJS WebSocket error for session ${sessionId}:`, error);
-    });
-  });
+  // Function to send text to Hocuspocus document
+  async function sendTextToHocuspocusDocument(sessionId, text) {
+    try {
+      console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${text}"`);
+      
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      
+      // Access existing document from server's documents collection
+      const document = hocuspocus.documents.get(roomName);
+      
+      if (document) {
+        // Use session-specific field name to match client
+        const fieldName = `content-${sessionId}`;
+        
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = document.getXmlFragment(fieldName);
+        
+        // Add text to existing paragraph or create new one if needed
+        const hasContent = fragment.length > 0;
+        
+        if (hasContent) {
+          // Get the last element in the fragment
+          const lastElement = fragment.get(fragment.length - 1);
+          
+          if (lastElement && lastElement.nodeName === 'paragraph') {
+            // Add text to the existing last paragraph
+            const existingTextNode = lastElement.get(0);
+            if (existingTextNode && existingTextNode instanceof (require('yjs')).XmlText) {
+              // Append text with space to existing text node
+              existingTextNode.insert(existingTextNode.length, ` ${text}`);
+              console.log(`[Hocuspocus Integration] ✅ Text appended to existing paragraph in '${fieldName}'`);
+            } else {
+              // Create new text node in existing paragraph
+              const newTextNode = new (require('yjs')).XmlText();
+              newTextNode.insert(0, ` ${text}`);
+              lastElement.insert(lastElement.length, [newTextNode]);
+              console.log(`[Hocuspocus Integration] ✅ Text added as new text node in existing paragraph '${fieldName}'`);
+            }
+          } else {
+            // Last element is not a paragraph, create new paragraph
+            const newParagraph = new (require('yjs')).XmlElement('paragraph');
+            const newTextNode = new (require('yjs')).XmlText();
+            newTextNode.insert(0, ` ${text}`);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+            console.log(`[Hocuspocus Integration] ✅ Text added as new paragraph to '${fieldName}'`);
+          }
+        } else {
+          // No content yet, create first paragraph
+          const newParagraph = new (require('yjs')).XmlElement('paragraph');
+          const newTextNode = new (require('yjs')).XmlText();
+          newTextNode.insert(0, text);
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(0, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ Text added as first paragraph to '${fieldName}'`);
+        }
+        
+        console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);
+      } else {
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
+        
+        // Debug: Show available documents
+        const availableDocs = Array.from(hocuspocus.documents.keys());
+        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
+      }
+      
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error adding text to document:`, error);
+    }
+  }
 
-  server.listen(port, hostname, (err) => {
-    if (err) throw err;
+  // Function to create a paragraph break in Hocuspocus document
+  async function createParagraphBreak(sessionId) {
+    try {
+      console.log(`[Hocuspocus Integration] Creating paragraph break for session ${sessionId}`);
+      
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      
+      // Access existing document from server's documents collection
+      const document = hocuspocus.documents.get(roomName);
+      
+      if (document) {
+        // Use session-specific field name to match client
+        const fieldName = `content-${sessionId}`;
+        
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = document.getXmlFragment(fieldName);
+        
+        // Only create new paragraph if there's existing content
+        const hasContent = fragment.length > 0;
+        
+        if (hasContent) {
+          // Create a new empty paragraph for the next content
+          const newParagraph = new (require('yjs')).XmlElement('paragraph');
+          const newTextNode = new (require('yjs')).XmlText();
+          newTextNode.insert(0, ''); // Empty paragraph initially
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(fragment.length, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ New paragraph created in '${fieldName}' for speech break`);
+        } else {
+          console.log(`[Hocuspocus Integration] ⚠️ No existing content, skipping paragraph break`);
+        }
+        
+      } else {
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
+        
+        // Debug: Show available documents
+        const availableDocs = Array.from(hocuspocus.documents.keys());
+        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
+      }
+      
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error creating paragraph break:`, error);
+    }
+  }
+
+
+  // Function to send dummy audio data from client (localStorage)
+  function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress) {
+    try {
+      console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
+      
+      // Convert base64 to buffer
+      const audioBuffer = Buffer.from(base64AudioData, 'base64');
+      console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
+      
+      // Check if WebSocket is ready
+      if (openaiWs.readyState !== 1) { // WebSocket.OPEN
+        console.error(`❌ OpenAI WebSocket not ready (state: ${openaiWs.readyState})`);
+        clientWs.send(JSON.stringify({
+          type: 'error',
+          error: 'WebSocket connection not ready'
+        }));
+        return;
+      }
+      
+      // Convert audio data to base64 and send in chunks
+      const chunkSize = 4096; // Match typical audio chunk size
+      const totalChunks = Math.ceil(audioBuffer.length / chunkSize);
+      console.log(`[Dummy Audio Data] 📦 Sending ${totalChunks} chunks of ${chunkSize} bytes each`);
+      
+      let chunkIndex = 0;
+      
+      const sendNextChunk = () => {
+        if (chunkIndex >= totalChunks) {
+          console.log(`[Dummy Audio Data] ✅ All ${totalChunks} chunks sent successfully`);
+          
+          // Auto-commit the audio after sending all chunks
+          setTimeout(() => {
+            console.log(`[Dummy Audio Data] 🔄 Auto-committing client audio buffer`);
+            setResponseInProgress();
+            
+            const commitEvent = {
+              type: 'input_audio_buffer.commit'
+            };
+            
+            if (openaiWs.readyState === 1) { // WebSocket.OPEN
+              openaiWs.send(JSON.stringify(commitEvent));
+              console.log('✅ Client audio buffer committed, waiting for transcription...');
+            } else {
+              console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
+            }
+          }, 1000); // Wait 1 second before committing
+          
+          return;
+        }
+        
+        const start = chunkIndex * chunkSize;
+        const end = Math.min(start + chunkSize, audioBuffer.length);
+        const chunk = audioBuffer.slice(start, end);
+        const base64Chunk = chunk.toString('base64');
+        
+        const audioEvent = {
+          type: 'input_audio_buffer.append',
+          audio: base64Chunk
+        };
+        
+        try {
+          openaiWs.send(JSON.stringify(audioEvent));
+          
+          if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
+            console.log(`[Dummy Audio Data] 📤 Sent chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} bytes)`);
+          }
+          
+          chunkIndex++;
+          
+          // Send next chunk after a small delay to simulate real-time streaming
+          setTimeout(sendNextChunk, 50); // 50ms delay between chunks
+          
+        } catch (error) {
+          console.error(`❌ Error sending client audio chunk ${chunkIndex}:`, error);
+          clientWs.send(JSON.stringify({
+            type: 'error',
+            error: `Failed to send client audio chunk ${chunkIndex}: ${error.message}`
+          }));
+        }
+      };
+      
+      // Start sending chunks
+      clientWs.send(JSON.stringify({
+        type: 'dummy_audio_started',
+        filename: recordingName,
+        totalSize: audioBuffer.length,
+        totalChunks: totalChunks
+      }));
+      
+      sendNextChunk();
+      
+    } catch (error) {
+      console.error(`[Dummy Audio Data] ❌ Error processing client audio data:`, error);
+      clientWs.send(JSON.stringify({
+        type: 'error',
+        error: `Failed to process client audio data: ${error.message}`
+      }));
+    }
+  }
+
+  server.listen(port, hostname, () => {
     const displayHost = hostname === '0.0.0.0' ? 'localhost' : hostname;
-    console.log(`> Ready on http://${displayHost}:${port}`);
-    console.log(`> WebSocket server ready on ws://${displayHost}:${port}/api/realtime-ws`);
-    console.log(`> YJS WebSocket server ready on ws://${displayHost}:${port}/api/yjs-ws`);
+    console.log(`🚀 Server ready at http://${displayHost}:${port}`);
+    console.log(`📡 Hocuspocus WebSocket ready at ws://${displayHost}:${port}/api/yjs-ws`);
+    console.log(`🎤 Realtime Audio WebSocket ready at ws://${displayHost}:${port}/api/realtime-ws`);
+    console.log(`🌐 Next.js UI available at http://${displayHost}:${port}`);
   });
 });

@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect } from "react";
-
-type RealtimeModel = "gpt-4o-realtime-preview" | "gpt-4o-mini-realtime-preview";
+import { HocuspocusProvider } from '@hocuspocus/provider';
+import * as Y from 'yjs';
 
 interface PromptPreset {
   id: string;
@@ -71,10 +71,13 @@ export default function RealtimeClient() {
   const processorRef = useRef<ScriptProcessorNode | AudioWorkletNode | null>(null);
   const recordingStateRef = useRef<boolean>(false);
   
+  // Hocuspocus client refs for test functionality
+  const hocuspocusProviderRef = useRef<HocuspocusProvider | null>(null);  
+  const hocuspocusDocRef = useRef<Y.Doc | null>(null);
+  
   const [text, setText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [model, setModel] = useState<RealtimeModel>("gpt-4o-mini-realtime-preview");
   const [error, setError] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -84,8 +87,17 @@ export default function RealtimeClient() {
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [promptMode, setPromptMode] = useState<'preset' | 'custom'>('preset');
   const [autoLineBreak, setAutoLineBreak] = useState<boolean>(false);
+  const [transcriptionModel, setTranscriptionModel] = useState<string>('gpt-4o-transcribe');
+  const [speechBreakDetection, setSpeechBreakDetection] = useState<boolean>(false);
+  const [breakMarker, setBreakMarker] = useState<string>('⏎');
+  const [vadThreshold, setVadThreshold] = useState<number>(0.3);
+  const [vadSilenceDuration, setVadSilenceDuration] = useState<number>(1000);
+  const [vadPrefixPadding, setVadPrefixPadding] = useState<number>(300);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
+  const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
+  const [localStorageRecordings, setLocalStorageRecordings] = useState<any[]>([]);
+  const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
 
@@ -112,6 +124,7 @@ export default function RealtimeClient() {
     
     return basePrompt;
   }, [promptMode, customPrompt, selectedPromptPreset, autoLineBreak]);
+
 
   // Audio processing utility functions
   const floatTo16BitPCM = useCallback((float32Array: Float32Array): Int16Array => {
@@ -173,9 +186,7 @@ export default function RealtimeClient() {
     }
 
     const currentPrompt = getCurrentPrompt();
-    const wsUrl = process.env.NODE_ENV === 'production' 
-      ? `wss://${window.location.host}/api/realtime-ws?model=${model}`
-      : `ws://localhost:8888/api/realtime-ws?model=${model}`;
+    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
     const ws = new WebSocket(wsUrl);
@@ -186,6 +197,15 @@ export default function RealtimeClient() {
       setIsConnected(true);
       setError(null);
       
+      // Send session ID to server if available
+      if (currentSessionId) {
+        ws.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: currentSessionId
+        }));
+        console.log('[WebSocket] 📋 Sent session ID to server:', currentSessionId);
+      }
+      
       // Send prompt configuration to server
       if (currentPrompt) {
         ws.send(JSON.stringify({
@@ -194,6 +214,30 @@ export default function RealtimeClient() {
         }));
         console.log('[WebSocket] 📝 Sent transcription prompt to server');
       }
+      
+      // Send transcription model configuration to server
+      ws.send(JSON.stringify({
+        type: 'set_transcription_model',
+        model: transcriptionModel
+      }));
+      console.log('[WebSocket] 🎤 Sent transcription model to server:', transcriptionModel);
+      
+      // Send speech break detection settings to server
+      ws.send(JSON.stringify({
+        type: 'set_speech_break_detection',
+        enabled: speechBreakDetection,
+        marker: breakMarker
+      }));
+      console.log('[WebSocket] 🔸 Sent speech break detection settings:', { enabled: speechBreakDetection, marker: breakMarker });
+      
+      // Send VAD parameters to server
+      ws.send(JSON.stringify({
+        type: 'set_vad_params',
+        threshold: vadThreshold,
+        silence_duration_ms: vadSilenceDuration,
+        prefix_padding_ms: vadPrefixPadding
+      }));
+      console.log('[WebSocket] 🎛️ Sent VAD parameters:', { threshold: vadThreshold, silence_duration_ms: vadSilenceDuration, prefix_padding_ms: vadPrefixPadding });
     };
 
     ws.onmessage = (event) => {
@@ -209,69 +253,16 @@ export default function RealtimeClient() {
           case 'transcription':
             console.log('[Transcription] 📝 Received text:', message.text);
             setText(prev => prev + message.text + ' ');
+            break;
             
-            // Send transcription to current editor session via Yjs
-            if (currentSessionId) {
-              console.log('[Realtime] 📡 Sending to Yjs session:', currentSessionId);
-              try {
-                // Import Yjs and connect to the same document
-                import('yjs').then(Y => {
-                  import('y-websocket').then(({ WebsocketProvider }) => {
-                    const ydoc = new Y.Doc();
-                    const yjsWsUrl = process.env.NODE_ENV === 'production' 
-                      ? `wss://${window.location.host}/api/yjs-ws?sessionId=${currentSessionId}`
-                      : `ws://localhost:8888/api/yjs-ws?sessionId=${currentSessionId}`;
-                    const provider = new WebsocketProvider(yjsWsUrl, `transcribe-editor-${currentSessionId}`, ydoc);
-                    
-                    provider.on('status', (event: { status: string }) => {
-                      console.log('[Realtime] Yjs status:', event.status);
-                      if (event.status === 'connected') {
-                        // Get the prosemirror fragment
-                        const type = ydoc.getXmlFragment('prosemirror');
-                        
-                        // Wait a bit for document to sync, then append text
-                        setTimeout(() => {
-                          // Find the last paragraph or create one
-                          let lastP = null;
-                          for (let i = type.length - 1; i >= 0; i--) {
-                            const item = type.get(i);
-                            if (item instanceof Y.XmlElement && item.nodeName === 'paragraph') {
-                              lastP = item;
-                              break;
-                            }
-                          }
-                          
-                          if (!lastP) {
-                            // Create a new paragraph if none exists
-                            lastP = new Y.XmlElement('paragraph');
-                            type.push([lastP]);
-                          }
-                          
-                          // Add text to the paragraph
-                          const textContent = lastP.firstChild;
-                          if (textContent instanceof Y.XmlText) {
-                            textContent.insert(textContent.length, message.text + ' ');
-                          } else {
-                            const newText = new Y.XmlText();
-                            newText.insert(0, message.text + ' ');
-                            lastP.push([newText]);
-                          }
-                          
-                          console.log('[Realtime] ✅ Text added to Yjs document');
-                          
-                          // Clean up connection
-                          setTimeout(() => {
-                            provider.destroy();
-                          }, 500);
-                        }, 500);
-                      }
-                    });
-                  });
-                });
-              } catch (error) {
-                console.error('[Realtime] ❌ Yjs error:', error);
-              }
-            }
+          case 'dummy_audio_started':
+            console.log('[Dummy Audio] 🎵 Started sending dummy audio:', message.filename);
+            setIsDummyAudioSending(true);
+            break;
+            
+          case 'dummy_audio_completed':
+            console.log('[Dummy Audio] ✅ Dummy audio processing completed');
+            setIsDummyAudioSending(false);
             break;
             
           case 'speech_started':
@@ -282,11 +273,18 @@ export default function RealtimeClient() {
           case 'speech_stopped':
             setIsSpeaking(false);
             console.log('[Speech Detection] 🔇 Speech stopped');
+            
+            // Insert line break if speech break detection is enabled (for local display)
+            if (speechBreakDetection) {
+              setText(prev => prev + '\n\n');
+              console.log('[Speech Break] Added paragraph break to local display');
+            }
             break;
             
           case 'error':
           case 'transcription_error':
             setError(message.error);
+            setIsDummyAudioSending(false);
             console.error('[WebSocket] ❌ Error:', message.error);
             break;
             
@@ -309,7 +307,7 @@ export default function RealtimeClient() {
       setIsConnected(false);
       setIsRecording(false);
     };
-  }, [model, getCurrentPrompt, currentSessionId]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadThreshold, vadSilenceDuration, vadPrefixPadding]);
 
   const disconnectWebSocket = useCallback(() => {
     if (websocketRef.current) {
@@ -577,9 +575,80 @@ export default function RealtimeClient() {
     console.log('[Audio] ✅ Audio stream stopped successfully');
   }, []);
 
+  // Function to send status messages to collaborative document
+  const sendStatusToCollaboration = useCallback((message: string) => {
+    if (!currentSessionId || !hocuspocusDocRef.current || !hocuspocusProviderRef.current) {
+      return;
+    }
+
+    try {
+      const fieldName = `content-${currentSessionId}`;
+      const fragment = hocuspocusDocRef.current.getXmlFragment(fieldName);
+      
+      // Add status message to existing paragraph or create new one if needed
+      const hasContent = fragment.length > 0;
+      
+      if (hasContent) {
+        // Get the last element in the fragment
+        const lastElement = fragment.get(fragment.length - 1);
+        
+        if (lastElement && lastElement.nodeName === 'paragraph') {
+          // Add status message to the existing last paragraph
+          const existingTextNode = lastElement.get(0);
+          if (existingTextNode && existingTextNode instanceof Y.XmlText) {
+            // Append status message with space to existing text node
+            existingTextNode.insert(existingTextNode.length, ` ${message}`);
+          } else {
+            // Create new text node in existing paragraph
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, ` ${message}`);
+            lastElement.insert(lastElement.length, [newTextNode]);
+          }
+        } else {
+          // Last element is not a paragraph, create new paragraph
+          const newParagraph = new Y.XmlElement('paragraph');
+          const newTextNode = new Y.XmlText();
+          newTextNode.insert(0, ` ${message}`);
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(fragment.length, [newParagraph]);
+        }
+      } else {
+        // No content yet, create first paragraph
+        const newParagraph = new Y.XmlElement('paragraph');
+        const newTextNode = new Y.XmlText();
+        newTextNode.insert(0, message);
+        newParagraph.insert(0, [newTextNode]);
+        fragment.insert(0, [newParagraph]);
+      }
+      
+      console.log('[Hocuspocus Status] Status sent to collaborative document:', message);
+    } catch (error) {
+      console.error('[Hocuspocus Status] Error sending status:', error);
+    }
+  }, [currentSessionId]);
+
   // Main control functions
   const startRecording = useCallback(async () => {
     console.log('[Recording] 🎙️ Start recording requested');
+    
+    // Send detailed start notification to collaborative document
+    const currentTime = new Date().toLocaleString('ja-JP');
+    const currentPrompt = getCurrentPrompt();
+    const promptModeText = promptMode === 'custom' ? 'カスタム' : 'プリセット';
+    const promptName = promptMode === 'preset' 
+      ? PROMPT_PRESETS.find(p => p.id === selectedPromptPreset)?.name || 'なし'
+      : 'カスタムプロンプト';
+    const autoBreakText = autoLineBreak ? '有効' : '無効';
+    
+    const statusMessage = `
+📝 文字起こし開始 (${currentTime})
+🎤 音声認識モデル: ${transcriptionModel}
+💬 プロンプト設定: ${promptModeText} - ${promptName}
+🔄 自動改行: ${autoBreakText}
+${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
+    
+    sendStatusToCollaboration(statusMessage);
+    
     if (!isConnected) {
       console.log('[Recording] 🔗 Not connected, connecting WebSocket first...');
       connectWebSocket();
@@ -593,12 +662,21 @@ export default function RealtimeClient() {
       console.log('[Recording] 🚀 Already connected, starting audio stream immediately');
       startAudioStream();
     }
-  }, [isConnected, connectWebSocket, startAudioStream]);
+  }, [isConnected, connectWebSocket, startAudioStream, sendStatusToCollaboration, transcriptionModel, promptMode, selectedPromptPreset, autoLineBreak, getCurrentPrompt]);
 
   const stopRecording = useCallback(() => {
     console.log('[Recording] ⏹️ Stop recording requested');
+    
+    // Send detailed stop notification to collaborative document
+    const currentTime = new Date().toLocaleString('ja-JP');
+    const statusMessage = `
+⏹️ 文字起こし終了 (${currentTime})
+🎤 使用モデル: ${transcriptionModel}`;
+    
+    sendStatusToCollaboration(statusMessage);
+    
     stopAudioStream();
-  }, [stopAudioStream]);
+  }, [stopAudioStream, sendStatusToCollaboration, transcriptionModel]);
 
   const clearText = useCallback(() => {
     console.log('[UI] 🧹 Clearing transcription text');
@@ -631,15 +709,35 @@ export default function RealtimeClient() {
     console.log('[Session] 🚀 Opening editing session:', sessionId);
     console.log('[Session] 📍 Editor URL:', editorUrl);
     
+    // Send session ID to server if WebSocket is connected
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({
+        type: 'set_session_id',
+        sessionId: sessionId
+      }));
+      console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+    }
+    
     // Open new tab with editor
     window.open(editorUrl, '_blank');
   }, [generateSessionId]);
 
   const connectToExistingSession = useCallback(() => {
     if (existingSessionInput.trim()) {
-      setCurrentSessionId(existingSessionInput.trim());
+      const sessionId = existingSessionInput.trim();
+      setCurrentSessionId(sessionId);
       setExistingSessionInput('');
-      console.log('[Session] 🔗 Connected to existing session:', existingSessionInput.trim());
+      console.log('[Session] 🔗 Connected to existing session:', sessionId);
+      
+      // Send session ID to server if WebSocket is connected
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: sessionId
+        }));
+        console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+      }
+      
     }
   }, [existingSessionInput]);
 
@@ -655,17 +753,256 @@ export default function RealtimeClient() {
 
   const saveSessionId = useCallback(() => {
     if (sessionIdInput.trim()) {
-      setCurrentSessionId(sessionIdInput.trim());
+      const sessionId = sessionIdInput.trim();
+      setCurrentSessionId(sessionId);
       setIsEditingSessionId(false);
-      console.log('[Session] 💾 Session ID updated to:', sessionIdInput.trim());
+      console.log('[Session] 💾 Session ID updated to:', sessionId);
+      
+      // Send session ID to server if WebSocket is connected
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({
+          type: 'set_session_id',
+          sessionId: sessionId
+        }));
+        console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
+      }
     }
   }, [sessionIdInput]);
+
+  // Load recordings from localStorage
+  const loadLocalStorageRecordings = useCallback(() => {
+    try {
+      const stored = localStorage.getItem('dummy-audio-recordings');
+      console.log('[LocalStorage] Raw stored data:', stored ? `${stored.length} chars` : 'null');
+      
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        setLocalStorageRecordings(parsed);
+        console.log('[LocalStorage] Loaded', parsed.length, 'recordings:', parsed.map(r => ({ id: r.id, name: r.name })));
+        if (parsed.length > 0 && !selectedRecordingId) {
+          setSelectedRecordingId(parsed[0].id);
+          console.log('[LocalStorage] Auto-selected first recording:', parsed[0].id);
+        }
+      } else {
+        console.log('[LocalStorage] No recordings found in localStorage');
+        setLocalStorageRecordings([]);
+      }
+    } catch (error) {
+      console.error('[LocalStorage] Error loading recordings:', error);
+      setLocalStorageRecordings([]);
+    }
+  }, [selectedRecordingId]);
+
+  // Send dummy audio from localStorage
+  const sendDummyAudio = useCallback(() => {
+    if (!isConnected) {
+      setError('WebSocket接続が必要です。先に接続してください。');
+      return;
+    }
+    
+    // Send from localStorage
+    const recording = localStorageRecordings.find(rec => rec.id === selectedRecordingId);
+    if (!recording) {
+      setError('選択された録音が見つかりません。録音データ作成画面で録音を作成してください。');
+      setIsDummyAudioSending(false);
+      return;
+    }
+    
+    setIsDummyAudioSending(true);
+    setError(null);
+    
+    console.log('[Dummy Audio] 🎵 Sending localStorage recording:', recording.name);
+    websocketRef.current?.send(JSON.stringify({
+      type: 'send_dummy_audio_data',
+      audioData: recording.data,
+      name: recording.name
+    }));
+  }, [isConnected, localStorageRecordings, selectedRecordingId]);
+
+  // Initialize/cleanup Hocuspocus connection for test functionality
+  const initializeHocuspocusClient = useCallback(() => {
+    if (!currentSessionId || hocuspocusProviderRef.current) {
+      return; // Already initialized or no session
+    }
+
+    console.log('[Hocuspocus Test Client] Initializing for session:', currentSessionId);
+
+    // Create Y.Doc
+    const ydoc = new Y.Doc();
+    hocuspocusDocRef.current = ydoc;
+
+    // Create provider
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
+    const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
+    const roomName = `transcribe-editor-v2-${currentSessionId}`;
+
+    const provider = new HocuspocusProvider({
+      url: websocketUrl,
+      name: roomName,
+      document: ydoc,
+    });
+
+    hocuspocusProviderRef.current = provider;
+
+    provider.on('connect', () => {
+      console.log('[Hocuspocus Test Client] Connected to collaborative session');
+    });
+
+    provider.on('disconnect', () => {
+      console.log('[Hocuspocus Test Client] Disconnected from collaborative session');
+    });
+
+    provider.on('error', (error: unknown) => {
+      console.error('[Hocuspocus Test Client] Error:', error);
+    });
+  }, [currentSessionId]);
+
+  const cleanupHocuspocusClient = useCallback(() => {
+    if (hocuspocusProviderRef.current) {
+      console.log('[Hocuspocus Test Client] Cleaning up connection');
+      hocuspocusProviderRef.current.disconnect();
+      hocuspocusProviderRef.current.destroy();
+      hocuspocusProviderRef.current = null;
+    }
+    if (hocuspocusDocRef.current) {
+      hocuspocusDocRef.current = null;
+    }
+  }, []);
+
+  // Test text send function - send directly to Hocuspocus document as a client
+  const sendTestText = useCallback(() => {
+    if (!currentSessionId) {
+      setError('セッションIDが設定されていません。先に編集セッションを作成してください。');
+      return;
+    }
+
+    // Initialize Hocuspocus client if not already done
+    initializeHocuspocusClient();
+
+    if (!hocuspocusDocRef.current || !hocuspocusProviderRef.current) {
+      setError('Hocuspocusクライアントが初期化されていません。');
+      return;
+    }
+
+    const provider = hocuspocusProviderRef.current;
+    
+    // Check if provider is connected, if not, wait for connection
+    const sendWhenReady = () => {
+      const testTexts = [
+        'テスト送信1: リアルタイム音声認識からの統合テストです。',
+        'テスト送信2: このテキストは共同編集画面に表示されるはずです。',
+        'テスト送信3: Hocuspocusサーバー経由で同期されます。',
+        'テスト送信4: 複数のユーザーがリアルタイムで確認できます。'
+      ];
+
+      const randomText = testTexts[Math.floor(Math.random() * testTexts.length)];
+      
+      try {
+        // Add text to Hocuspocus document as a collaborative client using TipTap-compatible format
+        const fieldName = `content-${currentSessionId}`;
+        
+        // TipTap Collaboration uses XmlFragment, not Text
+        const fragment = hocuspocusDocRef.current!.getXmlFragment(fieldName);
+        
+        // Add text to existing paragraph or create new one if needed
+        const hasContent = fragment.length > 0;
+        
+        if (hasContent) {
+          // Get the last element in the fragment
+          const lastElement = fragment.get(fragment.length - 1);
+          
+          if (lastElement && lastElement.nodeName === 'paragraph') {
+            // Add text to the existing last paragraph
+            const existingTextNode = lastElement.get(0);
+            if (existingTextNode && existingTextNode instanceof Y.XmlText) {
+              // Append text with space to existing text node
+              existingTextNode.insert(existingTextNode.length, ` ${randomText}`);
+            } else {
+              // Create new text node in existing paragraph
+              const newTextNode = new Y.XmlText();
+              newTextNode.insert(0, ` ${randomText}`);
+              lastElement.insert(lastElement.length, [newTextNode]);
+            }
+          } else {
+            // Last element is not a paragraph, create new paragraph
+            const newParagraph = new Y.XmlElement('paragraph');
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, ` ${randomText}`);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+          }
+        } else {
+          // No content yet, create first paragraph
+          const newParagraph = new Y.XmlElement('paragraph');
+          const newTextNode = new Y.XmlText();
+          newTextNode.insert(0, randomText);
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(0, [newParagraph]);
+        }
+        
+        console.log('[Hocuspocus Test Client] Text sent to collaborative document as paragraph:', randomText);
+        console.log('[Hocuspocus Test Client] Fragment length after insert:', fragment.length);
+        console.log('[Hocuspocus Test Client] Fragment content preview:', fragment.toString().substring(0, 100) + '...');
+        
+        // Also add to local display for immediate feedback
+        setText(prev => prev + randomText + ' ');
+        
+        // Clear any previous errors
+        setError(null);
+      } catch (error) {
+        console.error('[Hocuspocus Test Client] Error sending text:', error);
+        setError('テキストの送信に失敗しました。');
+      }
+    };
+
+    // Always wait for connection to ensure reliable sending
+    console.log('[Hocuspocus Test Client] Setting up connection listener for test text sending');
+    
+    // Try to send immediately first, if that fails, wait for connection
+    try {
+      sendWhenReady();
+      console.log('[Hocuspocus Test Client] Text sent immediately (provider was ready)');
+    } catch (error) {
+      console.log('[Hocuspocus Test Client] Immediate send failed, waiting for connection...', error);
+      
+      // Wait for connection and then send
+      const onConnect = () => {
+        console.log('[Hocuspocus Test Client] Connection established, sending test text');
+        provider.off('connect', onConnect);
+        try {
+          sendWhenReady();
+        } catch (retryError) {
+          console.error('[Hocuspocus Test Client] Failed to send after connection:', retryError);
+          setError('テキストの送信に失敗しました。');
+        }
+      };
+      
+      provider.on('connect', onConnect);
+      
+      // Timeout after 5 seconds if connection doesn't happen
+      setTimeout(() => {
+        provider.off('connect', onConnect);
+        setError('Hocuspocus接続タイムアウトです。編集セッションが開いているか確認してください。');
+      }, 5000);
+    }
+  }, [currentSessionId, initializeHocuspocusClient]);
+
+  // Initialize Hocuspocus when session changes
+  useEffect(() => {
+    if (currentSessionId) {
+      initializeHocuspocusClient();
+    } else {
+      cleanupHocuspocusClient();
+    }
+  }, [currentSessionId, initializeHocuspocusClient, cleanupHocuspocusClient]);
 
   // Load audio devices when component mounts
   useEffect(() => {
     console.log('[Component] 🎬 RealtimeClient component mounted, loading audio devices...');
     getAudioDevices();
-  }, [getAudioDevices]);
+    loadLocalStorageRecordings();
+  }, [getAudioDevices, loadLocalStorageRecordings]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -673,8 +1010,9 @@ export default function RealtimeClient() {
       console.log('[Component] 🧹 RealtimeClient component unmounting, cleaning up...');
       stopAudioStream();
       disconnectWebSocket();
+      cleanupHocuspocusClient();
     };
-  }, [stopAudioStream, disconnectWebSocket]);
+  }, [stopAudioStream, disconnectWebSocket, cleanupHocuspocusClient]);
 
   return (
     <main className="container mx-auto px-4 py-8 max-w-4xl">
@@ -687,6 +1025,16 @@ export default function RealtimeClient() {
           <p className="text-gray-600 mt-2">
             Streaming speech-to-text using OpenAI&apos;s Realtime API
           </p>
+          <div className="mt-4">
+            <a 
+              href="/dummy-recorder" 
+              className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors text-sm"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              ダミーデータ作成画面 →
+            </a>
+          </div>
         </div>
 
         {/* Transcription Prompt Settings */}
@@ -800,34 +1148,153 @@ export default function RealtimeClient() {
             </p>
           </div>
 
+          {/* Speech Break Detection Option */}
+          <div className="mb-4">
+            <label className="flex items-center">
+              <input
+                type="checkbox"
+                checked={speechBreakDetection}
+                onChange={(e) => setSpeechBreakDetection(e.target.checked)}
+                disabled={isRecording || isConnected}
+                className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+              />
+              <span className="text-sm font-medium text-gray-700">
+                発話区切り検出を有効にする
+              </span>
+            </label>
+            <p className="text-xs text-gray-500 mt-1 ml-6">
+              発話の区切りを検出して絵文字マーカーを挿入します
+            </p>
+            
+            {speechBreakDetection && (
+              <div className="mt-3 ml-6">
+                <label htmlFor="break-marker" className="block text-xs font-medium text-gray-600 mb-1">
+                  区切りマーカー:
+                </label>
+                <select
+                  id="break-marker"
+                  value={breakMarker}
+                  onChange={(e) => setBreakMarker(e.target.value)}
+                  disabled={isRecording || isConnected}
+                  className="block w-32 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                >
+                  <option value="⏎">⏎ (改行)</option>
+                  <option value="↵">↵ (Return)</option>
+                  <option value="🔄">🔄 (更新)</option>
+                  <option value="📝">📝 (メモ)</option>
+                  <option value="🔃">🔃 (緑改行)</option>
+                </select>
+              </div>
+            )}
+          </div>
+
+          {/* VAD Parameters */}
+          <div className="mb-4 p-4 bg-gray-50 rounded-md border border-gray-200">
+            <h4 className="text-sm font-medium text-gray-700 mb-3">
+              音声検出パラメータ (VAD設定)
+            </h4>
+            
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Threshold */}
+              <div>
+                <label htmlFor="vad-threshold" className="block text-xs font-medium text-gray-600 mb-1">
+                  検出感度 (Threshold):
+                </label>
+                <input
+                  id="vad-threshold"
+                  type="number"
+                  min="0.1"
+                  max="1.0"
+                  step="0.1"
+                  value={vadThreshold}
+                  onChange={(e) => setVadThreshold(parseFloat(e.target.value))}
+                  disabled={isRecording || isConnected}
+                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  0.1-1.0 (低いほど敏感)
+                </p>
+              </div>
+              
+              {/* Silence Duration */}
+              <div>
+                <label htmlFor="vad-silence" className="block text-xs font-medium text-gray-600 mb-1">
+                  発話終了判定時間 (ms):
+                </label>
+                <input
+                  id="vad-silence"
+                  type="number"
+                  min="200"
+                  max="3000"
+                  step="100"
+                  value={vadSilenceDuration}
+                  onChange={(e) => setVadSilenceDuration(parseInt(e.target.value))}
+                  disabled={isRecording || isConnected}
+                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  200-3000ms (短いほど区切りやすい)
+                </p>
+              </div>
+              
+              {/* Prefix Padding */}
+              <div>
+                <label htmlFor="vad-padding" className="block text-xs font-medium text-gray-600 mb-1">
+                  開始余裕時間 (ms):
+                </label>
+                <input
+                  id="vad-padding"
+                  type="number"
+                  min="100"
+                  max="1000"
+                  step="50"
+                  value={vadPrefixPadding}
+                  onChange={(e) => setVadPrefixPadding(parseInt(e.target.value))}
+                  disabled={isRecording || isConnected}
+                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  100-1000ms
+                </p>
+              </div>
+            </div>
+            
+            <div className="mt-3 text-xs text-blue-600">
+              <strong>推奨設定:</strong> 短い区切りなら感度0.2、終了時間500ms
+            </div>
+          </div>
+
           <p className="text-xs text-gray-500">
             Note: プロンプト設定は接続前にのみ変更可能です
           </p>
         </div>
 
-        {/* Model Selection and Audio Device Selection - Responsive 2-column layout */}
+        {/* Audio Device Selection and Transcription Model Selection - Responsive 2-column layout */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Model Selection */}
+          {/* Transcription Model Selection */}
           <div className="bg-white p-6 rounded-lg shadow-md">
-            <label htmlFor="model-select" className="block text-sm font-medium text-gray-700 mb-2">
-              Select Realtime Model:
+            <label htmlFor="transcription-model-select" className="block text-sm font-medium text-gray-700 mb-2">
+              音声認識モデル:
             </label>
             <select
-              id="model-select"
-              value={model}
-              onChange={(e) => setModel(e.target.value as RealtimeModel)}
+              id="transcription-model-select"
+              value={transcriptionModel}
+              onChange={(e) => setTranscriptionModel(e.target.value)}
               disabled={isRecording || isConnected}
               className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
             >
-              <option value="gpt-4o-mini-realtime-preview">
-                GPT-4o Mini Realtime (~$0.06/min input, $0.24/min output)
+              <option value="whisper-1">
+                Whisper-1 (従来モデル)
               </option>
-              <option value="gpt-4o-realtime-preview">
-                GPT-4o Realtime (~$0.06/min input, $0.24/min output)
+              <option value="gpt-4o-mini-transcribe">
+                GPT-4o Mini Transcribe (軽量・高速)
+              </option>
+              <option value="gpt-4o-transcribe">
+                GPT-4o Transcribe (高精度)
               </option>
             </select>
             <p className="text-xs text-gray-500 mt-1">
-              Note: Model can only be changed when disconnected
+              接続前に音声認識モデルを選択してください
             </p>
           </div>
 
@@ -880,16 +1347,70 @@ export default function RealtimeClient() {
                 {isConnected ? 'Connected to Realtime API' : 'Disconnected'}
               </span>
             </div>
-            <button
-              onClick={isConnected ? disconnectWebSocket : connectWebSocket}
-              className={`px-8 py-4 text-lg font-semibold rounded-lg transition-colors ${
-                isConnected
-                  ? "bg-red-600 hover:bg-red-700 text-white"
-                  : "bg-blue-600 hover:bg-blue-700 text-white"
-              }`}
-            >
-              {isConnected ? 'Disconnect' : 'Connect'}
-            </button>
+            
+            {/* Connection and Dummy Audio Controls */}
+            <div className="flex items-center justify-center space-x-4 flex-wrap gap-2">
+              <button
+                onClick={isConnected ? disconnectWebSocket : connectWebSocket}
+                className={`px-6 py-3 text-lg font-semibold rounded-lg transition-colors ${
+                  isConnected
+                    ? "bg-red-600 hover:bg-red-700 text-white"
+                    : "bg-blue-600 hover:bg-blue-700 text-white"
+                }`}
+              >
+                {isConnected ? 'Disconnect' : 'Connect'}
+              </button>
+              
+              {/* Dummy Audio Controls */}
+              <button
+                onClick={sendDummyAudio}
+                disabled={!isConnected || isDummyAudioSending}
+                className={`px-6 py-3 text-sm font-medium rounded-lg transition-colors ${
+                  !isConnected || isDummyAudioSending
+                    ? "bg-gray-400 cursor-not-allowed text-gray-200"
+                    : "bg-orange-600 hover:bg-orange-700 text-white"
+                }`}
+              >
+                {isDummyAudioSending ? '送信中...' : 'ダミーデータ認識'}
+              </button>
+              
+              <div className="flex items-center space-x-2">
+                <label htmlFor="dummy-recording-select" className="text-sm font-medium text-gray-700">
+                  録音データ:
+                </label>
+                <select
+                  id="dummy-recording-select"
+                  value={selectedRecordingId}
+                  onChange={(e) => setSelectedRecordingId(e.target.value)}
+                  disabled={isDummyAudioSending}
+                  className="px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 min-w-[200px]"
+                >
+                  {localStorageRecordings.length === 0 ? (
+                    <option value="">録音データがありません</option>
+                  ) : (
+                    localStorageRecordings.map((recording) => (
+                      <option key={recording.id} value={recording.id}>
+                        {recording.name} ({(recording.duration || 0).toFixed(1)}秒)
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  onClick={loadLocalStorageRecordings}
+                  disabled={isDummyAudioSending}
+                  className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 transition-colors"
+                >
+                  更新
+                </button>
+              </div>
+            </div>
+            
+            {isDummyAudioSending && (
+              <div className="flex items-center justify-center space-x-2 text-orange-600">
+                <div className="w-4 h-4 border-2 border-orange-600 border-t-transparent rounded-full animate-spin"></div>
+                <span className="text-sm font-medium">ダミーオーディオを送信中...</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -968,15 +1489,64 @@ export default function RealtimeClient() {
 
           {/* Session Status */}
           {currentSessionId && (
-            <div className="p-3 bg-green-50 border border-green-200 rounded-md">
-              <div className="flex items-center space-x-2">
-                <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                <span className="text-sm font-medium text-green-800">
-                  セッション接続中: {currentSessionId}
-                </span>
+            <div className="space-y-3">
+              <div className="p-3 bg-green-50 border border-green-200 rounded-md">
+                <div className="flex items-center space-x-2">
+                  <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+                  <span className="text-sm font-medium text-green-800">
+                    セッション接続中: {currentSessionId}
+                  </span>
+                </div>
+              </div>
+              
+              {/* Share Session URL */}
+              <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm text-blue-700">
+                    このURLを共有して他の人を招待
+                  </div>
+                  <button
+                    onClick={() => {
+                      const editorUrl = `${window.location.origin}/editor/${currentSessionId}`;
+                      navigator.clipboard.writeText(editorUrl);
+                      // Optional: Show feedback (could add a toast notification here)
+                      const button = document.activeElement as HTMLButtonElement;
+                      const originalText = button.textContent;
+                      button.textContent = 'コピー完了！';
+                      setTimeout(() => {
+                        button.textContent = originalText;
+                      }, 2000);
+                    }}
+                    className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                  >
+                    URLをコピー
+                  </button>
+                </div>
+                <div className="mt-2 text-xs text-blue-600 font-mono">
+                  {typeof window !== 'undefined' && `${window.location.origin}/editor/${currentSessionId}`}
+                </div>
               </div>
             </div>
           )}
+          
+          {/* Create/Open Session Button */}
+          <div className="flex justify-center space-x-4">
+            <button
+              onClick={createOrOpenEditingSession}
+              className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
+            >
+              {currentSessionId ? '編集セッションを開く' : '編集セッションの作成'}
+            </button>
+            
+            <button
+              onClick={sendTestText}
+              disabled={!currentSessionId}
+              className="px-6 py-3 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              title={!currentSessionId ? "セッションIDを設定してください" : "テスト文字列を共同編集セッションに送信"}
+            >
+              テスト文字列送信
+            </button>
+          </div>
         </div>
 
         {/* Controls */}
@@ -985,7 +1555,7 @@ export default function RealtimeClient() {
             ? "bg-red-50 border-2 border-red-200" 
             : "bg-white"
         }`}>
-          <div className="flex justify-center space-x-4">
+          <div className="flex justify-center space-x-4 flex-wrap gap-2">
           <button
             onClick={isRecording ? stopRecording : startRecording}
             disabled={!isConnected && !isRecording}
@@ -995,7 +1565,7 @@ export default function RealtimeClient() {
                 : "bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
             }`}
           >
-            {isRecording ? "Stop Streaming" : "Start Streaming"}
+            {isRecording ? "文字起こし終了" : "文字起こし開始"}
           </button>
           
           <button
@@ -1004,13 +1574,6 @@ export default function RealtimeClient() {
             className="px-6 py-3 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
           >
             Clear Text
-          </button>
-          
-          <button
-            onClick={createOrOpenEditingSession}
-            className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
-          >
-            {currentSessionId ? '編集セッションを開く' : '編集セッションの作成'}
           </button>
           </div>
         </div>
