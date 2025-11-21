@@ -165,12 +165,13 @@ app.prepare().then(() => {
     // Session management for Hocuspocus integration
     let currentSessionId = null;
     
-    // Fixed Realtime model for audio transcription (lightweight and cost-effective)
-    const fixedRealtimeModel = 'gpt-4o-mini-realtime-preview';
-    
-    // Connect to OpenAI Realtime API with fixed model
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${fixedRealtimeModel}`;
-    console.log('Connecting to OpenAI Realtime API:', openaiUrl);
+    // Use gpt-4o-transcribe for transcription-only mode (cost-effective)
+    // Note: We still connect via Realtime API but configure it for transcription-only
+    const transcriptionModel = 'gpt-4o-mini-realtime-preview';
+
+    // Connect to OpenAI Realtime API (will be configured for transcription-only)
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${transcriptionModel}`;
+    console.log('Connecting to OpenAI Realtime API (transcription-only mode):', openaiUrl);
     
     // Create proxy agent if HTTPS_PROXY is set
     const proxyAgent = process.env.HTTPS_PROXY ? new HttpsProxyAgent(process.env.HTTPS_PROXY) : undefined;
@@ -183,16 +184,16 @@ app.prepare().then(() => {
       agent: proxyAgent
     });
 
-    // Function to create session configuration with optional prompt and transcription model
-    const createSessionConfig = (prompt = '', transcriptionModel = 'gpt-4o-transcribe') => ({
+    // Function to create session configuration for transcription-only mode
+    // Optimized to minimize Realtime model usage and maximize transcription accuracy
+    const createSessionConfig = (prompt = '', asrModel = 'gpt-4o-transcribe') => ({
       type: 'session.update',
       session: {
-        modalities: ['text', 'audio'],
-        instructions: 'You are a transcription assistant. When you receive audio input, transcribe exactly what you hear without adding any commentary.',
+        modalities: ['text'],  // Only text output (no audio responses)
+        instructions: 'Transcription only mode.',  // Minimal instructions
         input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
         input_audio_transcription: {
-          model: transcriptionModel,
+          model: asrModel,  // Use dedicated ASR model (gpt-4o-transcribe)
           ...(prompt ? { prompt: prompt } : {})
         },
         turn_detection: {
@@ -201,8 +202,8 @@ app.prepare().then(() => {
           prefix_padding_ms: vadPrefixPadding,
           silence_duration_ms: vadSilenceDuration
         },
-        temperature: 0.6,
-        max_response_output_tokens: 200
+        temperature: 0.0,  // Deterministic (no variability needed)
+        max_response_output_tokens: 1  // Minimize response generation
       }
     });
 
