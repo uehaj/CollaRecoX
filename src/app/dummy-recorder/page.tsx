@@ -20,6 +20,7 @@ export default function DummyRecorderPage() {
   const [recordingName, setRecordingName] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [recordingDuration, setRecordingDuration] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState<boolean>(false);
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -310,6 +311,96 @@ export default function DummyRecorderPage() {
     }
   }, []);
 
+  // Upload and process audio file
+  const uploadAudioFile = useCallback(async (file: File) => {
+    try {
+      setIsUploading(true);
+      setError(null);
+      
+      console.log('[File Upload] Processing file:', file.name, file.type, file.size);
+      
+      // Create AudioContext for processing
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioContextClass({ sampleRate: 24000 });
+      
+      // Read file as ArrayBuffer
+      const arrayBuffer = await file.arrayBuffer();
+      console.log('[File Upload] File read as ArrayBuffer:', arrayBuffer.byteLength, 'bytes');
+      
+      // Decode audio data
+      const audioData = await audioContext.decodeAudioData(arrayBuffer);
+      console.log('[File Upload] Audio decoded - duration:', audioData.duration, 'seconds, sample rate:', audioData.sampleRate);
+      
+      // Convert to PCM16
+      const channelData = audioData.getChannelData(0);
+      const pcm16 = floatTo16BitPCM(channelData);
+      
+      console.log('[File Upload] Converted to PCM16:', pcm16.length, 'samples');
+      
+      if (pcm16.length > 0) {
+        // Convert to base64
+        const base64Data = int16ArrayToBase64(pcm16);
+        console.log('[File Upload] Base64 data length:', base64Data.length, 'chars');
+        
+        // Create recording object
+        const recording: AudioRecording = {
+          id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          name: file.name.replace(/\.[^/.]+$/, '') + '_アップロード', // Remove extension and add suffix
+          timestamp: Date.now(),
+          duration: audioData.duration,
+          data: base64Data,
+          sampleRate: 24000
+        };
+        
+        console.log('[File Upload] Created recording object:', recording);
+        
+        // Add to recordings list
+        const currentRecordings = JSON.parse(localStorage.getItem('dummy-audio-recordings') || '[]');
+        const newRecordings = [recording, ...currentRecordings];
+        setRecordings(newRecordings);
+        saveRecordingsToStorage(newRecordings);
+        
+        console.log('[File Upload] Updated recordings list, new length:', newRecordings.length);
+      }
+      
+      // Clean up
+      audioContext.close();
+      
+    } catch (error) {
+      console.error('[File Upload] Error processing file:', error);
+      setError('ファイルの処理に失敗しました。対応している音声ファイル形式を確認してください。');
+    } finally {
+      setIsUploading(false);
+    }
+  }, [floatTo16BitPCM, int16ArrayToBase64, saveRecordingsToStorage]);
+
+  // Handle file input change
+  const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      
+      // Validate file type
+      const supportedTypes = ['audio/wav', 'audio/mp3', 'audio/mpeg', 'audio/ogg', 'audio/webm', 'audio/m4a'];
+      if (!supportedTypes.some(type => file.type.includes(type.split('/')[1]))) {
+        setError('対応していないファイル形式です。WAV, MP3, OGG, WebM, M4Aファイルを選択してください。');
+        event.target.value = ''; // Clear the input
+        return;
+      }
+      
+      // Validate file size (max 50MB)
+      const maxSize = 50 * 1024 * 1024; // 50MB
+      if (file.size > maxSize) {
+        setError('ファイルサイズが大きすぎます。50MB以下のファイルを選択してください。');
+        event.target.value = ''; // Clear the input
+        return;
+      }
+      
+      uploadAudioFile(file);
+      event.target.value = ''; // Clear the input for next use
+    }
+  }, [uploadAudioFile]);
+
   // Clear all recordings
   const clearAllRecordings = useCallback(() => {
     if (confirm('すべての録音を削除しますか？この操作は取り消せません。')) {
@@ -430,7 +521,7 @@ export default function DummyRecorderPage() {
           )}
 
           {/* Control Buttons */}
-          <div className="flex justify-center space-x-4">
+          <div className="flex justify-center space-x-4 flex-wrap gap-2">
             <button
               onClick={isRecording ? stopRecording : startRecording}
               disabled={!selectedDeviceId && !isRecording}
@@ -442,7 +533,35 @@ export default function DummyRecorderPage() {
             >
               {isRecording ? "録音停止" : "録音開始"}
             </button>
+            
+            <div className="relative">
+              <input
+                type="file"
+                accept="audio/*"
+                onChange={handleFileUpload}
+                disabled={isRecording || isUploading}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
+                id="audio-file-upload"
+              />
+              <label
+                htmlFor="audio-file-upload"
+                className={`px-6 py-4 text-lg font-semibold rounded-lg transition-colors cursor-pointer inline-block ${
+                  isRecording || isUploading
+                    ? "bg-gray-400 text-gray-200 cursor-not-allowed"
+                    : "bg-blue-600 hover:bg-blue-700 text-white"
+                }`}
+              >
+                {isUploading ? "アップロード中..." : "ファイルアップロード"}
+              </label>
+            </div>
           </div>
+          
+          {isUploading && (
+            <div className="mt-4 flex items-center justify-center space-x-2 text-blue-600">
+              <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+              <span className="text-sm font-medium">オーディオファイルを処理中...</span>
+            </div>
+          )}
         </div>
 
         {/* Recordings List */}
@@ -471,7 +590,14 @@ export default function DummyRecorderPage() {
                 <div key={recording.id} className="border border-gray-200 rounded-lg p-4">
                   <div className="flex items-center justify-between">
                     <div className="flex-1">
-                      <h4 className="font-medium text-gray-900">{recording.name}</h4>
+                      <div className="flex items-center space-x-2">
+                        {recording.id.startsWith('file_') ? (
+                          <span className="text-blue-600" title="アップロードファイル">📁</span>
+                        ) : (
+                          <span className="text-red-600" title="録音データ">🎤</span>
+                        )}
+                        <h4 className="font-medium text-gray-900">{recording.name}</h4>
+                      </div>
                       <div className="text-sm text-gray-500 mt-1">
                         <span>長さ: {formatDuration(recording.duration)}</span>
                         <span className="mx-2">•</span>
