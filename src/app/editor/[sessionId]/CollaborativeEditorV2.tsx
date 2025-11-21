@@ -1,65 +1,107 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import * as Y from 'yjs';
-import { WebsocketProvider } from 'y-websocket';
+import { HocuspocusProvider } from '@hocuspocus/provider';
 
 interface CollaborativeEditorV2Props {
   sessionId: string;
 }
 
 export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditorV2Props) {
-  const [ydoc] = useState(() => new Y.Doc());
-  const [provider, setProvider] = useState<WebsocketProvider | null>(null);
+  // Use refs to prevent React Strict Mode from creating duplicates
+  const ydocRef = useRef<Y.Doc | null>(null);
+  const providerRef = useRef<HocuspocusProvider | null>(null);
+  const initializedRef = useRef(false);
+  
+  const [provider, setProvider] = useState<HocuspocusProvider | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [userCount, setUserCount] = useState(1);
 
-  // Initialize WebSocket provider
+  // Initialize Y.Doc only once
+  if (!ydocRef.current) {
+    ydocRef.current = new Y.Doc();
+    console.log('[Collaborative Editor V2] 📄 Created new Y.Doc for session:', sessionId);
+  }
+
+  // Initialize Hocuspocus provider
   useEffect(() => {
+    // Prevent duplicate initialization in React Strict Mode
+    if (initializedRef.current || !ydocRef.current) {
+      console.log('[Collaborative Editor V2] ⚠️ Skipping duplicate initialization');
+      return;
+    }
+    
+    initializedRef.current = true;
     console.log('[Collaborative Editor V2] 🚀 Initializing for session:', sessionId);
     
-    const websocketUrl = `ws://localhost:5001/api/yjs-ws?sessionId=${sessionId}`;
+    // Use the current hostname and port, automatically detecting protocol
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
+    const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
     const roomName = `transcribe-editor-v2-${sessionId}`;
     
     console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
     
-    const wsProvider = new WebsocketProvider(websocketUrl, roomName, ydoc);
+    const hocusProvider = new HocuspocusProvider({
+      url: websocketUrl,
+      name: roomName,
+      document: ydocRef.current,
+    });
     
-    wsProvider.on('status', (event: { status: string }) => {
-      console.log('[WebSocket Provider V2] Status:', event.status);
+    providerRef.current = hocusProvider;
+    
+    hocusProvider.on('status', (event: { status: string }) => {
+      console.log('[Hocuspocus Provider V2] Status:', event.status);
       setIsConnected(event.status === 'connected');
     });
 
-    wsProvider.on('connection-close', () => {
-      console.log('[WebSocket Provider V2] Connection closed');
+    hocusProvider.on('connect', () => {
+      console.log('[Hocuspocus Provider V2] Connected');
+      setIsConnected(true);
+    });
+
+    hocusProvider.on('disconnect', (event: unknown) => {
+      console.log('[Hocuspocus Provider V2] Disconnected:', event);
       setIsConnected(false);
     });
 
-    wsProvider.on('connection-error', (event: Event) => {
-      console.error('[WebSocket Provider V2] Connection error:', event);
-      setIsConnected(false);
+    hocusProvider.on('close', (event: unknown) => {
+      console.error('[Hocuspocus Provider V2] Connection closed:', event);
     });
 
-    // Track user count (without cursor extension)
-    wsProvider.awareness.on('change', () => {
-      const count = wsProvider.awareness.getStates().size;
+    hocusProvider.on('error', (event: unknown) => {
+      console.error('[Hocuspocus Provider V2] Error:', event);
+    });
+
+    // Track user count
+    hocusProvider.awareness?.on('change', () => {
+      const count = hocusProvider.awareness?.getStates().size || 1;
       console.log('[Awareness V2] User count changed:', count);
       setUserCount(count);
     });
 
-    setProvider(wsProvider);
+    setProvider(hocusProvider);
 
     return () => {
-      console.log('[Collaborative Editor V2] 🧹 Cleaning up WebSocket provider');
-      if (wsProvider) {
-        wsProvider.destroy();
+      console.log('[Collaborative Editor V2] 🧹 Cleaning up Hocuspocus provider');
+      if (providerRef.current) {
+        try {
+          providerRef.current.disconnect();
+          providerRef.current.destroy();
+        } catch (error) {
+          console.error('[Collaborative Editor V2] ❌ Error during cleanup:', error);
+        }
+        providerRef.current = null;
       }
       setProvider(null);
+      setIsConnected(false);
+      initializedRef.current = false;
     };
-  }, [sessionId, ydoc]);
+  }, [sessionId]);
 
   // Create editor with collaboration (no cursor for now)
   const editor = useEditor({
@@ -68,7 +110,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         history: false, // Disable history for collaboration
       }),
       Collaboration.configure({
-        document: ydoc,
+        document: ydocRef.current,
+        field: `content-${sessionId}`, // Use session-specific field name
       }),
     ],
     content: `
@@ -84,6 +127,38 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     },
   });
 
+
+  // Document change listener for debugging
+  useEffect(() => {
+    if (!ydocRef.current) return;
+
+    try {
+      // Use session-specific text field name to avoid conflicts
+      const textFieldName = `content-${sessionId}`;
+      
+      // Check if this text type already exists to avoid duplication
+      const existingText = ydocRef.current.share.has(textFieldName);
+      console.log(`[Collaborative Editor V2] 📄 Text field '${textFieldName}' exists:`, existingText);
+      
+      const ytext = ydocRef.current.getText(textFieldName);
+      
+      const onChange = () => {
+        console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
+      };
+
+      ytext.observe(onChange);
+
+      return () => {
+        try {
+          ytext.unobserve(onChange);
+        } catch (error) {
+          console.warn('[Collaborative Editor V2] ⚠️ Error during unobserve:', error);
+        }
+      };
+    } catch (error) {
+      console.error('[Collaborative Editor V2] ❌ Error setting up document listener:', error);
+    }
+  }, [sessionId]);
 
   if (!editor) {
     return (
@@ -123,31 +198,33 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
       {/* Editor Toolbar */}
       <div className="bg-white rounded-lg shadow-sm border p-3">
-        <div className="flex items-center space-x-2">
-          <button
-            onClick={() => editor.chain().focus().toggleBold().run()}
-            className={`px-3 py-1 text-sm rounded ${editor.isActive('bold') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
-          >
-            太字
-          </button>
-          <button
-            onClick={() => editor.chain().focus().toggleItalic().run()}
-            className={`px-3 py-1 text-sm rounded ${editor.isActive('italic') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
-          >
-            斜体
-          </button>
-          <button
-            onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-            className={`px-3 py-1 text-sm rounded ${editor.isActive('heading', { level: 2 }) ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
-          >
-            見出し
-          </button>
-          <button
-            onClick={() => editor.chain().focus().toggleBulletList().run()}
-            className={`px-3 py-1 text-sm rounded ${editor.isActive('bulletList') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
-          >
-            箇条書き
-          </button>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => editor.chain().focus().toggleBold().run()}
+              className={`px-3 py-1 text-sm rounded ${editor.isActive('bold') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+            >
+              太字
+            </button>
+            <button
+              onClick={() => editor.chain().focus().toggleItalic().run()}
+              className={`px-3 py-1 text-sm rounded ${editor.isActive('italic') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+            >
+              斜体
+            </button>
+            <button
+              onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
+              className={`px-3 py-1 text-sm rounded ${editor.isActive('heading', { level: 2 }) ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+            >
+              見出し
+            </button>
+            <button
+              onClick={() => editor.chain().focus().toggleBulletList().run()}
+              className={`px-3 py-1 text-sm rounded ${editor.isActive('bulletList') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+            >
+              箇条書き
+            </button>
+          </div>
         </div>
       </div>
 

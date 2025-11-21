@@ -40,8 +40,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 sample/CollaReco/
-<<<<<<< HEAD
-=======
 
 # temporary files
 nohup.out
@@ -55,4 +53,5 @@ a.env~
 .env~
 .env.local~
 .env.local.bak
->>>>>>> 9aed8aeb53a087cff4cd514274cdf53dcce23e5f
+working
+server.pid
