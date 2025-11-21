@@ -186,7 +186,10 @@ export default function RealtimeClient() {
     }
 
     const currentPrompt = getCurrentPrompt();
-    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws`;
+    // Automatically detect protocol and host
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
+    const wsUrl = `${protocol}//${host}/api/realtime-ws`;
     console.log('[WebSocket] Connecting to:', wsUrl);
     console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
     const ws = new WebSocket(wsUrl);
