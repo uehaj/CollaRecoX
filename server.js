@@ -97,10 +97,17 @@ app.prepare().then(() => {
       }
     } else if (pathname === '/api/realtime-ws') {
       console.log('[WebSocket] Processing /api/realtime-ws upgrade request');
+      console.log('[WebSocket] Socket readable:', socket.readable);
+      console.log('[WebSocket] Socket writable:', socket.writable);
+      console.log('[WebSocket] Head length:', head.length);
+      console.log('[WebSocket] About to call handleUpgrade...');
       try {
         realtimeWss.handleUpgrade(request, socket, head, (ws) => {
+          console.log('[WebSocket] ✅ handleUpgrade callback called, about to emit connection event');
           realtimeWss.emit('connection', ws, request);
+          console.log('[WebSocket] ✅ connection event emitted');
         });
+        console.log('[WebSocket] handleUpgrade called (but callback may not have executed yet)');
       } catch (upgradeError) {
         console.error('[WebSocket] ❌ Realtime WebSocket upgrade error:', upgradeError);
         socket.destroy();
