@@ -164,13 +164,13 @@ app.prepare().then(() => {
     
     // Session management for Hocuspocus integration
     let currentSessionId = null;
-    
-    // Use gpt-4o-transcribe for transcription-only mode (cost-effective)
-    // Note: We still connect via Realtime API but configure it for transcription-only
-    const transcriptionModel = 'gpt-4o-mini-realtime-preview';
+
+    // Use Realtime API in transcription-only mode (cost-effective)
+    // Connect with mini model, but configure for ASR-only processing
+    const realtimeModel = 'gpt-4o-mini-realtime-preview';
 
     // Connect to OpenAI Realtime API (will be configured for transcription-only)
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${transcriptionModel}`;
+    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${realtimeModel}`;
     console.log('Connecting to OpenAI Realtime API (transcription-only mode):', openaiUrl);
     
     // Create proxy agent if HTTPS_PROXY is set
