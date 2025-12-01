@@ -67,21 +67,36 @@ interface StatusMessage {
 interface DummyAudioMessage {
   type: 'dummy_audio_started' | 'dummy_audio_completed';
   filename?: string;
+  totalSeconds?: number;
 }
 
-type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage;
+interface DummyAudioProgressMessage {
+  type: 'dummy_audio_progress';
+  currentSeconds: number;
+  totalSeconds: number;
+  progress: number;
+}
+
+type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage | DummyAudioProgressMessage;
 
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | AudioWorkletNode | null>(null);
   const recordingStateRef = useRef<boolean>(false);
-  
+
   // Hocuspocus client refs for test functionality
-  const hocuspocusProviderRef = useRef<HocuspocusProvider | null>(null);  
+  const hocuspocusProviderRef = useRef<HocuspocusProvider | null>(null);
   const hocuspocusDocRef = useRef<Y.Doc | null>(null);
-  
+
   const [text, setText] = useState("");
+  const textRef = useRef<string>(""); // Keep latest text value for logging
+
+  // Update textRef when text changes
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
+
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,14 +111,23 @@ export default function RealtimeClient() {
   const [transcriptionModel, setTranscriptionModel] = useState<string>('gpt-4o-transcribe');
   const [speechBreakDetection, setSpeechBreakDetection] = useState<boolean>(false);
   const [breakMarker, setBreakMarker] = useState<string>('⏎');
-  const [vadThreshold, setVadThreshold] = useState<number>(0.3);
-  const [vadSilenceDuration, setVadSilenceDuration] = useState<number>(1000);
+  const [vadThreshold, setVadThreshold] = useState<number>(0.2);
+  const [vadSilenceDuration, setVadSilenceDuration] = useState<number>(3000);
   const [vadPrefixPadding, setVadPrefixPadding] = useState<number>(300);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
   const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
+  const [dummyAudioProgress, setDummyAudioProgress] = useState<{ currentSeconds: number; totalSeconds: number } | null>(null);
   const [localStorageRecordings, setLocalStorageRecordings] = useState<AudioRecording[]>([]);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
+  const [dummySendInterval, setDummySendInterval] = useState<number>(50); // Dummy audio send interval in ms
+  const [audioBufferSize, setAudioBufferSize] = useState<number>(4096); // ScriptProcessor buffer size (256, 512, 1024, 2048, 4096)
+  const [batchMultiplier, setBatchMultiplier] = useState<number>(1); // 一括送信する際のバッチ数（1=即時送信、2以上=蓄積して送信）
+  const accumulatedAudioRef = useRef<Int16Array[]>([]); // 蓄積用バッファ
+  const [skipSilentChunks, setSkipSilentChunks] = useState<boolean>(false); // 無音チャンクをスキップするかどうか（デフォルト:無効=高精度）
+  const [recordingElapsedTime, setRecordingElapsedTime] = useState<number>(0);
+  const recordingStartTimeRef = useRef<number>(0);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
 
@@ -265,13 +289,31 @@ export default function RealtimeClient() {
             break;
             
           case 'dummy_audio_started':
-            console.log('[Dummy Audio] 🎵 Started sending dummy audio:', message.filename);
+            console.log('[Dummy Audio] 🎵 Started sending dummy audio:', message.filename, 'total:', message.totalSeconds, 'seconds');
             setIsDummyAudioSending(true);
+            setDummyAudioProgress({ currentSeconds: 0, totalSeconds: message.totalSeconds || 0 });
             break;
-            
+
+          case 'dummy_audio_progress':
+            console.log('[Dummy Audio] 📊 Progress:', message.currentSeconds.toFixed(2), '/', message.totalSeconds.toFixed(2), 'seconds');
+            setDummyAudioProgress({ currentSeconds: message.currentSeconds, totalSeconds: message.totalSeconds });
+            break;
+
           case 'dummy_audio_completed':
             console.log('[Dummy Audio] ✅ Dummy audio processing completed');
+
+            // Log final transcription text
+            console.log('[Dummy Audio] 📝 Final transcription text:');
+            console.log('====== START OF TRANSCRIPTION ======');
+            console.log(text);
+            console.log('====== END OF TRANSCRIPTION ======');
+            console.log(`[Dummy Audio] 📊 Total characters: ${text.length}, Total words: ${text.split(/\s+/).filter(word => word.length > 0).length}`);
+
             setIsDummyAudioSending(false);
+            setDummyAudioProgress(null);
+            // Stop recording state when dummy audio is completed
+            setIsRecording(false);
+            setIsProcessing(false);
             break;
             
           case 'speech_started':
@@ -294,6 +336,9 @@ export default function RealtimeClient() {
           case 'transcription_error':
             setError(message.error);
             setIsDummyAudioSending(false);
+            // Stop recording state when error occurs
+            setIsRecording(false);
+            setIsProcessing(false);
             console.error('[WebSocket] ❌ Error:', message.error);
             break;
             
@@ -381,12 +426,16 @@ export default function RealtimeClient() {
         throw new Error('Audio processing not supported in this browser');
       }
       
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const processor = audioContext.createScriptProcessor(audioBufferSize, 1, 1);
       processorRef.current = processor;
-      console.log('[Audio] 🔧 ScriptProcessor created with 4096 buffer size');
+      console.log(`[Audio] 🔧 ScriptProcessor created with ${audioBufferSize} buffer size`);
       
       let audioChunkCount = 0;
-      
+      let lastSendTime = 0;          // For timing analysis
+      let sendCount = 0;             // Count of actually sent chunks
+      let skipCount = 0;             // Count of skipped chunks (silent)
+      const timingLog: Array<{timestamp: number; interval: number; type: 'sent' | 'skipped'; samples: number}> = [];
+
       processor.onaudioprocess = (event) => {
         audioChunkCount++;
         
@@ -472,28 +521,67 @@ export default function RealtimeClient() {
 
         // Check for actual audio content before sending
         const maxPcmValue = Math.max(...Array.from(pcm16).map(Math.abs));
-        
-        // Skip silent audio chunks (threshold: 100 for 16-bit PCM)
-        if (maxPcmValue < 100) {
+
+        // Skip silent audio chunks if enabled (threshold: 100 for 16-bit PCM)
+        if (skipSilentChunks && maxPcmValue < 100) {
+          skipCount++;
+          const now = performance.now();
+          const interval = lastSendTime > 0 ? now - lastSendTime : 0;
+          timingLog.push({timestamp: now, interval, type: 'skipped', samples: processedData.length});
+
           if (audioChunkCount <= 10 || audioChunkCount % 50 === 0) {
             console.warn(`[Audio Processing] ⚠️ Skipping silent chunk #${audioChunkCount}: max PCM=${maxPcmValue}`);
           }
           return; // Don't send silent audio
         }
 
-        // Send audio chunk to WebSocket
-        try {
-          websocketRef.current.send(JSON.stringify({
-            type: 'audio_chunk',
-            audio: base64Audio
-          }));
-          
-          // Log successful transmission every 20th chunk
-          if (audioChunkCount % 20 === 0) {
-            console.log(`[WebSocket] 📤 Audio chunk #${audioChunkCount} sent successfully (max PCM: ${maxPcmValue})`);
+        // Batch accumulation logic
+        accumulatedAudioRef.current.push(pcm16);
+
+        // Check if we have accumulated enough batches
+        if (accumulatedAudioRef.current.length >= batchMultiplier) {
+          // Merge accumulated audio chunks into one
+          const totalSamples = accumulatedAudioRef.current.reduce((sum, arr) => sum + arr.length, 0);
+          const mergedPcm16 = new Int16Array(totalSamples);
+          let offset = 0;
+          for (const chunk of accumulatedAudioRef.current) {
+            mergedPcm16.set(chunk, offset);
+            offset += chunk.length;
           }
-        } catch (sendError) {
-          console.error(`[WebSocket] ❌ Failed to send audio chunk #${audioChunkCount}:`, sendError);
+
+          // Clear accumulated buffer
+          accumulatedAudioRef.current = [];
+
+          // Convert merged audio to base64
+          const mergedBase64Audio = arrayBufferToBase64(mergedPcm16.buffer as ArrayBuffer);
+
+          // Send audio chunk to WebSocket
+          try {
+            const now = performance.now();
+            const interval = lastSendTime > 0 ? now - lastSendTime : 0;
+            lastSendTime = now;
+            sendCount++;
+
+            // Record timing for analysis
+            timingLog.push({timestamp: now, interval, type: 'sent', samples: totalSamples});
+
+            websocketRef.current.send(JSON.stringify({
+              type: 'audio_chunk',
+              audio: mergedBase64Audio
+            }));
+
+            // Log with detailed timing info every 10th sent chunk
+            if (sendCount % 10 === 0 || sendCount <= 5) {
+              console.log(`[Timing Analysis] 📤 SENT #${sendCount} | interval: ${interval.toFixed(1)}ms | samples: ${totalSamples} (${batchMultiplier}バッチ統合) | max PCM: ${maxPcmValue} | skipped: ${skipCount}`);
+            }
+          } catch (sendError) {
+            console.error(`[WebSocket] ❌ Failed to send audio chunk #${audioChunkCount}:`, sendError);
+          }
+        } else {
+          // Log accumulation progress
+          if (audioChunkCount <= 10 || audioChunkCount % 50 === 0) {
+            console.log(`[Audio Processing] 📦 Accumulating batch ${accumulatedAudioRef.current.length}/${batchMultiplier}`);
+          }
         }
       };
 
@@ -532,7 +620,15 @@ export default function RealtimeClient() {
 
       // Set recording state immediately for audio processing
       recordingStateRef.current = true;
-      
+
+      // Start recording timer
+      recordingStartTimeRef.current = Date.now();
+      setRecordingElapsedTime(0);
+      recordingTimerRef.current = setInterval(() => {
+        const elapsed = (Date.now() - recordingStartTimeRef.current) / 1000;
+        setRecordingElapsedTime(elapsed);
+      }, 100);
+
       setIsRecording(true);
       setIsProcessing(true);
       console.log('[Audio] ✅ Audio streaming started successfully');
@@ -549,14 +645,24 @@ export default function RealtimeClient() {
       console.error('[Audio] ❌ Error starting audio stream:', err);
       setError(err instanceof Error ? err.message : 'Failed to start audio stream');
     }
-  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId]);
+  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks]);
 
   const stopAudioStream = useCallback(() => {
     console.log('[Audio] 🛑 Stopping audio stream...');
-    
+
     // Stop recording state immediately
     recordingStateRef.current = false;
-    
+
+    // Clear accumulated audio buffer
+    accumulatedAudioRef.current = [];
+
+    // Stop recording timer
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setRecordingElapsedTime(0);
+
     // Stop audio processing
     if (processorRef.current) {
       console.log('[Audio] 🔌 Disconnecting audio processor');
@@ -675,17 +781,24 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
   const stopRecording = useCallback(() => {
     console.log('[Recording] ⏹️ Stop recording requested');
-    
+
+    // Log final transcription text
+    console.log('[Recording] 📝 Final transcription text:');
+    console.log('====== START OF TRANSCRIPTION ======');
+    console.log(text);
+    console.log('====== END OF TRANSCRIPTION ======');
+    console.log(`[Recording] 📊 Total characters: ${text.length}, Total words: ${text.split(/\s+/).filter(word => word.length > 0).length}`);
+
     // Send detailed stop notification to collaborative document
     const currentTime = new Date().toLocaleString('ja-JP');
     const statusMessage = `
 ⏹️ 文字起こし終了 (${currentTime})
 🎤 使用モデル: ${transcriptionModel}`;
-    
+
     sendStatusToCollaboration(statusMessage);
-    
+
     stopAudioStream();
-  }, [stopAudioStream, sendStatusToCollaboration, transcriptionModel]);
+  }, [stopAudioStream, sendStatusToCollaboration, transcriptionModel, text]);
 
   const clearText = useCallback(() => {
     console.log('[UI] 🧹 Clearing transcription text');
@@ -801,7 +914,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       setError('WebSocket接続が必要です。先に接続してください。');
       return;
     }
-    
+
     // Send from localStorage
     const recording = localStorageRecordings.find(rec => rec.id === selectedRecordingId);
     if (!recording) {
@@ -809,17 +922,40 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       setIsDummyAudioSending(false);
       return;
     }
-    
+
     setIsDummyAudioSending(true);
     setError(null);
-    
-    console.log('[Dummy Audio] 🎵 Sending localStorage recording:', recording.name);
+
+    // Start recording state for transcription UI
+    setIsRecording(true);
+    setIsProcessing(true);
+
+    console.log('[Dummy Audio] 🎵 Sending localStorage recording:', recording.name, 'interval:', dummySendInterval, 'ms');
     websocketRef.current?.send(JSON.stringify({
       type: 'send_dummy_audio_data',
       audioData: recording.data,
-      name: recording.name
+      name: recording.name,
+      sendInterval: dummySendInterval
     }));
-  }, [isConnected, localStorageRecordings, selectedRecordingId]);
+  }, [isConnected, localStorageRecordings, selectedRecordingId, dummySendInterval]);
+
+  // Stop dummy audio sending
+  const stopDummyAudio = useCallback(() => {
+    console.log('[Dummy Audio] 🛑 Stopping dummy audio sending');
+
+    // Send stop message to server
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({
+        type: 'stop_dummy_audio'
+      }));
+    }
+
+    // Reset states
+    setIsDummyAudioSending(false);
+    setDummyAudioProgress(null);
+    setIsRecording(false);
+    setIsProcessing(false);
+  }, []);
 
   // Initialize/cleanup Hocuspocus connection for test functionality
   const initializeHocuspocusClient = useCallback(() => {
@@ -1037,6 +1173,33 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               ダミーデータ作成画面 →
             </a>
           </div>
+        </div>
+
+        {/* Transcription Model Selection */}
+        <div className="bg-white p-6 rounded-lg shadow-md">
+          <label htmlFor="transcription-model-select" className="block text-sm font-medium text-gray-700 mb-2">
+            音声認識モデル:
+          </label>
+          <select
+            id="transcription-model-select"
+            value={transcriptionModel}
+            onChange={(e) => setTranscriptionModel(e.target.value)}
+            disabled={isRecording || isConnected}
+            className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option value="whisper-1">
+              Whisper-1 (従来モデル)
+            </option>
+            <option value="gpt-4o-mini-transcribe">
+              GPT-4o Mini Transcribe (軽量・高速)
+            </option>
+            <option value="gpt-4o-transcribe">
+              GPT-4o Transcribe (高精度)
+            </option>
+          </select>
+          <p className="text-xs text-gray-500 mt-1">
+            接続前に音声認識モデルを選択してください
+          </p>
         </div>
 
         {/* Transcription Prompt Settings */}
@@ -1261,83 +1424,30 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               </div>
             </div>
             
-            <div className="mt-3 text-xs text-blue-600">
-              <strong>推奨設定:</strong> 短い区切りなら感度0.2、終了時間500ms
+            <div className="mt-3 flex items-center justify-between">
+              <div className="text-xs text-blue-600">
+                <strong>推奨:</strong> 高精度は終了時間3000ms、区切り重視は500ms
+              </div>
+              <button
+                onClick={() => {
+                  setVadThreshold(0.2);
+                  setVadSilenceDuration(3000);
+                  setVadPrefixPadding(300);
+                  setSkipSilentChunks(false);
+                  setAudioBufferSize(4096);
+                  setBatchMultiplier(1);
+                }}
+                disabled={isRecording || isConnected}
+                className="px-3 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              >
+                最高精度設定を適用
+              </button>
             </div>
           </div>
 
           <p className="text-xs text-gray-500">
             Note: プロンプト設定は接続前にのみ変更可能です
           </p>
-        </div>
-
-        {/* Audio Device Selection and Transcription Model Selection - Responsive 2-column layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Transcription Model Selection */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <label htmlFor="transcription-model-select" className="block text-sm font-medium text-gray-700 mb-2">
-              音声認識モデル:
-            </label>
-            <select
-              id="transcription-model-select"
-              value={transcriptionModel}
-              onChange={(e) => setTranscriptionModel(e.target.value)}
-              disabled={isRecording || isConnected}
-              className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-            >
-              <option value="whisper-1">
-                Whisper-1 (従来モデル)
-              </option>
-              <option value="gpt-4o-mini-transcribe">
-                GPT-4o Mini Transcribe (軽量・高速)
-              </option>
-              <option value="gpt-4o-transcribe">
-                GPT-4o Transcribe (高精度)
-              </option>
-            </select>
-            <p className="text-xs text-gray-500 mt-1">
-              接続前に音声認識モデルを選択してください
-            </p>
-          </div>
-
-          {/* Audio Input Device Selection */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
-              Select Audio Input Device:
-            </label>
-            <select
-              id="device-select"
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-              disabled={isRecording}
-              className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-            >
-              {audioDevices.length === 0 ? (
-                <option value="">Loading devices...</option>
-              ) : (
-                audioDevices.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label || `Microphone ${device.deviceId.slice(0, 8)}...`}
-                  </option>
-                ))
-              )}
-            </select>
-            <div className="mt-2 flex items-center space-x-2">
-              <button
-                onClick={getAudioDevices}
-                disabled={isRecording}
-                className="px-3 py-1 text-sm bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Refresh Devices
-              </button>
-              <p className="text-xs text-gray-500">
-                {audioDevices.length} device(s) found
-              </p>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">
-              Note: Input device can only be changed when not recording
-            </p>
-          </div>
         </div>
 
         {/* Connection Status */}
@@ -1349,9 +1459,9 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 {isConnected ? 'Connected to Realtime API' : 'Disconnected'}
               </span>
             </div>
-            
-            {/* Connection and Dummy Audio Controls */}
-            <div className="flex items-center justify-center space-x-4 flex-wrap gap-2">
+
+            {/* Connection Controls */}
+            <div className="flex items-center justify-center">
               <button
                 onClick={isConnected ? disconnectWebSocket : connectWebSocket}
                 className={`px-6 py-3 text-lg font-semibold rounded-lg transition-colors ${
@@ -1362,57 +1472,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               >
                 {isConnected ? 'Disconnect' : 'Connect'}
               </button>
-              
-              {/* Dummy Audio Controls */}
-              <button
-                onClick={sendDummyAudio}
-                disabled={!isConnected || isDummyAudioSending}
-                className={`px-6 py-3 text-sm font-medium rounded-lg transition-colors ${
-                  !isConnected || isDummyAudioSending
-                    ? "bg-gray-400 cursor-not-allowed text-gray-200"
-                    : "bg-orange-600 hover:bg-orange-700 text-white"
-                }`}
-              >
-                {isDummyAudioSending ? '送信中...' : 'ダミーデータ認識'}
-              </button>
-              
-              <div className="flex items-center space-x-2">
-                <label htmlFor="dummy-recording-select" className="text-sm font-medium text-gray-700">
-                  録音データ:
-                </label>
-                <select
-                  id="dummy-recording-select"
-                  value={selectedRecordingId}
-                  onChange={(e) => setSelectedRecordingId(e.target.value)}
-                  disabled={isDummyAudioSending}
-                  className="px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 min-w-[200px]"
-                >
-                  {localStorageRecordings.length === 0 ? (
-                    <option value="">録音データがありません</option>
-                  ) : (
-                    localStorageRecordings.map((recording) => (
-                      <option key={recording.id} value={recording.id}>
-                        {recording.name} ({(recording.duration || 0).toFixed(1)}秒)
-                      </option>
-                    ))
-                  )}
-                </select>
-                <button
-                  onClick={loadLocalStorageRecordings}
-                  disabled={isDummyAudioSending}
-                  className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 transition-colors"
-                >
-                  更新
-                </button>
-              </div>
             </div>
-            
-            {isDummyAudioSending && (
-              <div className="flex items-center justify-center space-x-2 text-orange-600">
-                <div className="w-4 h-4 border-2 border-orange-600 border-t-transparent rounded-full animate-spin"></div>
-                <span className="text-sm font-medium">ダミーオーディオを送信中...</span>
-              </div>
-            )}
           </div>
         </div>
 
@@ -1551,43 +1611,267 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
           </div>
         </div>
 
-        {/* Controls */}
+        {/* Controls - 2 Column Layout */}
         <div className={`p-6 rounded-lg transition-colors ${
-          isRecording 
-            ? "bg-red-50 border-2 border-red-200" 
+          isRecording
+            ? "bg-red-50 border-2 border-red-200"
             : "bg-white"
         }`}>
-          <div className="flex justify-center space-x-4 flex-wrap gap-2">
-          <button
-            onClick={isRecording ? stopRecording : startRecording}
-            disabled={!isConnected && !isRecording}
-            className={`px-6 py-3 rounded-lg font-medium text-white transition-colors ${
-              isRecording
-                ? "bg-red-600 hover:bg-red-700"
-                : "bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
-            }`}
-          >
-            {isRecording ? "文字起こし終了" : "文字起こし開始"}
-          </button>
-          
-          <button
-            onClick={clearText}
-            disabled={isRecording}
-            className="px-6 py-3 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
-          >
-            Clear Text
-          </button>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Main Recording Controls */}
+            <div className="space-y-4 bg-white p-4 rounded-lg shadow-sm">
+              <h4 className="text-md font-medium text-gray-900 text-center">
+                音声入力からの文字起こし
+              </h4>
+
+              {/* Audio Input Device Selection */}
+              <div className="px-4">
+                <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
+                  音声入力デバイス:
+                </label>
+                <select
+                  id="device-select"
+                  value={selectedDeviceId}
+                  onChange={(e) => setSelectedDeviceId(e.target.value)}
+                  disabled={isRecording}
+                  className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+                >
+                  {audioDevices.length === 0 ? (
+                    <option value="">デバイスを読み込み中...</option>
+                  ) : (
+                    audioDevices.map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label || `マイク ${device.deviceId.slice(0, 8)}...`}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <div className="mt-2 flex items-center space-x-2">
+                  <button
+                    onClick={getAudioDevices}
+                    disabled={isRecording}
+                    className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    デバイス更新
+                  </button>
+                  <p className="text-xs text-gray-500">
+                    {audioDevices.length} 個のデバイス
+                  </p>
+                </div>
+              </div>
+
+              {/* Audio Processing Settings */}
+              <div className="px-4 pt-3 border-t border-gray-200">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Audio Buffer Size */}
+                  <div>
+                    <label htmlFor="buffer-size-select" className="block text-xs font-medium text-gray-700 mb-1">
+                      バッファサイズ:
+                    </label>
+                    <select
+                      id="buffer-size-select"
+                      value={audioBufferSize}
+                      onChange={(e) => setAudioBufferSize(parseInt(e.target.value))}
+                      disabled={isRecording}
+                      className="w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+                    >
+                      <option value="256">256 (~5ms)</option>
+                      <option value="512">512 (~11ms)</option>
+                      <option value="1024">1024 (~21ms)</option>
+                      <option value="2048">2048 (~43ms)</option>
+                      <option value="4096">4096 (~85ms)</option>
+                    </select>
+                  </div>
+
+                  {/* Batch Multiplier */}
+                  <div>
+                    <label htmlFor="batch-multiplier-select" className="block text-xs font-medium text-gray-700 mb-1">
+                      バッチ数:
+                    </label>
+                    <select
+                      id="batch-multiplier-select"
+                      value={batchMultiplier}
+                      onChange={(e) => setBatchMultiplier(parseInt(e.target.value))}
+                      disabled={isRecording}
+                      className="w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+                    >
+                      <option value="1">1 (即時)</option>
+                      <option value="2">2</option>
+                      <option value="4">4</option>
+                      <option value="8">8</option>
+                      <option value="16">16</option>
+                    </select>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400 mt-2">
+                  送信設定: {audioBufferSize * batchMultiplier} サンプル (~{((audioBufferSize * batchMultiplier) / 24000 * 1000).toFixed(0)}ms/回)
+                </p>
+              </div>
+
+              {/* Silent Chunk Skip */}
+              <div className="px-4">
+                <label className="flex items-center">
+                  <input
+                    type="checkbox"
+                    checked={skipSilentChunks}
+                    onChange={(e) => setSkipSilentChunks(e.target.checked)}
+                    disabled={isRecording}
+                    className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                  />
+                  <span className="text-sm font-medium text-gray-700">
+                    無音チャンクをスキップ
+                  </span>
+                </label>
+                <p className="text-xs text-gray-500 mt-1 ml-6">
+                  無効（推奨）: 高精度　/ 有効: 帯域節約
+                </p>
+              </div>
+
+              {/* Start/Stop Button */}
+              <div className="flex justify-center pt-2">
+                <button
+                  onClick={isRecording && !isDummyAudioSending ? stopRecording : startRecording}
+                  disabled={(!isConnected && !isRecording) || isDummyAudioSending}
+                  className={`px-6 py-3 rounded-lg font-medium text-white transition-colors ${
+                    isRecording && !isDummyAudioSending
+                      ? "bg-red-600 hover:bg-red-700"
+                      : "bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  }`}
+                >
+                  {isRecording && !isDummyAudioSending ? "音声入力を停止" : "音声入力で文字おこし"}
+                </button>
+              </div>
+
+              {/* Recording Status Display */}
+              {isRecording && !isDummyAudioSending && (
+                <div className="flex flex-col items-center justify-center space-y-2 text-blue-600 pt-3">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-3 h-3 bg-blue-600 rounded-full animate-pulse"></div>
+                    <span className="font-medium">Streaming Audio...</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <span className="text-2xl font-bold tabular-nums">
+                      {Math.floor(recordingElapsedTime / 60).toString().padStart(2, '0')}:
+                      {Math.floor(recordingElapsedTime % 60).toString().padStart(2, '0')}
+                    </span>
+                    <span className="text-sm text-gray-500">経過</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Dummy Audio Controls */}
+            <div className="space-y-4 bg-white p-4 rounded-lg shadow-sm">
+              <h4 className="text-md font-medium text-gray-900 text-center">
+                録音データからの文字起こし
+              </h4>
+
+              {/* Settings */}
+              <div className="space-y-4 px-4">
+                {/* Recording Selection */}
+                <div className="space-y-2">
+                  <label htmlFor="dummy-recording-select" className="block text-sm font-medium text-gray-700">
+                    録音データ:
+                  </label>
+                  <div className="flex items-center space-x-2">
+                    <select
+                      id="dummy-recording-select"
+                      value={selectedRecordingId}
+                      onChange={(e) => setSelectedRecordingId(e.target.value)}
+                      disabled={isDummyAudioSending || isRecording}
+                      className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+                    >
+                      {localStorageRecordings.length === 0 ? (
+                        <option value="">録音データがありません</option>
+                      ) : (
+                        localStorageRecordings.map((recording) => {
+                          const sizeKB = (recording.data.length * 0.75 / 1024).toFixed(1);
+                          // Calculate duration from PCM data size if not available
+                          // Base64 length * 0.75 = bytes, bytes / 2 = samples (16-bit), samples / 24000 = seconds
+                          const duration = recording.duration || (recording.data.length * 0.75 / 2 / 24000);
+                          return (
+                            <option key={recording.id} value={recording.id}>
+                              {recording.name} ({duration.toFixed(1)}秒, {sizeKB}KB)
+                            </option>
+                          );
+                        })
+                      )}
+                    </select>
+                    <button
+                      onClick={loadLocalStorageRecordings}
+                      disabled={isDummyAudioSending || isRecording}
+                      className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 transition-colors"
+                    >
+                      更新
+                    </button>
+                  </div>
+                </div>
+
+                {/* Send Interval */}
+                <div className="flex items-center space-x-2">
+                  <label htmlFor="dummy-send-interval" className="text-sm font-medium text-gray-700">
+                    送信間隔:
+                  </label>
+                  <input
+                    id="dummy-send-interval"
+                    type="number"
+                    min="10"
+                    max="500"
+                    step="10"
+                    value={dummySendInterval}
+                    onChange={(e) => setDummySendInterval(Math.max(10, Math.min(500, parseInt(e.target.value) || 50)))}
+                    disabled={isDummyAudioSending || isRecording}
+                    className="w-20 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 text-center"
+                  />
+                  <span className="text-sm text-gray-500">ms</span>
+                </div>
+              </div>
+
+              {/* Start/Stop Button */}
+              <div className="flex justify-center pt-2">
+                <button
+                  onClick={isDummyAudioSending ? stopDummyAudio : sendDummyAudio}
+                  disabled={!isConnected || (isRecording && !isDummyAudioSending)}
+                  className={`px-6 py-3 text-sm font-medium rounded-lg transition-colors ${
+                    isDummyAudioSending
+                      ? "bg-red-600 hover:bg-red-700 text-white"
+                      : !isConnected || (isRecording && !isDummyAudioSending)
+                      ? "bg-gray-400 cursor-not-allowed text-gray-200"
+                      : "bg-orange-600 hover:bg-orange-700 text-white"
+                  }`}
+                >
+                  {isDummyAudioSending ? '録音データからの文字起こしの停止' : 'ダミーデータで文字おこし'}
+                </button>
+              </div>
+
+              {/* Progress Display */}
+              {isDummyAudioSending && (
+                <div className="flex flex-col items-center justify-center space-y-2 text-orange-600">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-4 h-4 border-2 border-orange-600 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="text-sm font-medium">ダミーオーディオを送信中...</span>
+                  </div>
+                  {dummyAudioProgress && (
+                    <div className="flex flex-col items-center space-y-1">
+                      <span className="text-lg font-bold">
+                        {dummyAudioProgress.currentSeconds.toFixed(1)}秒 / {dummyAudioProgress.totalSeconds.toFixed(1)}秒
+                      </span>
+                      <div className="w-64 h-2 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-orange-500 transition-all duration-200"
+                          style={{ width: `${(dummyAudioProgress.currentSeconds / dummyAudioProgress.totalSeconds) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
         {/* Status Indicators */}
         <div className="text-center space-y-2">
-          {isRecording && (
-            <div className="flex items-center justify-center space-x-2 text-blue-600">
-              <div className="w-3 h-3 bg-blue-600 rounded-full animate-pulse"></div>
-              <span className="font-medium">Streaming Audio...</span>
-            </div>
-          )}
           {isSpeaking && (
             <div className="flex items-center justify-center space-x-2 text-green-600">
               <div className="w-3 h-3 bg-green-600 rounded-full animate-pulse"></div>
@@ -1618,9 +1902,18 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
         {/* Transcription Output */}
         <div className="bg-white p-6 rounded-lg shadow-md">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">
-            Real-time Transcription:
-          </h2>
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-lg font-medium text-gray-900">
+              文字起こし結果
+            </h2>
+            <button
+              onClick={clearText}
+              disabled={isRecording || isDummyAudioSending}
+              className="px-4 py-2 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
+            >
+              Clear Text
+            </button>
+          </div>
           <div className="min-h-[200px] p-4 border border-gray-300 rounded-md bg-gray-50">
             {text ? (
               <p className="text-gray-900 whitespace-pre-wrap leading-relaxed">
