@@ -385,20 +385,84 @@ export default function DummyRecorderPage() {
     }
   }, [floatTo16BitPCM, int16ArrayToBase64]);
 
+  // Upload PCM file directly (raw 16-bit PCM at 24kHz)
+  const uploadPcmFile = useCallback(async (file: File) => {
+    try {
+      setIsUploading(true);
+      setError(null);
+
+      console.log('[PCM Upload] Processing PCM file:', file.name, file.size);
+
+      // Read file as ArrayBuffer
+      const arrayBuffer = await file.arrayBuffer();
+      console.log('[PCM Upload] File read as ArrayBuffer:', arrayBuffer.byteLength, 'bytes');
+
+      // PCM files are raw 16-bit samples, so we can directly use the data
+      const int16Array = new Int16Array(arrayBuffer);
+      console.log('[PCM Upload] Int16Array created:', int16Array.length, 'samples');
+
+      // Convert to base64
+      const base64Data = int16ArrayToBase64(int16Array);
+      console.log('[PCM Upload] Base64 data length:', base64Data.length, 'chars');
+
+      // Calculate duration (24kHz sample rate, 16-bit mono)
+      const duration = int16Array.length / 24000;
+
+      // Create recording object
+      const recording: AudioRecording = {
+        id: `pcm_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: file.name.replace(/\.[^/.]+$/, '') + '_PCMアップロード',
+        timestamp: Date.now(),
+        duration: duration,
+        data: base64Data,
+        sampleRate: 24000
+      };
+
+      console.log('[PCM Upload] Created recording object:', recording);
+
+      // Save to IndexedDB
+      await saveRecording(recording);
+      setRecordings(prev => [recording, ...prev]);
+      console.log('[PCM Upload] Saved recording to IndexedDB');
+
+    } catch (error) {
+      console.error('[PCM Upload] Error processing PCM file:', error);
+      setError('PCMファイルの処理に失敗しました。');
+    } finally {
+      setIsUploading(false);
+    }
+  }, [int16ArrayToBase64]);
+
   // Handle file input change
   const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files && files.length > 0) {
       const file = files[0];
-      
-      // Validate file type
+
+      // Check if it's a PCM file (by extension since PCM has no MIME type)
+      const isPcmFile = file.name.toLowerCase().endsWith('.pcm');
+
+      if (isPcmFile) {
+        // Validate file size (max 50MB)
+        const maxSize = 50 * 1024 * 1024; // 50MB
+        if (file.size > maxSize) {
+          setError('ファイルサイズが大きすぎます。50MB以下のファイルを選択してください。');
+          event.target.value = '';
+          return;
+        }
+        uploadPcmFile(file);
+        event.target.value = '';
+        return;
+      }
+
+      // Validate file type for other audio formats
       const supportedTypes = ['audio/wav', 'audio/mp3', 'audio/mpeg', 'audio/ogg', 'audio/webm', 'audio/m4a'];
       if (!supportedTypes.some(type => file.type.includes(type.split('/')[1]))) {
-        setError('対応していないファイル形式です。WAV, MP3, OGG, WebM, M4Aファイルを選択してください。');
+        setError('対応していないファイル形式です。WAV, MP3, OGG, WebM, M4A, PCMファイルを選択してください。');
         event.target.value = ''; // Clear the input
         return;
       }
-      
+
       // Validate file size (max 50MB)
       const maxSize = 50 * 1024 * 1024; // 50MB
       if (file.size > maxSize) {
@@ -406,11 +470,11 @@ export default function DummyRecorderPage() {
         event.target.value = ''; // Clear the input
         return;
       }
-      
+
       uploadAudioFile(file);
       event.target.value = ''; // Clear the input for next use
     }
-  }, [uploadAudioFile]);
+  }, [uploadAudioFile, uploadPcmFile]);
 
   // Clear all recordings
   const clearAllRecordings = useCallback(async () => {
@@ -589,7 +653,7 @@ export default function DummyRecorderPage() {
             <div className="relative">
               <input
                 type="file"
-                accept="audio/*"
+                accept="audio/*,.pcm"
                 onChange={handleFileUpload}
                 disabled={isRecording || isUploading}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
