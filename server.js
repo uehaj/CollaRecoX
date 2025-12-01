@@ -153,6 +153,8 @@ app.prepare().then(() => {
     let autoCommitTimer = null;
     let responseInProgress = false;
     let lastCommitTime = 0; // Prevent too frequent commits
+    let isDummyAudioSending = false; // Flag to prevent duplicate dummy audio sends
+    let dummyAudioTimeoutId = null; // Timeout ID for stopping dummy audio sending
     
     // Transcription prompt tracking
     let transcriptionPrompt = '';
@@ -164,9 +166,9 @@ app.prepare().then(() => {
     let speechBreakDetection = false;
     let speechBreakMarker = '⏎';
     
-    // VAD parameters
-    let vadThreshold = 0.3;
-    let vadSilenceDuration = 1000;
+    // VAD parameters (optimized for high accuracy)
+    let vadThreshold = 0.2;
+    let vadSilenceDuration = 3000;
     let vadPrefixPadding = 300;
     
     // Session management for Hocuspocus integration
@@ -201,6 +203,7 @@ app.prepare().then(() => {
         input_audio_format: 'pcm16',
         input_audio_transcription: {
           model: asrModel,  // Use dedicated ASR model (gpt-4o-transcribe)
+          language: 'ja',   // Explicitly specify Japanese to prevent other language detection
           ...(prompt ? { prompt: prompt } : {})
         },
         turn_detection: {
@@ -251,7 +254,14 @@ app.prepare().then(() => {
           case 'conversation.item.input_audio_transcription.completed':
             console.log('✅ Audio transcription completed:', message.transcript);
             responseInProgress = false; // Reset response flag
-            
+
+            // Clear any pending auto-commit timer to prevent race condition
+            if (autoCommitTimer) {
+              clearTimeout(autoCommitTimer);
+              autoCommitTimer = null;
+              console.log('🧹 Cleared auto-commit timer after transcription completion');
+            }
+
             // Reset buffer tracking after successful transcription
             audioBufferDuration = 0;
             audioChunkCount = 0;
@@ -263,12 +273,9 @@ app.prepare().then(() => {
               text: message.transcript,
               item_id: message.item_id
             }));
-            
-            // Send dummy audio completion notification
-            clientWs.send(JSON.stringify({
-              type: 'dummy_audio_completed'
-            }));
-            
+
+            // Note: dummy_audio_completed is now sent from sendDummyAudioData when all chunks are sent
+
             // Send text to Hocuspocus document if session is active
             console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
             if (currentSessionId && message.transcript) {
@@ -281,6 +288,14 @@ app.prepare().then(() => {
           case 'conversation.item.input_audio_transcription.failed':
             console.log('Transcription failed:', message.error);
             responseInProgress = false; // Reset response flag on failure
+
+            // Clear any pending auto-commit timer to prevent race condition
+            if (autoCommitTimer) {
+              clearTimeout(autoCommitTimer);
+              autoCommitTimer = null;
+              console.log('🧹 Cleared auto-commit timer after transcription failure');
+            }
+
             clientWs.send(JSON.stringify({
               type: 'transcription_error',
               error: message.error?.message || 'Transcription failed',
@@ -378,14 +393,25 @@ app.prepare().then(() => {
           case 'error':
             console.log('OpenAI API error:', message.error);
             responseInProgress = false; // Reset response flag on error
-            
-            // Reset buffer if error is related to buffer issues
+
+            // Handle buffer-related errors gracefully
             if (message.error && message.error.message && message.error.message.includes('buffer')) {
-              console.log('Buffer-related error detected, resetting buffer tracking');
+              // This is expected when Server VAD auto-commits an already-committed buffer
+              // Just log as warning and don't send to client (it's not a real error)
+              console.log('⚠️  Buffer-related warning (expected with Server VAD):', message.error.message);
+              console.log('📝 This occurs when OpenAI VAD tries to auto-commit after manual commit - not a problem');
               audioBufferDuration = 0;
               audioChunkCount = 0;
+              // Clear any pending timer
+              if (autoCommitTimer) {
+                clearTimeout(autoCommitTimer);
+                autoCommitTimer = null;
+              }
+              // Don't send this error to client - it's not a user-facing issue
+              break;
             }
-            
+
+            // Send other errors to client
             clientWs.send(JSON.stringify({
               type: 'error',
               error: message.error?.message || 'Unknown error from OpenAI'
@@ -533,14 +559,13 @@ app.prepare().then(() => {
             const avgSample = Array.from(int16Array).reduce((sum, val) => sum + Math.abs(val), 0) / int16Array.length;
             
             audioChunkCount++;
-            
-            // Skip silent audio chunks (threshold: 100 for very quiet audio)
+
+            // Log silent audio chunks but don't skip (for accurate VAD detection)
             if (maxSample < 100) {
-              console.warn(`⚠️ Skipping silent audio chunk ${audioChunkCount}: max sample=${maxSample}`);
-              return;
+              console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample} (sending anyway for VAD accuracy)`);
             }
-            
-            // Track audio buffer duration only for non-silent chunks
+
+            // Track audio buffer duration for all chunks (including silent)
             const sampleCount = audioData.length / 2; // 16-bit = 2 bytes per sample
             const chunkDurationMs = (sampleCount / 24000) * 1000; // duration at 24kHz
             audioBufferDuration += chunkDurationMs;
@@ -602,7 +627,8 @@ app.prepare().then(() => {
               autoCommitTimer = setTimeout(() => {
                 const timerNow = Date.now();
                 const timerTimeSinceLastCommit = timerNow - lastCommitTime;
-                
+
+                // Check buffer duration again to prevent race condition with transcription completion
                 if (audioBufferDuration >= 500 && !responseInProgress && timerTimeSinceLastCommit >= 1500) {
                   console.log(`Timer-based commit: ${audioBufferDuration}ms, ${audioChunkCount} chunks`);
                   responseInProgress = true;
@@ -624,8 +650,15 @@ app.prepare().then(() => {
                   // Don't reset buffer tracking immediately
                   // audioBufferDuration = 0;
                   // audioChunkCount = 0;
-                } else if (responseInProgress) {
-                  console.log('Skipping timer commit - response already in progress');
+                } else {
+                  // Log why commit was skipped
+                  if (audioBufferDuration < 500) {
+                    console.log(`⏭️  Skipping timer commit - buffer too small: ${audioBufferDuration}ms (minimum: 500ms)`);
+                  } else if (responseInProgress) {
+                    console.log('⏭️  Skipping timer commit - response already in progress');
+                  } else if (timerTimeSinceLastCommit < 1500) {
+                    console.log(`⏭️  Skipping timer commit - too soon after last commit: ${timerTimeSinceLastCommit}ms (minimum: 1500ms)`);
+                  }
                 }
               }, 2000);
             }
@@ -679,11 +712,26 @@ app.prepare().then(() => {
             
           case 'send_dummy_audio_data':
             // Send dummy audio data directly from client (localStorage)
+            if (isDummyAudioSending) {
+              console.log('⚠️ Dummy audio is already being sent, ignoring new request');
+              clientWs.send(JSON.stringify({
+                type: 'error',
+                error: 'ダミーオーディオ送信中です。完了をお待ちください。'
+              }));
+              break;
+            }
             if (message.audioData) {
-              sendDummyAudioData(message.audioData, message.name || 'Client Recording', clientWs, openaiWs, () => {
+              isDummyAudioSending = true;
+              const sendInterval = message.sendInterval || 50; // Default to 50ms if not specified
+              console.log(`[Dummy Audio] Using send interval: ${sendInterval}ms`);
+              dummyAudioTimeoutId = sendDummyAudioData(message.audioData, message.name || 'Client Recording', clientWs, openaiWs, () => {
                 responseInProgress = true;
                 lastCommitTime = Date.now();
-              });
+              }, () => {
+                // onComplete callback - reset flag when sending is done
+                isDummyAudioSending = false;
+                dummyAudioTimeoutId = null;
+              }, sendInterval);
             } else {
               console.error('❌ No audio data provided for dummy audio');
               clientWs.send(JSON.stringify({
@@ -692,7 +740,21 @@ app.prepare().then(() => {
               }));
             }
             break;
-            
+
+          case 'stop_dummy_audio':
+            // Stop dummy audio sending
+            console.log('[Dummy Audio] 🛑 Stop dummy audio requested');
+            if (dummyAudioTimeoutId) {
+              clearTimeout(dummyAudioTimeoutId);
+              dummyAudioTimeoutId = null;
+            }
+            isDummyAudioSending = false;
+            clientWs.send(JSON.stringify({
+              type: 'dummy_audio_completed'
+            }));
+            console.log('[Dummy Audio] ✅ Dummy audio stopped');
+            break;
+
           default:
             console.log('Unhandled client message type:', message.type);
         }
@@ -838,14 +900,15 @@ app.prepare().then(() => {
 
 
   // Function to send dummy audio data from client (localStorage)
-  function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress) {
+  function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress, onComplete, sendInterval = 50) {
+    let currentTimeoutId = null;
     try {
       console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
-      
+
       // Convert base64 to buffer
       const audioBuffer = Buffer.from(base64AudioData, 'base64');
       console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
-      
+
       // Check if WebSocket is ready
       if (openaiWs.readyState !== 1) { // WebSocket.OPEN
         console.error(`❌ OpenAI WebSocket not ready (state: ${openaiWs.readyState})`);
@@ -855,85 +918,152 @@ app.prepare().then(() => {
         }));
         return;
       }
-      
+
+      // Calculate total duration (24kHz, 16-bit = 2 bytes per sample)
+      const totalSamples = audioBuffer.length / 2;
+      const totalSeconds = totalSamples / 24000;
+      console.log(`[Dummy Audio Data] ⏱️ Total duration: ${totalSeconds.toFixed(2)} seconds`);
+
       // Convert audio data to base64 and send in chunks
       const chunkSize = 4096; // Match typical audio chunk size
       const totalChunks = Math.ceil(audioBuffer.length / chunkSize);
       console.log(`[Dummy Audio Data] 📦 Sending ${totalChunks} chunks of ${chunkSize} bytes each`);
-      
+
       let chunkIndex = 0;
-      
+      let sentBytes = 0;
+      let lastChunkSendTime = Date.now();  // For timing analysis
+
       const sendNextChunk = () => {
         if (chunkIndex >= totalChunks) {
           console.log(`[Dummy Audio Data] ✅ All ${totalChunks} chunks sent successfully`);
-          
+
+          // Send final progress update
+          clientWs.send(JSON.stringify({
+            type: 'dummy_audio_progress',
+            currentSeconds: totalSeconds,
+            totalSeconds: totalSeconds,
+            progress: 100
+          }));
+
           // Auto-commit the audio after sending all chunks
           setTimeout(() => {
             console.log(`[Dummy Audio Data] 🔄 Auto-committing client audio buffer`);
             setResponseInProgress();
-            
+
             const commitEvent = {
               type: 'input_audio_buffer.commit'
             };
-            
+
             if (openaiWs.readyState === 1) { // WebSocket.OPEN
               openaiWs.send(JSON.stringify(commitEvent));
               console.log('✅ Client audio buffer committed, waiting for transcription...');
+
+              // Wait for transcription to complete before sending dummy_audio_completed
+              // This ensures all transcription results are received
+              setTimeout(() => {
+                console.log(`[Dummy Audio Data] ⏰ Sending dummy_audio_completed after transcription delay`);
+                clientWs.send(JSON.stringify({
+                  type: 'dummy_audio_completed'
+                }));
+                console.log(`[Dummy Audio Data] 📤 Sent dummy_audio_completed to client`);
+
+                // Call onComplete callback to reset the sending flag
+                if (onComplete) {
+                  onComplete();
+                }
+              }, 3000); // Wait 3 seconds after commit for transcription to complete
             } else {
               console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
+              // Still send completion event if WebSocket is not ready
+              clientWs.send(JSON.stringify({
+                type: 'dummy_audio_completed'
+              }));
+              if (onComplete) {
+                onComplete();
+              }
             }
           }, 1000); // Wait 1 second before committing
-          
+
           return;
         }
-        
+
         const start = chunkIndex * chunkSize;
         const end = Math.min(start + chunkSize, audioBuffer.length);
         const chunk = audioBuffer.slice(start, end);
         const base64Chunk = chunk.toString('base64');
-        
+
         const audioEvent = {
           type: 'input_audio_buffer.append',
           audio: base64Chunk
         };
-        
+
         try {
+          const now = Date.now();
+          const actualInterval = now - lastChunkSendTime;
+          lastChunkSendTime = now;
+
           openaiWs.send(JSON.stringify(audioEvent));
-          
+          sentBytes += chunk.length;
+
+          // Calculate current progress
+          const currentSamples = sentBytes / 2;
+          const currentSeconds = currentSamples / 24000;
+          const progressPercent = (sentBytes / audioBuffer.length) * 100;
+          const samplesInChunk = chunk.length / 2;  // 16-bit = 2 bytes per sample
+
+          // Send progress update every 10 chunks or on last chunk
           if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
-            console.log(`[Dummy Audio Data] 📤 Sent chunk ${chunkIndex + 1}/${totalChunks} (${chunk.length} bytes)`);
+            console.log(`[Timing Analysis] 📤 DUMMY #${chunkIndex + 1}/${totalChunks} | interval: ${actualInterval}ms | samples: ${samplesInChunk} | progress: ${currentSeconds.toFixed(2)}s / ${totalSeconds.toFixed(2)}s`);
+
+            clientWs.send(JSON.stringify({
+              type: 'dummy_audio_progress',
+              currentSeconds: currentSeconds,
+              totalSeconds: totalSeconds,
+              progress: progressPercent
+            }));
           }
-          
+
           chunkIndex++;
-          
+
           // Send next chunk after a small delay to simulate real-time streaming
-          setTimeout(sendNextChunk, 50); // 50ms delay between chunks
-          
+          currentTimeoutId = setTimeout(sendNextChunk, sendInterval); // Configurable delay between chunks
+
         } catch (error) {
           console.error(`❌ Error sending client audio chunk ${chunkIndex}:`, error);
           clientWs.send(JSON.stringify({
             type: 'error',
             error: `Failed to send client audio chunk ${chunkIndex}: ${error.message}`
           }));
+          // Reset sending flag on error
+          if (onComplete) {
+            onComplete();
+          }
         }
       };
-      
+
       // Start sending chunks
       clientWs.send(JSON.stringify({
         type: 'dummy_audio_started',
         filename: recordingName,
         totalSize: audioBuffer.length,
-        totalChunks: totalChunks
+        totalChunks: totalChunks,
+        totalSeconds: totalSeconds
       }));
-      
+
       sendNextChunk();
-      
+      return currentTimeoutId;
+
     } catch (error) {
       console.error(`[Dummy Audio Data] ❌ Error processing client audio data:`, error);
       clientWs.send(JSON.stringify({
         type: 'error',
         error: `Failed to process client audio data: ${error.message}`
       }));
+      // Reset sending flag on error
+      if (onComplete) {
+        onComplete();
+      }
+      return null;
     }
   }
 
