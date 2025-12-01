@@ -3,6 +3,7 @@
 import React, { useRef, useState, useCallback, useEffect } from "react";
 import { HocuspocusProvider } from '@hocuspocus/provider';
 import * as Y from 'yjs';
+import { getAllRecordings, type AudioRecording } from '@/lib/indexedDB';
 
 interface PromptPreset {
   id: string;
@@ -63,7 +64,12 @@ interface StatusMessage {
   audio_end_ms?: number;
 }
 
-type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage;
+interface DummyAudioMessage {
+  type: 'dummy_audio_started' | 'dummy_audio_completed';
+  filename?: string;
+}
+
+type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage;
 
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
@@ -96,7 +102,7 @@ export default function RealtimeClient() {
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
   const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
-  const [localStorageRecordings, setLocalStorageRecordings] = useState<any[]>([]);
+  const [localStorageRecordings, setLocalStorageRecordings] = useState<AudioRecording[]>([]);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
@@ -594,8 +600,8 @@ export default function RealtimeClient() {
       if (hasContent) {
         // Get the last element in the fragment
         const lastElement = fragment.get(fragment.length - 1);
-        
-        if (lastElement && lastElement.nodeName === 'paragraph') {
+
+        if (lastElement && lastElement instanceof Y.XmlElement && lastElement.nodeName === 'paragraph') {
           // Add status message to the existing last paragraph
           const existingTextNode = lastElement.get(0);
           if (existingTextNode && existingTextNode instanceof Y.XmlText) {
@@ -772,26 +778,19 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
     }
   }, [sessionIdInput]);
 
-  // Load recordings from localStorage
-  const loadLocalStorageRecordings = useCallback(() => {
+  // Load recordings from IndexedDB
+  const loadLocalStorageRecordings = useCallback(async () => {
     try {
-      const stored = localStorage.getItem('dummy-audio-recordings');
-      console.log('[LocalStorage] Raw stored data:', stored ? `${stored.length} chars` : 'null');
-      
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        setLocalStorageRecordings(parsed);
-        console.log('[LocalStorage] Loaded', parsed.length, 'recordings:', parsed.map(r => ({ id: r.id, name: r.name })));
-        if (parsed.length > 0 && !selectedRecordingId) {
-          setSelectedRecordingId(parsed[0].id);
-          console.log('[LocalStorage] Auto-selected first recording:', parsed[0].id);
-        }
-      } else {
-        console.log('[LocalStorage] No recordings found in localStorage');
-        setLocalStorageRecordings([]);
+      console.log('[IndexedDB] Loading recordings from IndexedDB...');
+      const recordings = await getAllRecordings();
+      setLocalStorageRecordings(recordings);
+      console.log('[IndexedDB] Loaded', recordings.length, 'recordings:', recordings.map((r: AudioRecording) => ({ id: r.id, name: r.name })));
+      if (recordings.length > 0 && !selectedRecordingId) {
+        setSelectedRecordingId(recordings[0].id);
+        console.log('[IndexedDB] Auto-selected first recording:', recordings[0].id);
       }
     } catch (error) {
-      console.error('[LocalStorage] Error loading recordings:', error);
+      console.error('[IndexedDB] Error loading recordings:', error);
       setLocalStorageRecordings([]);
     }
   }, [selectedRecordingId]);
@@ -914,8 +913,8 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
         if (hasContent) {
           // Get the last element in the fragment
           const lastElement = fragment.get(fragment.length - 1);
-          
-          if (lastElement && lastElement.nodeName === 'paragraph') {
+
+          if (lastElement && lastElement instanceof Y.XmlElement && lastElement.nodeName === 'paragraph') {
             // Add text to the existing last paragraph
             const existingTextNode = lastElement.get(0);
             if (existingTextNode && existingTextNode instanceof Y.XmlText) {
