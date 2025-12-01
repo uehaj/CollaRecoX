@@ -3,6 +3,11 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
 
+// 録音時間と容量の制限
+const MAX_RECORDING_DURATION_SECONDS = 120; // 2分
+const MAX_LOCALSTORAGE_SIZE_MB = 5; // localStorage容量制限の目安
+const ESTIMATED_SIZE_PER_SECOND_MB = 0.06; // 24kHz PCM16のおおよそのサイズ
+
 interface AudioRecording {
   id: string;
   name: string;
@@ -53,11 +58,29 @@ export default function DummyRecorderPage() {
   // Save recordings to localStorage
   const saveRecordingsToStorage = useCallback((newRecordings: AudioRecording[]) => {
     try {
-      localStorage.setItem('dummy-audio-recordings', JSON.stringify(newRecordings));
+      const jsonString = JSON.stringify(newRecordings);
+      const sizeInMB = (jsonString.length * 2) / (1024 * 1024); // UTF-16 encoding
+
+      console.log(`[Storage] Attempting to save ${sizeInMB.toFixed(2)}MB to localStorage`);
+
+      if (sizeInMB > MAX_LOCALSTORAGE_SIZE_MB) {
+        const errorMsg = `データサイズ（${sizeInMB.toFixed(2)}MB）がlocalStorageの容量制限（約${MAX_LOCALSTORAGE_SIZE_MB}MB）を超えています。\n\n対処法：\n1. 古い録音データを削除してください\n2. より短い時間で録音してください（推奨：2分以内）`;
+        console.error('[Storage] Size limit exceeded:', errorMsg);
+        setError(errorMsg);
+        return;
+      }
+
+      localStorage.setItem('dummy-audio-recordings', jsonString);
       console.log('[Storage] Saved', newRecordings.length, 'recordings to localStorage');
     } catch (error) {
       console.error('[Storage] Error saving recordings:', error);
-      setError('録音データの保存に失敗しました');
+
+      // QuotaExceededErrorの場合、詳細なメッセージを表示
+      if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+        setError('localStorageの容量制限を超えました。古い録音データを削除してから再試行してください。');
+      } else {
+        setError('録音データの保存に失敗しました');
+      }
     }
   }, []);
 
@@ -272,8 +295,17 @@ export default function DummyRecorderPage() {
     }, 500);
 
     // Recording data processing is handled in MediaRecorder.onstop callback
-    
+
   }, [recordingName, recordingDuration, saveRecordingsToStorage, int16ArrayToBase64]);
+
+  // 録音時間の監視と自動停止
+  useEffect(() => {
+    if (isRecording && recordingDuration >= MAX_RECORDING_DURATION_SECONDS) {
+      console.log('[Recording] Max duration reached, auto-stopping...');
+      setError(`最大録音時間（${MAX_RECORDING_DURATION_SECONDS}秒）に達しました。録音を自動停止します。`);
+      stopRecording();
+    }
+  }, [isRecording, recordingDuration, stopRecording]);
 
   // Delete recording
   const deleteRecording = useCallback((id: string) => {
@@ -492,7 +524,20 @@ export default function DummyRecorderPage() {
           <h3 className="text-lg font-medium text-gray-900 mb-4">
             録音コントロール
           </h3>
-          
+
+          {/* 録音時間制限の表示 */}
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md">
+            <p className="text-sm text-blue-800">
+              <strong>最大録音時間:</strong> {MAX_RECORDING_DURATION_SECONDS}秒（{Math.floor(MAX_RECORDING_DURATION_SECONDS / 60)}分）
+            </p>
+            <p className="text-xs text-blue-600 mt-1">
+              localStorageの容量制限のため、長時間の録音はできません。
+            </p>
+            <p className="text-xs text-orange-600 mt-1">
+              ⚠️ 2分の録音は約7.2MBになります。ブラウザによっては保存できない場合があります。
+            </p>
+          </div>
+
           {/* Recording Name Input */}
           <div className="mb-4">
             <label htmlFor="recording-name" className="block text-sm font-medium text-gray-700 mb-2">
@@ -516,6 +561,11 @@ export default function DummyRecorderPage() {
                 <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
                 <span className="text-red-800 font-medium">録音中...</span>
                 <span className="text-red-600">{formatDuration(recordingDuration)}</span>
+                {recordingDuration < MAX_RECORDING_DURATION_SECONDS && (
+                  <span className="text-red-500 text-sm">
+                    / 残り {formatDuration(MAX_RECORDING_DURATION_SECONDS - recordingDuration)}
+                  </span>
+                )}
               </div>
             </div>
           )}
@@ -633,7 +683,7 @@ export default function DummyRecorderPage() {
             <div className="flex">
               <div className="ml-3">
                 <h3 className="text-sm font-medium text-red-800">エラー</h3>
-                <div className="mt-2 text-sm text-red-700">
+                <div className="mt-2 text-sm text-red-700 whitespace-pre-line">
                   {error}
                 </div>
               </div>
