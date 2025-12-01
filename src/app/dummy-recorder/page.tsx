@@ -2,20 +2,18 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import Link from 'next/link';
+import {
+  getAllRecordings,
+  saveRecording,
+  deleteRecording as deleteRecordingFromDB,
+  deleteAllRecordings,
+  type AudioRecording
+} from '@/lib/indexedDB';
 
-// 録音時間と容量の制限
-const MAX_RECORDING_DURATION_SECONDS = 120; // 2分
-const MAX_LOCALSTORAGE_SIZE_MB = 5; // localStorage容量制限の目安
-const ESTIMATED_SIZE_PER_SECOND_MB = 0.06; // 24kHz PCM16のおおよそのサイズ
+// 録音時間制限のデフォルト値
+const DEFAULT_TIME_LIMIT_MINUTES = 3; // デフォルト3分
 
-interface AudioRecording {
-  id: string;
-  name: string;
-  timestamp: number;
-  duration: number;
-  data: string; // base64 encoded PCM data
-  sampleRate: number;
-}
+// AudioRecording型はIndexedDBからインポート
 
 export default function DummyRecorderPage() {
   const [isRecording, setIsRecording] = useState(false);
@@ -26,6 +24,8 @@ export default function DummyRecorderPage() {
   const [error, setError] = useState<string | null>(null);
   const [recordingDuration, setRecordingDuration] = useState<number>(0);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [isTimeLimitEnabled, setIsTimeLimitEnabled] = useState<boolean>(true); // デフォルトで有効
+  const [timeLimitMinutes, setTimeLimitMinutes] = useState<number>(DEFAULT_TIME_LIMIT_MINUTES); // 制限時間（分）
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -35,52 +35,20 @@ export default function DummyRecorderPage() {
   const durationTimerRef = useRef<NodeJS.Timeout | null>(null);
   const recordingStateRef = useRef<boolean>(false);
 
-  // Load recordings from localStorage on mount
+  // Load recordings from IndexedDB on mount
   useEffect(() => {
-    loadRecordingsFromStorage();
+    loadRecordingsFromDB();
   }, []);
 
-  // Load recordings from localStorage
-  const loadRecordingsFromStorage = useCallback(() => {
+  // Load recordings from IndexedDB
+  const loadRecordingsFromDB = useCallback(async () => {
     try {
-      const stored = localStorage.getItem('dummy-audio-recordings');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        setRecordings(parsed);
-        console.log('[Storage] Loaded', parsed.length, 'recordings from localStorage');
-      }
+      const storedRecordings = await getAllRecordings();
+      setRecordings(storedRecordings);
+      console.log('[IndexedDB] Loaded', storedRecordings.length, 'recordings');
     } catch (error) {
-      console.error('[Storage] Error loading recordings:', error);
+      console.error('[IndexedDB] Error loading recordings:', error);
       setError('録音データの読み込みに失敗しました');
-    }
-  }, []);
-
-  // Save recordings to localStorage
-  const saveRecordingsToStorage = useCallback((newRecordings: AudioRecording[]) => {
-    try {
-      const jsonString = JSON.stringify(newRecordings);
-      const sizeInMB = (jsonString.length * 2) / (1024 * 1024); // UTF-16 encoding
-
-      console.log(`[Storage] Attempting to save ${sizeInMB.toFixed(2)}MB to localStorage`);
-
-      if (sizeInMB > MAX_LOCALSTORAGE_SIZE_MB) {
-        const errorMsg = `データサイズ（${sizeInMB.toFixed(2)}MB）がlocalStorageの容量制限（約${MAX_LOCALSTORAGE_SIZE_MB}MB）を超えています。\n\n対処法：\n1. 古い録音データを削除してください\n2. より短い時間で録音してください（推奨：2分以内）`;
-        console.error('[Storage] Size limit exceeded:', errorMsg);
-        setError(errorMsg);
-        return;
-      }
-
-      localStorage.setItem('dummy-audio-recordings', jsonString);
-      console.log('[Storage] Saved', newRecordings.length, 'recordings to localStorage');
-    } catch (error) {
-      console.error('[Storage] Error saving recordings:', error);
-
-      // QuotaExceededErrorの場合、詳細なメッセージを表示
-      if (error instanceof DOMException && error.name === 'QuotaExceededError') {
-        setError('localStorageの容量制限を超えました。古い録音データを削除してから再試行してください。');
-      } else {
-        setError('録音データの保存に失敗しました');
-      }
     }
   }, []);
 
@@ -161,7 +129,7 @@ export default function DummyRecorderPage() {
       });
 
       // Create AudioContext for processing
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const audioContext = new AudioContextClass({ sampleRate: 24000 });
       audioContextRef.current = audioContext;
 
@@ -182,15 +150,19 @@ export default function DummyRecorderPage() {
       
       mediaRecorder.onstop = async () => {
         console.log('[Recording] MediaRecorder stopped, processing audio...');
-        
+
         if (audioChunks.length > 0) {
           try {
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
             console.log(`[Recording] Audio blob created: ${audioBlob.size} bytes`);
-            
+
+            // Create a new AudioContext for decoding (the original may be closed)
+            const DecodeAudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+            const decodeContext = new DecodeAudioContextClass({ sampleRate: 24000 });
+
             // Convert blob to PCM16 using AudioContext
             const arrayBuffer = await audioBlob.arrayBuffer();
-            const audioData = await audioContext.decodeAudioData(arrayBuffer);
+            const audioData = await decodeContext.decodeAudioData(arrayBuffer);
             
             // Convert to PCM16
             const channelData = audioData.getChannelData(0);
@@ -214,19 +186,24 @@ export default function DummyRecorderPage() {
               };
               
               console.log('[Recording] Created recording object:', recording);
-              
-              // Add to recordings list
-              const currentRecordings = JSON.parse(localStorage.getItem('dummy-audio-recordings') || '[]');
-              const newRecordings = [recording, ...currentRecordings];
-              setRecordings(newRecordings);
-              saveRecordingsToStorage(newRecordings);
-              
-              console.log('[Recording] Updated recordings list, new length:', newRecordings.length);
+
+              // Save to IndexedDB
+              saveRecording(recording).then(() => {
+                // Update state with new recording
+                setRecordings(prev => [recording, ...prev]);
+                console.log('[Recording] Saved recording to IndexedDB');
+              }).catch(err => {
+                console.error('[Recording] Error saving to IndexedDB:', err);
+                setError('録音データの保存に失敗しました');
+              });
               
               // Clear recording name for next recording
               setRecordingName('');
               setRecordingDuration(0);
             }
+
+            // Close the decode context
+            decodeContext.close();
           } catch (error) {
             console.error('[Recording] Error processing audio:', error);
             setError('録音データの処理に失敗しました。');
@@ -296,24 +273,29 @@ export default function DummyRecorderPage() {
 
     // Recording data processing is handled in MediaRecorder.onstop callback
 
-  }, [recordingName, recordingDuration, saveRecordingsToStorage, int16ArrayToBase64]);
+  }, [recordingName, recordingDuration, int16ArrayToBase64]);
 
   // 録音時間の監視と自動停止
   useEffect(() => {
-    if (isRecording && recordingDuration >= MAX_RECORDING_DURATION_SECONDS) {
-      console.log('[Recording] Max duration reached, auto-stopping...');
-      setError(`最大録音時間（${MAX_RECORDING_DURATION_SECONDS}秒）に達しました。録音を自動停止します。`);
+    const timeLimitSeconds = timeLimitMinutes * 60;
+    if (isTimeLimitEnabled && isRecording && recordingDuration >= timeLimitSeconds) {
+      console.log('[Recording] Time limit reached, auto-stopping...');
+      setError(`録音時間制限（${timeLimitMinutes}分）に達しました。録音を自動停止します。`);
       stopRecording();
     }
-  }, [isRecording, recordingDuration, stopRecording]);
+  }, [isTimeLimitEnabled, isRecording, recordingDuration, timeLimitMinutes, stopRecording]);
 
   // Delete recording
-  const deleteRecording = useCallback((id: string) => {
-    const newRecordings = recordings.filter(rec => rec.id !== id);
-    setRecordings(newRecordings);
-    saveRecordingsToStorage(newRecordings);
-    console.log('[Recording] Deleted recording:', id);
-  }, [recordings, saveRecordingsToStorage]);
+  const handleDeleteRecording = useCallback(async (id: string) => {
+    try {
+      await deleteRecordingFromDB(id);
+      setRecordings(prev => prev.filter(rec => rec.id !== id));
+      console.log('[IndexedDB] Deleted recording:', id);
+    } catch (error) {
+      console.error('[IndexedDB] Error deleting recording:', error);
+      setError('録音データの削除に失敗しました');
+    }
+  }, []);
 
   // Export recording as downloadable file
   const exportRecording = useCallback((recording: AudioRecording) => {
@@ -352,9 +334,9 @@ export default function DummyRecorderPage() {
       console.log('[File Upload] Processing file:', file.name, file.type, file.size);
       
       // Create AudioContext for processing
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const audioContext = new AudioContextClass({ sampleRate: 24000 });
-      
+
       // Read file as ArrayBuffer
       const arrayBuffer = await file.arrayBuffer();
       console.log('[File Upload] File read as ArrayBuffer:', arrayBuffer.byteLength, 'bytes');
@@ -385,14 +367,11 @@ export default function DummyRecorderPage() {
         };
         
         console.log('[File Upload] Created recording object:', recording);
-        
-        // Add to recordings list
-        const currentRecordings = JSON.parse(localStorage.getItem('dummy-audio-recordings') || '[]');
-        const newRecordings = [recording, ...currentRecordings];
-        setRecordings(newRecordings);
-        saveRecordingsToStorage(newRecordings);
-        
-        console.log('[File Upload] Updated recordings list, new length:', newRecordings.length);
+
+        // Save to IndexedDB
+        await saveRecording(recording);
+        setRecordings(prev => [recording, ...prev]);
+        console.log('[File Upload] Saved recording to IndexedDB');
       }
       
       // Clean up
@@ -404,7 +383,7 @@ export default function DummyRecorderPage() {
     } finally {
       setIsUploading(false);
     }
-  }, [floatTo16BitPCM, int16ArrayToBase64, saveRecordingsToStorage]);
+  }, [floatTo16BitPCM, int16ArrayToBase64]);
 
   // Handle file input change
   const handleFileUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
@@ -434,11 +413,16 @@ export default function DummyRecorderPage() {
   }, [uploadAudioFile]);
 
   // Clear all recordings
-  const clearAllRecordings = useCallback(() => {
+  const clearAllRecordings = useCallback(async () => {
     if (confirm('すべての録音を削除しますか？この操作は取り消せません。')) {
-      setRecordings([]);
-      localStorage.removeItem('dummy-audio-recordings');
-      console.log('[Storage] Cleared all recordings');
+      try {
+        await deleteAllRecordings();
+        setRecordings([]);
+        console.log('[IndexedDB] Cleared all recordings');
+      } catch (error) {
+        console.error('[IndexedDB] Error clearing recordings:', error);
+        setError('録音データの削除に失敗しました');
+      }
     }
   }, []);
 
@@ -525,17 +509,35 @@ export default function DummyRecorderPage() {
             録音コントロール
           </h3>
 
-          {/* 録音時間制限の表示 */}
-          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md">
-            <p className="text-sm text-blue-800">
-              <strong>最大録音時間:</strong> {MAX_RECORDING_DURATION_SECONDS}秒（{Math.floor(MAX_RECORDING_DURATION_SECONDS / 60)}分）
-            </p>
-            <p className="text-xs text-blue-600 mt-1">
-              localStorageの容量制限のため、長時間の録音はできません。
-            </p>
-            <p className="text-xs text-orange-600 mt-1">
-              ⚠️ 2分の録音は約7.2MBになります。ブラウザによっては保存できない場合があります。
-            </p>
+          {/* 録音時間制限設定 */}
+          <div className="mb-4 p-3 bg-gray-50 border border-gray-200 rounded-md">
+            <div className="flex items-center mb-2">
+              <input
+                type="checkbox"
+                id="time-limit-checkbox"
+                checked={isTimeLimitEnabled}
+                onChange={(e) => setIsTimeLimitEnabled(e.target.checked)}
+                className="mr-2 w-4 h-4"
+                disabled={isRecording}
+              />
+              <label htmlFor="time-limit-checkbox" className="text-sm text-gray-700">
+                録音時間を制限する
+              </label>
+            </div>
+            {isTimeLimitEnabled && (
+              <div className="flex items-center ml-6">
+                <input
+                  type="number"
+                  min="1"
+                  max="30"
+                  value={timeLimitMinutes}
+                  onChange={(e) => setTimeLimitMinutes(Math.max(1, Math.min(30, Number(e.target.value))))}
+                  className="w-16 px-2 py-1 border border-gray-300 rounded text-center"
+                  disabled={isRecording}
+                />
+                <span className="ml-2 text-sm text-gray-600">分</span>
+              </div>
+            )}
           </div>
 
           {/* Recording Name Input */}
@@ -561,9 +563,9 @@ export default function DummyRecorderPage() {
                 <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
                 <span className="text-red-800 font-medium">録音中...</span>
                 <span className="text-red-600">{formatDuration(recordingDuration)}</span>
-                {recordingDuration < MAX_RECORDING_DURATION_SECONDS && (
+                {isTimeLimitEnabled && recordingDuration < timeLimitMinutes * 60 && (
                   <span className="text-red-500 text-sm">
-                    / 残り {formatDuration(MAX_RECORDING_DURATION_SECONDS - recordingDuration)}
+                    / 残り {formatDuration(timeLimitMinutes * 60 - recordingDuration)}
                   </span>
                 )}
               </div>
@@ -664,7 +666,7 @@ export default function DummyRecorderPage() {
                         エクスポート
                       </button>
                       <button
-                        onClick={() => deleteRecording(recording.id)}
+                        onClick={() => handleDeleteRecording(recording.id)}
                         className="px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
                       >
                         削除
