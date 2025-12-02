@@ -27,9 +27,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 開発コマンド
 
+### 推奨：開発スクリプト (bin/dev.sh)
+
+環境変数の自動読み込み、プロキシ対応、ログ出力機能を含む統合スクリプトです。
+
 ```bash
-# 開発サーバーの起動（ポート5001、WebSocket対応）
+# 通常起動（ポート8888、WebSocket対応）
+bin/dev.sh
+
+# 既存プロセスを強制終了して起動（ポート競合時）
+bin/dev.sh -f
+
+# ログファイル出力を有効化（logs/ディレクトリに保存）
+bin/dev.sh -l
+
+# 強制終了 + ログ出力（推奨）
+bin/dev.sh -f -l
+
+# カスタムログディレクトリ指定
+bin/dev.sh -l -d /path/to/logs
+
+# ヘルプ表示
+bin/dev.sh -h
+```
+
+**機能:**
+- `.env.local`の自動読み込み
+- 企業プロキシ環境での自動TLS証明書検証無効化
+- `-f`オプション: ポート8888使用中のプロセスを自動kill
+- `-l`オプション: タイムスタンプ付きログファイル出力（`logs/server_YYYYMMDD_HHMMSS.log`）
+
+**ログ監視（別ターミナル）:**
+```bash
+tail -f logs/server_*.log | grep --color 'threshold\|VAD\|Auto-commit\|Error'
+```
+
+### 直接起動
+
+```bash
+# 開発サーバーの起動（npm経由）
 npm run dev
+
+# 企業プロキシ環境でSSL証明書エラーが発生する場合
+source <(grep -v '^#' .env.local | sed 's/^/export /') && export NODE_TLS_REJECT_UNAUTHORIZED=0 && npm run dev
 
 # 標準のNext.js開発サーバー（WebSocketなし）
 npm run next-dev
@@ -44,7 +84,11 @@ npm run start
 npm run lint
 ```
 
-**重要**: 開発時は `npm run dev` を使用してください。これは `server.js` を使用し、WebSocket機能（リアルタイム文字起こし用）をサポートします。
+**重要**:
+- 開発時は `bin/dev.sh` の使用を推奨します。環境変数の自動読み込みとプロキシ対応が含まれます。
+- `npm run dev` を直接使用する場合は、事前に環境変数を読み込んでください。
+- 企業プロキシ環境で「unable to verify the first certificate」エラーが発生する場合、`bin/dev.sh`が自動的に`NODE_TLS_REJECT_UNAUTHORIZED=0`を設定します。
+  - **注意**: この設定はセキュリティリスクがあるため、開発環境でのみ使用してください。本番環境では絶対に使用しないでください。
 
 ## 環境変数
 
@@ -224,3 +268,5 @@ load_contextしたときに即座にタスク開始はしないこと。
 
 - コミットするまえにビルドして
 - APIを勝手に増やすことは禁止
+- MCPはいっさいつかわないこと
+- bin/dev.shについてCLAUDE.mdに追記
