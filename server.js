@@ -165,12 +165,19 @@ app.prepare().then(() => {
     // Speech break detection settings
     let speechBreakDetection = false;
     let speechBreakMarker = '⏎';
-    
+
     // VAD parameters (optimized for high accuracy)
+    let vadEnabled = true; // VAD enabled/disabled (default: true = same as before)
     let vadThreshold = 0.2;
     let vadSilenceDuration = 3000;
     let vadPrefixPadding = 300;
-    
+
+    // Auto-commit threshold (milliseconds) - can be adjusted by client
+    let autoCommitThresholdMs = 1000; // Default: 1 second (same as before)
+    let autoCommitTimerDelayMs = 2000; // Default: 2 seconds (same as before)
+    let audioBufferSize = 4096; // Default buffer size
+    let batchMultiplier = 8; // Default batch multiplier
+
     // Session management for Hocuspocus integration
     let currentSessionId = null;
 
@@ -206,12 +213,13 @@ app.prepare().then(() => {
           language: 'ja',   // Explicitly specify Japanese to prevent other language detection
           ...(prompt ? { prompt: prompt } : {})
         },
-        turn_detection: {
+        // Conditionally enable/disable VAD based on vadEnabled flag
+        turn_detection: vadEnabled ? {
           type: 'server_vad',
           threshold: vadThreshold,
           prefix_padding_ms: vadPrefixPadding,
           silence_duration_ms: vadSilenceDuration
-        },
+        } : null,  // null = disable VAD
         temperature: 0.6,  // Minimum allowed value for Realtime API
         max_response_output_tokens: 1  // Minimize response generation
       }
@@ -521,6 +529,10 @@ app.prepare().then(() => {
             
           case 'set_vad_params':
             // Update VAD parameters
+            if (message.enabled !== undefined) {
+              vadEnabled = message.enabled;
+              console.log('🎛️ VAD enabled set to:', vadEnabled);
+            }
             if (message.threshold !== undefined) {
               vadThreshold = message.threshold;
               console.log('🎛️ VAD threshold set to:', vadThreshold);
@@ -533,15 +545,30 @@ app.prepare().then(() => {
               vadPrefixPadding = message.prefix_padding_ms;
               console.log('🎛️ VAD prefix padding set to:', vadPrefixPadding + 'ms');
             }
-            
+
             // Update session configuration with new VAD parameters
             sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
-            
+
             // Send updated session config to OpenAI if connection is open
             if (openaiWs.readyState === 1) { // WebSocket.OPEN
               console.log('🔄 Updating OpenAI session with new VAD parameters...');
               openaiWs.send(JSON.stringify(sessionConfig));
               console.log('✅ Session updated with VAD parameters');
+            }
+            break;
+
+          case 'set_commit_threshold':
+            // Update auto-commit threshold from client
+            if (message.threshold_ms !== undefined && message.threshold_ms > 0) {
+              autoCommitThresholdMs = message.threshold_ms;
+              autoCommitTimerDelayMs = Math.max(autoCommitThresholdMs * 2, 2000); // At least 2 seconds
+              if (message.buffer_size !== undefined) {
+                audioBufferSize = message.buffer_size;
+              }
+              if (message.batch_multiplier !== undefined) {
+                batchMultiplier = message.batch_multiplier;
+              }
+              console.log(`⏱️ Auto-commit threshold set to: ${autoCommitThresholdMs}ms (buffer: ${audioBufferSize}, batch: ${batchMultiplier}, timer delay: ${autoCommitTimerDelayMs}ms)`);
             }
             break;
             
@@ -600,9 +627,9 @@ app.prepare().then(() => {
             // Auto-commit when we have enough audio with rate limiting
             const now = Date.now();
             const timeSinceLastCommit = now - lastCommitTime;
-            
-            if (audioBufferDuration >= 1000 && !responseInProgress && timeSinceLastCommit >= 2000) {
-              console.log(`Auto-committing audio buffer: ${audioBufferDuration}ms, ${audioChunkCount} chunks`);
+
+            if (audioBufferDuration >= autoCommitThresholdMs && !responseInProgress && timeSinceLastCommit >= (autoCommitThresholdMs * 2)) {
+              console.log(`Auto-committing audio buffer: ${audioBufferDuration}ms (threshold: ${autoCommitThresholdMs}ms), ${audioChunkCount} chunks`);
               responseInProgress = true;
               lastCommitTime = now;
               
@@ -623,14 +650,17 @@ app.prepare().then(() => {
               // audioBufferDuration = 0;
               // audioChunkCount = 0;
             } else {
-              // Set a timer to commit after 1 second of no new audio
+              // Set a timer to commit after specified delay with no new audio
               autoCommitTimer = setTimeout(() => {
                 const timerNow = Date.now();
                 const timerTimeSinceLastCommit = timerNow - lastCommitTime;
 
                 // Check buffer duration again to prevent race condition with transcription completion
-                if (audioBufferDuration >= 500 && !responseInProgress && timerTimeSinceLastCommit >= 1500) {
-                  console.log(`Timer-based commit: ${audioBufferDuration}ms, ${audioChunkCount} chunks`);
+                const minBufferForTimer = Math.max(500, autoCommitThresholdMs * 0.5); // At least 50% of threshold
+                const minTimeSinceLastCommit = Math.max(1500, autoCommitThresholdMs * 1.5); // At least 1.5x threshold
+
+                if (audioBufferDuration >= minBufferForTimer && !responseInProgress && timerTimeSinceLastCommit >= minTimeSinceLastCommit) {
+                  console.log(`Timer-based commit: ${audioBufferDuration}ms (min: ${minBufferForTimer}ms), ${audioChunkCount} chunks`);
                   responseInProgress = true;
                   lastCommitTime = timerNow;
                   
@@ -652,15 +682,15 @@ app.prepare().then(() => {
                   // audioChunkCount = 0;
                 } else {
                   // Log why commit was skipped
-                  if (audioBufferDuration < 500) {
-                    console.log(`⏭️  Skipping timer commit - buffer too small: ${audioBufferDuration}ms (minimum: 500ms)`);
+                  if (audioBufferDuration < minBufferForTimer) {
+                    console.log(`⏭️  Skipping timer commit - buffer too small: ${audioBufferDuration}ms (minimum: ${minBufferForTimer}ms)`);
                   } else if (responseInProgress) {
                     console.log('⏭️  Skipping timer commit - response already in progress');
-                  } else if (timerTimeSinceLastCommit < 1500) {
-                    console.log(`⏭️  Skipping timer commit - too soon after last commit: ${timerTimeSinceLastCommit}ms (minimum: 1500ms)`);
+                  } else if (timerTimeSinceLastCommit < minTimeSinceLastCommit) {
+                    console.log(`⏭️  Skipping timer commit - too soon after last commit: ${timerTimeSinceLastCommit}ms (minimum: ${minTimeSinceLastCommit}ms)`);
                   }
                 }
-              }, 2000);
+              }, autoCommitTimerDelayMs);
             }
             break;
             
@@ -830,13 +860,29 @@ app.prepare().then(() => {
             console.log(`[Hocuspocus Integration] ✅ Text added as new paragraph to '${fieldName}'`);
           }
         } else {
-          // No content yet, create first paragraph
+          // No content yet, create header paragraph with settings and first content paragraph
+          // Header paragraph
+          const headerParagraph = new (require('yjs')).XmlElement('paragraph');
+          const headerTextNode = new (require('yjs')).XmlText();
+          const headerText = `【音声認識設定】送信間隔: ${autoCommitThresholdMs}ms (バッファ: ${audioBufferSize}, バッチ: ${batchMultiplier})`;
+          headerTextNode.insert(0, headerText);
+          headerParagraph.insert(0, [headerTextNode]);
+          fragment.insert(0, [headerParagraph]);
+
+          // Separator paragraph (empty line)
+          const separatorParagraph = new (require('yjs')).XmlElement('paragraph');
+          const separatorTextNode = new (require('yjs')).XmlText();
+          separatorTextNode.insert(0, '');
+          separatorParagraph.insert(0, [separatorTextNode]);
+          fragment.insert(1, [separatorParagraph]);
+
+          // First content paragraph
           const newParagraph = new (require('yjs')).XmlElement('paragraph');
           const newTextNode = new (require('yjs')).XmlText();
           newTextNode.insert(0, text);
           newParagraph.insert(0, [newTextNode]);
-          fragment.insert(0, [newParagraph]);
-          console.log(`[Hocuspocus Integration] ✅ Text added as first paragraph to '${fieldName}'`);
+          fragment.insert(2, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ Header and text added as first content to '${fieldName}'`);
         }
         
         console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);

@@ -109,8 +109,9 @@ export default function RealtimeClient() {
   const [promptMode, setPromptMode] = useState<'preset' | 'custom'>('preset');
   const [autoLineBreak, setAutoLineBreak] = useState<boolean>(false);
   const [transcriptionModel, setTranscriptionModel] = useState<string>('gpt-4o-transcribe');
-  const [speechBreakDetection, setSpeechBreakDetection] = useState<boolean>(false);
-  const [breakMarker, setBreakMarker] = useState<string>('⏎');
+  const [speechBreakDetection, setSpeechBreakDetection] = useState<boolean>(true);
+  const [breakMarker, setBreakMarker] = useState<string>('\n');
+  const [vadEnabled, setVadEnabled] = useState<boolean>(true); // VAD有効/無効（デフォルト:有効=元と同じ）
   const [vadThreshold, setVadThreshold] = useState<number>(0.2);
   const [vadSilenceDuration, setVadSilenceDuration] = useState<number>(3000);
   const [vadPrefixPadding, setVadPrefixPadding] = useState<number>(300);
@@ -122,7 +123,7 @@ export default function RealtimeClient() {
   const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
   const [dummySendInterval, setDummySendInterval] = useState<number>(50); // Dummy audio send interval in ms
   const [audioBufferSize, setAudioBufferSize] = useState<number>(4096); // ScriptProcessor buffer size (256, 512, 1024, 2048, 4096)
-  const [batchMultiplier, setBatchMultiplier] = useState<number>(1); // 一括送信する際のバッチ数（1=即時送信、2以上=蓄積して送信）
+  const [batchMultiplier, setBatchMultiplier] = useState<number>(8); // 一括送信する際のバッチ数（デフォルト:8=約1365ms間隔）
   const accumulatedAudioRef = useRef<Int16Array[]>([]); // 蓄積用バッファ
   const [skipSilentChunks, setSkipSilentChunks] = useState<boolean>(false); // 無音チャンクをスキップするかどうか（デフォルト:無効=高精度）
   const [recordingElapsedTime, setRecordingElapsedTime] = useState<number>(0);
@@ -266,11 +267,23 @@ export default function RealtimeClient() {
       // Send VAD parameters to server
       ws.send(JSON.stringify({
         type: 'set_vad_params',
+        enabled: vadEnabled,
         threshold: vadThreshold,
         silence_duration_ms: vadSilenceDuration,
         prefix_padding_ms: vadPrefixPadding
       }));
-      console.log('[WebSocket] 🎛️ Sent VAD parameters:', { threshold: vadThreshold, silence_duration_ms: vadSilenceDuration, prefix_padding_ms: vadPrefixPadding });
+      console.log('[WebSocket] 🎛️ Sent VAD parameters:', { enabled: vadEnabled, threshold: vadThreshold, silence_duration_ms: vadSilenceDuration, prefix_padding_ms: vadPrefixPadding });
+
+      // Calculate and send commit threshold based on buffer settings
+      // Formula: (audioBufferSize * batchMultiplier / 24000) * 1000 milliseconds
+      const commitThresholdMs = Math.floor((audioBufferSize * batchMultiplier / 24000) * 1000);
+      ws.send(JSON.stringify({
+        type: 'set_commit_threshold',
+        threshold_ms: commitThresholdMs,
+        buffer_size: audioBufferSize,
+        batch_multiplier: batchMultiplier
+      }));
+      console.log('[WebSocket] ⏱️ Sent commit threshold:', commitThresholdMs, 'ms (buffer:', audioBufferSize, 'samples × batch:', batchMultiplier, ')');
     };
 
     ws.onmessage = (event) => {
@@ -361,7 +374,7 @@ export default function RealtimeClient() {
       setIsConnected(false);
       setIsRecording(false);
     };
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadThreshold, vadSilenceDuration, vadPrefixPadding]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, audioBufferSize, batchMultiplier]);
 
   const disconnectWebSocket = useCallback(() => {
     if (websocketRef.current) {
@@ -804,7 +817,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
     console.log('[UI] 🧹 Clearing transcription text');
     setText("");
     setError(null);
-    
+
     // Clear audio buffer
     if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
       console.log('[Audio] 🗑️ Clearing server audio buffer');
@@ -813,6 +826,27 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       }));
     }
   }, []);
+
+  const copyText = useCallback(async () => {
+    if (!text) {
+      console.log('[UI] ⚠️ No text to copy');
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+      console.log('[UI] 📋 Text copied to clipboard');
+      // Show temporary success message
+      const originalError = error;
+      setError('✅ コピーしました');
+      setTimeout(() => {
+        setError(originalError);
+      }, 2000);
+    } catch (err) {
+      console.error('[UI] ❌ Failed to copy text:', err);
+      setError('コピーに失敗しました');
+    }
+  }, [text, error]);
 
   // Generate or retrieve session ID
   const generateSessionId = useCallback(() => {
@@ -1313,53 +1347,74 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
             </p>
           </div>
 
-          {/* Speech Break Detection Option */}
-          <div className="mb-4">
-            <label className="flex items-center">
-              <input
-                type="checkbox"
-                checked={speechBreakDetection}
-                onChange={(e) => setSpeechBreakDetection(e.target.checked)}
-                disabled={isRecording || isConnected}
-                className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
-              />
-              <span className="text-sm font-medium text-gray-700">
-                発話区切り検出を有効にする
-              </span>
-            </label>
-            <p className="text-xs text-gray-500 mt-1 ml-6">
-              発話の区切りを検出して絵文字マーカーを挿入します
-            </p>
-            
-            {speechBreakDetection && (
-              <div className="mt-3 ml-6">
-                <label htmlFor="break-marker" className="block text-xs font-medium text-gray-600 mb-1">
-                  区切りマーカー:
-                </label>
-                <select
-                  id="break-marker"
-                  value={breakMarker}
-                  onChange={(e) => setBreakMarker(e.target.value)}
-                  disabled={isRecording || isConnected}
-                  className="block w-32 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                >
-                  <option value="⏎">⏎ (改行)</option>
-                  <option value="↵">↵ (Return)</option>
-                  <option value="🔄">🔄 (更新)</option>
-                  <option value="📝">📝 (メモ)</option>
-                  <option value="🔃">🔃 (緑改行)</option>
-                </select>
-              </div>
-            )}
-          </div>
-
           {/* VAD Parameters */}
           <div className="mb-4 p-4 bg-gray-50 rounded-md border border-gray-200">
             <h4 className="text-sm font-medium text-gray-700 mb-3">
               音声検出パラメータ (VAD設定)
             </h4>
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+            {/* VAD Enable/Disable */}
+            <div className="mb-4">
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={vadEnabled}
+                  onChange={(e) => setVadEnabled(e.target.checked)}
+                  disabled={isRecording || isConnected}
+                  className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                />
+                <span className="text-sm font-medium text-gray-700">
+                  VAD（音声区切り検出）を有効にする
+                </span>
+              </label>
+              <p className="text-xs text-gray-500 mt-1 ml-6">
+                VADを有効にすると音声の区切りが自動検出されます。
+              </p>
+            </div>
+
+            {/* Speech Break Detection (sub-option of VAD) */}
+            {vadEnabled && (
+              <div className="mb-4 ml-6 p-3 bg-white rounded-md border border-gray-300">
+                <label className="flex items-center">
+                  <input
+                    type="checkbox"
+                    checked={speechBreakDetection}
+                    onChange={(e) => setSpeechBreakDetection(e.target.checked)}
+                    disabled={isRecording || isConnected}
+                    className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                  />
+                  <span className="text-sm font-medium text-gray-700">
+                    発話区切りマーカーを挿入
+                  </span>
+                </label>
+                <p className="text-xs text-gray-500 mt-1 ml-6">
+                  発話の区切りを検出してマーカー文字を挿入します
+                </p>
+
+                {speechBreakDetection && (
+                  <div className="mt-3 ml-6">
+                    <label htmlFor="break-marker" className="block text-xs font-medium text-gray-600 mb-1">
+                      区切りマーカー:
+                    </label>
+                    <select
+                      id="break-marker"
+                      value={breakMarker}
+                      onChange={(e) => setBreakMarker(e.target.value)}
+                      disabled={isRecording || isConnected}
+                      className="block w-32 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                    >
+                      <option value="⏎">⏎ (改行)</option>
+                      <option value="↵">↵ (Return)</option>
+                      <option value="🔄">🔄 (更新)</option>
+                      <option value="📝">📝 (メモ)</option>
+                      <option value="🔃">🔃 (緑改行)</option>
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className={`grid grid-cols-1 md:grid-cols-3 gap-4 ${!vadEnabled ? 'opacity-50' : ''}`}>
               {/* Threshold */}
               <div>
                 <label htmlFor="vad-threshold" className="block text-xs font-medium text-gray-600 mb-1">
@@ -1373,7 +1428,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   step="0.1"
                   value={vadThreshold}
                   onChange={(e) => setVadThreshold(parseFloat(e.target.value))}
-                  disabled={isRecording || isConnected}
+                  disabled={!vadEnabled || isRecording || isConnected}
                   className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
                 />
                 <p className="text-xs text-gray-500 mt-1">
@@ -1394,7 +1449,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   step="100"
                   value={vadSilenceDuration}
                   onChange={(e) => setVadSilenceDuration(parseInt(e.target.value))}
-                  disabled={isRecording || isConnected}
+                  disabled={!vadEnabled || isRecording || isConnected}
                   className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
                 />
                 <p className="text-xs text-gray-500 mt-1">
@@ -1415,7 +1470,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   step="50"
                   value={vadPrefixPadding}
                   onChange={(e) => setVadPrefixPadding(parseInt(e.target.value))}
-                  disabled={isRecording || isConnected}
+                  disabled={!vadEnabled || isRecording || isConnected}
                   className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
                 />
                 <p className="text-xs text-gray-500 mt-1">
@@ -1437,7 +1492,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   setAudioBufferSize(4096);
                   setBatchMultiplier(1);
                 }}
-                disabled={isRecording || isConnected}
+                disabled={!vadEnabled || isRecording || isConnected}
                 className="px-3 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
               >
                 最高精度設定を適用
@@ -1680,6 +1735,8 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                       <option value="1024">1024 (~21ms)</option>
                       <option value="2048">2048 (~43ms)</option>
                       <option value="4096">4096 (~85ms)</option>
+                      <option value="8192">8192 (~171ms)</option>
+                      <option value="16384">16384 (~341ms)</option>
                     </select>
                   </div>
 
@@ -1700,12 +1757,26 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                       <option value="4">4</option>
                       <option value="8">8</option>
                       <option value="16">16</option>
+                      <option value="32">32</option>
+                      <option value="64">64</option>
                     </select>
                   </div>
                 </div>
-                <p className="text-xs text-gray-400 mt-2">
-                  送信設定: {audioBufferSize * batchMultiplier} サンプル (~{((audioBufferSize * batchMultiplier) / 24000 * 1000).toFixed(0)}ms/回)
-                </p>
+                <div className="mt-2 space-y-1">
+                  <p className="text-xs font-medium text-gray-600">
+                    送信設定: {audioBufferSize * batchMultiplier} サンプル (~{((audioBufferSize * batchMultiplier) / 24000 * 1000).toFixed(0)}ms/回)
+                  </p>
+                  <p className="text-xs text-gray-500 leading-relaxed">
+                    <span className="font-medium">バッファサイズ</span>: 音声処理の単位（サンプル数）<br/>
+                    <span className="font-medium">バッチ数</span>: 何回分蓄積してから送信するか<br/>
+                    <span className="font-medium">送信間隔</span> = バッファサイズ × バッチ数 ÷ 24000 × 1000 (ms)
+                  </p>
+                  <p className="text-xs text-gray-400 leading-relaxed mt-1">
+                    💡 同じ送信間隔でも処理粒度が異なる：<br/>
+                    小バッファ×多バッチ = 細かい処理、CPU負荷高<br/>
+                    大バッファ×少バッチ = 粗い処理、CPU負荷低、安定
+                  </p>
+                </div>
               </div>
 
               {/* Silent Chunk Skip */}
@@ -1906,13 +1977,22 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
             <h2 className="text-lg font-medium text-gray-900">
               文字起こし結果
             </h2>
-            <button
-              onClick={clearText}
-              disabled={isRecording || isDummyAudioSending}
-              className="px-4 py-2 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
-            >
-              Clear Text
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={copyText}
+                disabled={!text || isRecording || isDummyAudioSending}
+                className="px-4 py-2 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+              >
+                📋 コピー
+              </button>
+              <button
+                onClick={clearText}
+                disabled={isRecording || isDummyAudioSending}
+                className="px-4 py-2 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition-colors"
+              >
+                Clear Text
+              </button>
+            </div>
           </div>
           <div className="min-h-[200px] p-4 border border-gray-300 rounded-md bg-gray-50">
             {text ? (

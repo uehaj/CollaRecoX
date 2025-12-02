@@ -46,6 +46,7 @@ nohup.out
 *~
 *.log
 server.log
+logs/
 
 # additional environment files with sensitive data
 a.env
