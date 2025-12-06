@@ -509,66 +509,81 @@ export default function DummyRecorderPage() {
   };
 
   return (
-    <main className="container mx-auto px-4 py-8 max-w-6xl">
-      <div className="space-y-6">
-        {/* Header */}
-        <div className="text-center">
-          <h1 className="text-3xl font-bold text-gray-900">
-            ダミーデータ作成
-          </h1>
-          <p className="text-gray-600 mt-2">
-            ブラウザで音声を録音し、テスト用ダミーデータを作成・管理します
-          </p>
-          <div className="mt-4">
-            <Link 
-              href="/realtime" 
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
-            >
-              ← リアルタイム音声認識に戻る
-            </Link>
+    <div className="min-h-screen bg-gray-50">
+      {/* Header - editorと同様の構造 */}
+      <header className="bg-white shadow-sm border-b">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">録音データ作成</h1>
+              <p className="text-sm text-gray-600 mt-1">ブラウザで音声を録音し、テスト用録音データを作成・管理します</p>
+            </div>
+            <div className="flex items-center space-x-3">
+              <Link
+                href="/realtime"
+                className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+              >
+                リアルタイム文字起こし
+              </Link>
+              <a
+                href="/manual.html"
+                className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700 transition-colors"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                マニュアル
+              </a>
+            </div>
           </div>
         </div>
+      </header>
 
-        {/* Audio Device Selection */}
-        <div className="bg-white p-6 rounded-lg shadow-md">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">
-            オーディオデバイス選択
-          </h3>
-          <div className="flex items-center space-x-4">
-            <label htmlFor="device-select" className="text-sm font-medium text-gray-700">
-              入力デバイス:
-            </label>
-            <select
-              id="device-select"
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-              disabled={isRecording}
-              className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-            >
-              {audioDevices.length === 0 ? (
-                <option value="">デバイスを読み込み中...</option>
-              ) : (
-                audioDevices.map((device) => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label || `マイク ${device.deviceId.slice(0, 8)}...`}
-                  </option>
-                ))
-              )}
-            </select>
-            <button
-              onClick={getAudioDevices}
-              disabled={isRecording}
-              className="px-4 py-2 text-sm bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50"
-            >
-              更新
-            </button>
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="space-y-6">
+        {/* Audio Device Selection & Recording Controls - Side by Side */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Audio Device Selection */}
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">
+              オーディオデバイス選択
+            </h3>
+            <div className="space-y-4">
+              <div className="flex items-center space-x-4">
+                <label htmlFor="device-select" className="text-sm font-medium text-gray-700 whitespace-nowrap">
+                  入力デバイス:
+                </label>
+                <select
+                  id="device-select"
+                  value={selectedDeviceId}
+                  onChange={(e) => setSelectedDeviceId(e.target.value)}
+                  disabled={isRecording}
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                >
+                  {audioDevices.length === 0 ? (
+                    <option value="">デバイスを読み込み中...</option>
+                  ) : (
+                    audioDevices.map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {device.label || `マイク ${device.deviceId.slice(0, 8)}...`}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  onClick={getAudioDevices}
+                  disabled={isRecording}
+                  className="px-4 py-2 text-sm bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50"
+                >
+                  更新
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
 
-        {/* Recording Controls */}
-        <div className={`p-6 rounded-lg transition-colors ${
-          isRecording ? "bg-red-50 border-2 border-red-200" : "bg-white shadow-md"
-        }`}>
+          {/* Recording Controls */}
+          <div className={`p-6 rounded-lg transition-colors ${
+            isRecording ? "bg-red-50 border-2 border-red-200" : "bg-white shadow-md"
+          }`}>
           <h3 className="text-lg font-medium text-gray-900 mb-4">
             録音コントロール
           </h3>
@@ -678,6 +693,7 @@ export default function DummyRecorderPage() {
               <span className="text-sm font-medium">オーディオファイルを処理中...</span>
             </div>
           )}
+          </div>
         </div>
 
         {/* Recordings List */}
@@ -776,7 +792,8 @@ export default function DummyRecorderPage() {
             ブラウザのデータを消去すると録音も削除されます。
           </div>
         </div>
-      </div>
-    </main>
+        </div>
+      </main>
+    </div>
   );
 }
