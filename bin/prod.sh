@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Development server startup script for collarecox
-# This script loads environment variables from .env.local and starts the development server
+# Production server startup script for collarecox
+# This script loads environment variables from .env.local and starts the production server
 
 set -e
 
@@ -13,9 +13,9 @@ FORCE_KILL=false
 # Parse command line arguments
 show_help() {
     cat << EOF
-Usage: bin/dev.sh [OPTIONS]
+Usage: bin/prod.sh [OPTIONS]
 
-Development server startup script for collarecox
+Production server startup script for collarecox
 
 OPTIONS:
     -f, --force             Kill existing process on port 8888 before starting
@@ -24,11 +24,11 @@ OPTIONS:
     -h, --help              Show this help message
 
 EXAMPLES:
-    bin/dev.sh                      # Start server without logging
-    bin/dev.sh -f                   # Force kill existing process and start
-    bin/dev.sh -l                   # Start server with logging to ./logs
-    bin/dev.sh -f -l                # Force kill and start with logging
-    bin/dev.sh -l -d /path/to/logs  # Start server with custom log directory
+    bin/prod.sh                      # Start server without logging
+    bin/prod.sh -f                   # Force kill existing process and start
+    bin/prod.sh -l                   # Start server with logging to ./logs
+    bin/prod.sh -f -l                # Force kill and start with logging
+    bin/prod.sh -l -d /path/to/logs  # Start server with custom log directory
 
 EOF
     exit 0
@@ -62,7 +62,7 @@ done
 # Get the project root directory (parent of bin directory)
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "🚀 Starting collarecox development server..."
+echo "🚀 Starting collarecox production server..."
 echo "📁 Project root: $PROJECT_ROOT"
 
 # Change to project root
@@ -99,9 +99,9 @@ while IFS= read -r line || [ -n "$line" ]; do
     export "$line"
 done < .env.local
 
-# Set NODE_TLS_REJECT_UNAUTHORIZED for development environments
-# WARNING: Only use in development environments
-echo "🔓 Disabling TLS verification (development only)"
+# Disable TLS verification for corporate proxy environments
+# WARNING: This is a security risk, use only in trusted network environments
+echo "🔓 Disabling TLS verification for corporate proxy environment"
 export NODE_TLS_REJECT_UNAUTHORIZED=0
 
 # Check for existing processes on port 8888
@@ -121,7 +121,7 @@ if [ -n "$PIDS" ]; then
         echo "❌ Error: Port 8888 is already in use by process(es): $PIDS"
         echo ""
         echo "To kill existing processes and start the server, use:"
-        echo "  bin/dev.sh -f"
+        echo "  bin/prod.sh -f"
         echo ""
         echo "Or manually kill the process(es):"
         echo "  kill -9 $PIDS"
@@ -138,13 +138,13 @@ echo "🎤 Realtime API: ws://localhost:8888/api/realtime-ws"
 echo "📡 Hocuspocus: ws://localhost:8888/api/yjs-ws"
 echo ""
 
-# Start development server with or without logging
+# Start production server with or without logging
 if [ "$ENABLE_LOG" = true ]; then
     echo "📋 Server logs will be saved to: $LOG_FILE"
     echo "🔍 To monitor specific logs in another terminal:"
     echo "   tail -f $LOG_FILE | grep --color 'threshold\|VAD\|Auto-commit\|Error'"
     echo ""
-    npm run dev 2>&1 | tee "$LOG_FILE"
+    npm run start 2>&1 | tee "$LOG_FILE"
 else
-    npm run dev
+    npm run start
 fi

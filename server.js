@@ -167,14 +167,14 @@ app.prepare().then(() => {
     let speechBreakMarker = '⏎';
 
     // VAD parameters (optimized for high accuracy)
-    let vadEnabled = true; // VAD enabled/disabled (default: true = same as before)
+    let vadEnabled = false; // VAD enabled/disabled (default: false = Manual commit mode for VA-Cable testing)
     let vadThreshold = 0.2;
     let vadSilenceDuration = 3000;
     let vadPrefixPadding = 300;
 
     // Auto-commit threshold (milliseconds) - can be adjusted by client
-    let autoCommitThresholdMs = 1000; // Default: 1 second (same as before)
-    let autoCommitTimerDelayMs = 2000; // Default: 2 seconds (same as before)
+    let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
+    let autoCommitTimerDelayMs = 3000; // Default: 3 seconds delay before timer-commit
     let audioBufferSize = 4096; // Default buffer size
     let batchMultiplier = 8; // Default batch multiplier
 
@@ -288,6 +288,8 @@ app.prepare().then(() => {
             console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
             if (currentSessionId && message.transcript) {
               sendTextToHocuspocusDocument(currentSessionId, message.transcript);
+              // Clear pending text after transcription is complete
+              clearPendingText(currentSessionId);
             } else {
               console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${message.transcript ? 'HAS_CONTENT' : 'EMPTY'}`);
             }
@@ -318,7 +320,23 @@ app.prepare().then(() => {
           case 'conversation.item.input_audio_transcription.started':
             console.log('🎤 Audio transcription started:', message.item_id);
             break;
-            
+
+          case 'conversation.item.input_audio_transcription.delta':
+            // Forward partial transcription to client for "recognition in progress" display
+            console.log('🔤 Transcription delta:', message.delta, '(item_id:', message.item_id, ')');
+            if (message.delta) {
+              clientWs.send(JSON.stringify({
+                type: 'transcription_delta',
+                delta: message.delta,
+                item_id: message.item_id
+              }));
+              // Also broadcast pending text to collaborative editor via Yjs
+              if (currentSessionId) {
+                updatePendingText(currentSessionId, message.delta);
+              }
+            }
+            break;
+
           case 'input_audio_buffer.cleared':
             console.log('Audio buffer cleared');
             break;
@@ -329,19 +347,28 @@ app.prepare().then(() => {
               type: 'speech_started',
               audio_start_ms: message.audio_start_ms
             }));
+            // Update transcription status in Hocuspocus document
+            if (currentSessionId) {
+              updateTranscriptionStatus(currentSessionId, true);
+            }
             break;
             
           case 'input_audio_buffer.speech_stopped':
             console.log('Speech ended');
             clientWs.send(JSON.stringify({
               type: 'speech_stopped',
-              audio_end_ms: message.audio_end_ms
+              audio_end_ms: message.audio_end_ms,
+              marker: speechBreakDetection ? speechBreakMarker : null
             }));
-            
+
             // Create paragraph break to Hocuspocus document if enabled
             if (speechBreakDetection && currentSessionId) {
               console.log('🔸 Creating paragraph break in document');
-              createParagraphBreak(currentSessionId);
+              createParagraphBreak(currentSessionId, speechBreakMarker);
+            }
+            // Clear transcription status (will be confirmed in transcription_completed)
+            if (currentSessionId) {
+              updateTranscriptionStatus(currentSessionId, false);
             }
             break;
             
@@ -582,8 +609,15 @@ app.prepare().then(() => {
             // Validate audio data first
             const audioData = Buffer.from(message.audio, 'base64');
             const int16Array = new Int16Array(audioData.buffer, audioData.byteOffset, audioData.length / 2);
-            const maxSample = Math.max(...Array.from(int16Array).map(Math.abs));
-            const avgSample = Array.from(int16Array).reduce((sum, val) => sum + Math.abs(val), 0) / int16Array.length;
+            // Use loop instead of spread operator to avoid stack overflow with large arrays
+            let maxSample = 0;
+            let sumSample = 0;
+            for (let i = 0; i < int16Array.length; i++) {
+              const absVal = Math.abs(int16Array[i]);
+              if (absVal > maxSample) maxSample = absVal;
+              sumSample += absVal;
+            }
+            const avgSample = sumSample / int16Array.length;
             
             audioChunkCount++;
 
@@ -623,8 +657,15 @@ app.prepare().then(() => {
             if (autoCommitTimer) {
               clearTimeout(autoCommitTimer);
             }
-            
-            // Auto-commit when we have enough audio with rate limiting
+
+            // When Server VAD is enabled, skip manual commit - let OpenAI handle it automatically
+            if (vadEnabled) {
+              // VAD mode: OpenAI's Server VAD handles transcription timing automatically
+              // Just track buffer for logging purposes, don't send manual commits
+              break;
+            }
+
+            // Auto-commit when we have enough audio with rate limiting (only when VAD is disabled)
             const now = Date.now();
             const timeSinceLastCommit = now - lastCommitTime;
 
@@ -632,12 +673,12 @@ app.prepare().then(() => {
               console.log(`Auto-committing audio buffer: ${audioBufferDuration}ms (threshold: ${autoCommitThresholdMs}ms), ${audioChunkCount} chunks`);
               responseInProgress = true;
               lastCommitTime = now;
-              
+
               // Just commit the audio buffer - transcription should happen automatically
               const commitEvent = {
                 type: 'input_audio_buffer.commit'
               };
-              
+
               if (openaiWs.readyState === 1) { // WebSocket.OPEN
                 openaiWs.send(JSON.stringify(commitEvent));
                 console.log('✅ Audio buffer committed, waiting for automatic transcription...');
@@ -645,7 +686,7 @@ app.prepare().then(() => {
                 console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
                 responseInProgress = false; // Reset flag
               }
-              
+
               // Don't reset buffer tracking immediately - let transcription complete first
               // audioBufferDuration = 0;
               // audioChunkCount = 0;
@@ -663,12 +704,12 @@ app.prepare().then(() => {
                   console.log(`Timer-based commit: ${audioBufferDuration}ms (min: ${minBufferForTimer}ms), ${audioChunkCount} chunks`);
                   responseInProgress = true;
                   lastCommitTime = timerNow;
-                  
+
                   // Just commit the audio buffer - transcription should happen automatically
                   const commitEvent = {
                     type: 'input_audio_buffer.commit'
                   };
-                  
+
                   if (openaiWs.readyState === 1) { // WebSocket.OPEN
                     openaiWs.send(JSON.stringify(commitEvent));
                     console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
@@ -676,7 +717,7 @@ app.prepare().then(() => {
                     console.log(`⚠️ OpenAI WebSocket not ready for timer commit (state: ${openaiWs.readyState})`);
                     responseInProgress = false; // Reset flag
                   }
-                  
+
                   // Don't reset buffer tracking immediately
                   // audioBufferDuration = 0;
                   // audioChunkCount = 0;
@@ -746,7 +787,7 @@ app.prepare().then(() => {
               console.log('⚠️ Dummy audio is already being sent, ignoring new request');
               clientWs.send(JSON.stringify({
                 type: 'error',
-                error: 'ダミーオーディオ送信中です。完了をお待ちください。'
+                error: '録音データ送信中です。完了をお待ちください。'
               }));
               break;
             }
@@ -860,47 +901,123 @@ app.prepare().then(() => {
             console.log(`[Hocuspocus Integration] ✅ Text added as new paragraph to '${fieldName}'`);
           }
         } else {
-          // No content yet, create header paragraph with settings and first content paragraph
-          // Header paragraph
-          const headerParagraph = new (require('yjs')).XmlElement('paragraph');
-          const headerTextNode = new (require('yjs')).XmlText();
-          const headerText = `【音声認識設定】送信間隔: ${autoCommitThresholdMs}ms (バッファ: ${audioBufferSize}, バッチ: ${batchMultiplier})`;
-          headerTextNode.insert(0, headerText);
-          headerParagraph.insert(0, [headerTextNode]);
-          fragment.insert(0, [headerParagraph]);
-
-          // Separator paragraph (empty line)
-          const separatorParagraph = new (require('yjs')).XmlElement('paragraph');
-          const separatorTextNode = new (require('yjs')).XmlText();
-          separatorTextNode.insert(0, '');
-          separatorParagraph.insert(0, [separatorTextNode]);
-          fragment.insert(1, [separatorParagraph]);
-
-          // First content paragraph
+          // No content yet, create first content paragraph
           const newParagraph = new (require('yjs')).XmlElement('paragraph');
           const newTextNode = new (require('yjs')).XmlText();
           newTextNode.insert(0, text);
           newParagraph.insert(0, [newTextNode]);
-          fragment.insert(2, [newParagraph]);
-          console.log(`[Hocuspocus Integration] ✅ Header and text added as first content to '${fieldName}'`);
+          fragment.insert(0, [newParagraph]);
+          console.log(`[Hocuspocus Integration] ✅ Text added as first content to '${fieldName}'`);
         }
         
         console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);
       } else {
-        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
-        
-        // Debug: Show available documents
-        const availableDocs = Array.from(hocuspocus.documents.keys());
-        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
+        console.log(`[Hocuspocus Integration] ⚠️ Document not found, creating via direct connection: ${roomName}`);
+
+        // Create document using direct connection
+        try {
+          const directConnection = await hocuspocus.openDirectConnection(roomName, {});
+
+          const directDoc = directConnection.document;
+          const fieldName = `content-${sessionId}`;
+          const fragment = directDoc.getXmlFragment(fieldName);
+
+          // Create initial content
+          const newParagraph = new (require('yjs')).XmlElement('paragraph');
+          const newTextNode = new (require('yjs')).XmlText();
+          newTextNode.insert(0, text);
+          newParagraph.insert(0, [newTextNode]);
+          fragment.insert(fragment.length, [newParagraph]);
+
+          console.log(`[Hocuspocus Integration] ✅ Document created and text added via direct connection: ${roomName}`);
+
+          // Keep the connection alive for a short time to ensure sync
+          setTimeout(() => {
+            directConnection.disconnect();
+            console.log(`[Hocuspocus Integration] 📤 Direct connection closed: ${roomName}`);
+          }, 1000);
+
+        } catch (directError) {
+          console.error(`[Hocuspocus Integration] ❌ Failed to create document via direct connection:`, directError);
+
+          // Debug: Show available documents
+          const availableDocs = Array.from(hocuspocus.documents.keys());
+          console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
+        }
       }
-      
+
     } catch (error) {
       console.error(`[Hocuspocus Integration] ❌ Error adding text to document:`, error);
     }
   }
 
+  // Function to update transcription status in Hocuspocus document
+  function updateTranscriptionStatus(sessionId, isTranscribing) {
+    try {
+      if (!sessionId) return;
+
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+
+      if (document) {
+        const statusMap = document.getMap(`status-${sessionId}`);
+        statusMap.set('isTranscribing', isTranscribing);
+        console.log(`[Hocuspocus Integration] 📊 Transcription status updated: ${isTranscribing}`);
+      }
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error updating transcription status:`, error);
+    }
+  }
+
+  // Pending text accumulator per session
+  const pendingTextBySession = new Map();
+
+  // Function to update pending text (recognition in progress) in Hocuspocus document
+  function updatePendingText(sessionId, delta) {
+    try {
+      if (!sessionId) return;
+
+      // Accumulate delta text
+      const currentText = pendingTextBySession.get(sessionId) || '';
+      const newText = currentText + delta;
+      pendingTextBySession.set(sessionId, newText);
+
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+
+      if (document) {
+        const statusMap = document.getMap(`status-${sessionId}`);
+        statusMap.set('pendingText', newText);
+        console.log(`[Hocuspocus Integration] 🔤 Pending text updated: "${newText}"`);
+      }
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error updating pending text:`, error);
+    }
+  }
+
+  // Function to clear pending text when transcription is completed
+  function clearPendingText(sessionId) {
+    try {
+      if (!sessionId) return;
+
+      // Clear accumulated text
+      pendingTextBySession.delete(sessionId);
+
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+
+      if (document) {
+        const statusMap = document.getMap(`status-${sessionId}`);
+        statusMap.set('pendingText', '');
+        console.log(`[Hocuspocus Integration] 🧹 Pending text cleared`);
+      }
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error clearing pending text:`, error);
+    }
+  }
+
   // Function to create a paragraph break in Hocuspocus document
-  async function createParagraphBreak(sessionId) {
+  async function createParagraphBreak(sessionId, marker = '⏎') {
     try {
       console.log(`[Hocuspocus Integration] Creating paragraph break for session ${sessionId}`);
       
@@ -920,13 +1037,34 @@ app.prepare().then(() => {
         const hasContent = fragment.length > 0;
         
         if (hasContent) {
+          // Get the last paragraph and append the marker to its end
+          const lastParagraph = fragment.get(fragment.length - 1);
+          if (lastParagraph && lastParagraph instanceof (require('yjs')).XmlElement) {
+            // Find or create text node in the last paragraph to append marker
+            let lastTextNode = null;
+            for (let i = lastParagraph.length - 1; i >= 0; i--) {
+              const child = lastParagraph.get(i);
+              if (child instanceof (require('yjs')).XmlText) {
+                lastTextNode = child;
+                break;
+              }
+            }
+            if (lastTextNode) {
+              // Append marker to existing text
+              lastTextNode.insert(lastTextNode.length, ' ' + marker);
+            } else {
+              // Create new text node with marker
+              const newTextNode = new (require('yjs')).XmlText();
+              newTextNode.insert(0, ' ' + marker);
+              lastParagraph.insert(lastParagraph.length, [newTextNode]);
+            }
+            console.log(`[Hocuspocus Integration] ✅ Marker appended to last paragraph in '${fieldName}'`);
+          }
+
           // Create a new empty paragraph for the next content
           const newParagraph = new (require('yjs')).XmlElement('paragraph');
-          const newTextNode = new (require('yjs')).XmlText();
-          newTextNode.insert(0, ''); // Empty paragraph initially
-          newParagraph.insert(0, [newTextNode]);
           fragment.insert(fragment.length, [newParagraph]);
-          console.log(`[Hocuspocus Integration] ✅ New paragraph created in '${fieldName}' for speech break`);
+          console.log(`[Hocuspocus Integration] ✅ New empty paragraph created in '${fieldName}' for speech break`);
         } else {
           console.log(`[Hocuspocus Integration] ⚠️ No existing content, skipping paragraph break`);
         }
