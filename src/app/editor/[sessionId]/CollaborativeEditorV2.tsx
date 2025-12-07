@@ -298,37 +298,46 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   }, [provider, userInfo, CollaborationExtension, CollaborationCursorExtension, modulesLoaded, sessionId]);
 
 
-  // Document change listener for debugging
+  // Document change listener - highlight remote edits in blue
   useEffect(() => {
-    if (!ydocRef.current) return;
+    if (!ydocRef.current || !editor || !highlightEdits) return;
 
     try {
-      // Use session-specific text field name to avoid conflicts
-      const textFieldName = `content-${sessionId}`;
-      
-      // Check if this text type already exists to avoid duplication
-      const existingText = ydocRef.current.share.has(textFieldName);
-      console.log(`[Collaborative Editor V2] 📄 Text field '${textFieldName}' exists:`, existingText);
-      
-      const ytext = ydocRef.current.getText(textFieldName);
-      
-      const onChange = () => {
-        console.log('[Collaborative Editor V2] 📄 Document content updated:', ytext.toString());
+      const ydoc = ydocRef.current;
+
+      // Listen to Yjs document updates to detect remote changes
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const onUpdate = (update: Uint8Array, origin: any) => {
+        // origin is null for remote changes, non-null for local changes
+        const isRemote = origin === null || origin === 'remote';
+
+        if (isRemote) {
+          console.log('[Collaborative Editor V2] 🔵 Remote change detected');
+
+          // Flash the editor to indicate remote change
+          const editorElement = document.querySelector('.ProseMirror');
+          if (editorElement) {
+            editorElement.classList.add('remote-change-flash');
+            setTimeout(() => {
+              editorElement.classList.remove('remote-change-flash');
+            }, 500);
+          }
+        }
       };
 
-      ytext.observe(onChange);
+      ydoc.on('update', onUpdate);
 
       return () => {
         try {
-          ytext.unobserve(onChange);
+          ydoc.off('update', onUpdate);
         } catch (error) {
-          console.warn('[Collaborative Editor V2] ⚠️ Error during unobserve:', error);
+          console.warn('[Collaborative Editor V2] ⚠️ Error during update listener cleanup:', error);
         }
       };
     } catch (error) {
       console.error('[Collaborative Editor V2] ❌ Error setting up document listener:', error);
     }
-  }, [sessionId]);
+  }, [editor, highlightEdits]);
 
   // Transcription status listener - needs provider to ensure ydocRef is set
   useEffect(() => {
@@ -685,29 +694,18 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               テキストをコピー
             </button>
             <button
-              onClick={() => {
-                if (confirm('テキストをすべて削除しますか？')) {
-                  editor.commands.clearContent();
-                }
-              }}
-              className="px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
-            >
-              Clear Text
-            </button>
-            <button
               onClick={handleRewrite}
-              disabled={true}
-              title="準備中"
+              disabled={isRewriting}
+              title="AIでテキストを再編します"
               className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
             >
-              AI再編
+              {isRewriting ? '処理中...' : 'AI再編'}
             </button>
-            <label className="flex items-center space-x-1 text-sm text-gray-400">
+            <label className="flex items-center space-x-1 text-sm text-gray-600">
               <input
                 type="checkbox"
                 checked={autoRewrite}
                 onChange={(e) => setAutoRewrite(e.target.checked)}
-                disabled={true}
                 className="rounded"
               />
               <span>自動(30秒)</span>
