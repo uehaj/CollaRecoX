@@ -53,9 +53,29 @@ app.prepare().then(() => {
   console.log('Next.js app prepared successfully');
 
   const server = createServer(async (req, res) => {
-    // Next.js へ
     try {
       const parsedUrl = parse(req.url, true);
+
+      // /api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
+      if (parsedUrl.pathname === '/api/yjs-sessions') {
+        const sessions = Array.from(hocuspocus.documents.keys()).map(roomName => {
+          const sessionId = roomName.replace('transcribe-editor-v2-', '');
+          const doc = hocuspocus.documents.get(roomName);
+          return {
+            sessionId,
+            roomName,
+            connectionCount: doc?.getConnectionsCount?.() || 0
+          };
+        });
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end(JSON.stringify({ sessions }));
+        return;
+      }
+
+      // Next.js へ
       await handle(req, res, parsedUrl);
     } catch (err) {
       console.error('Error occurred handling', req.url, err);
@@ -149,8 +169,10 @@ app.prepare().then(() => {
     // Audio buffer tracking
     let audioBufferDuration = 0; // in milliseconds
     let lastAudioTimestamp = Date.now();
+    let accumulatedSilenceDuration = 0; // 累積無音時間（ms）- 有音チャンクでリセット
     let audioChunkCount = 0;
     let autoCommitTimer = null;
+    let paragraphBreakTimer = null; // Timer for delayed paragraph break detection
     let responseInProgress = false;
     let lastCommitTime = 0; // Prevent too frequent commits
     let isDummyAudioSending = false; // Flag to prevent duplicate dummy audio sends
@@ -164,13 +186,22 @@ app.prepare().then(() => {
     
     // Speech break detection settings
     let speechBreakDetection = false;
-    let speechBreakMarker = '⏎';
+    let speechBreakMarker = '↩️'; // デフォルト: 改行絵文字
 
-    // VAD parameters (optimized for high accuracy)
-    let vadEnabled = false; // VAD enabled/disabled (default: false = Manual commit mode for VA-Cable testing)
+    // VAD parameters - controls when OpenAI detects speech end (Server VAD mode only)
+    // vadSilenceDuration: OpenAI's VAD will fire speech_stopped after this much silence
+    let vadEnabled = true; // VAD enabled/disabled (default: true)
     let vadThreshold = 0.2;
-    let vadSilenceDuration = 3000;
+    let vadSilenceDuration = 600; // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間（推奨: 500-700ms）
     let vadPrefixPadding = 300;
+
+    // Paragraph break threshold - controls when to insert paragraph break marker
+    // This is independent from VAD silence duration
+    // Paragraph break is inserted only when actual silence gap >= this threshold
+    let paragraphBreakThreshold = 2500; // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入（推奨: 2000-2500ms）
+
+    // Auto-rewrite on paragraph break - automatically rewrite the completed paragraph
+    let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
 
     // Auto-commit threshold (milliseconds) - can be adjusted by client
     let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
@@ -343,6 +374,15 @@ app.prepare().then(() => {
             
           case 'input_audio_buffer.speech_started':
             console.log('Speech detected');
+            // Cancel pending paragraph break timer (speech resumed before threshold reached)
+            if (paragraphBreakTimer) {
+              clearTimeout(paragraphBreakTimer);
+              paragraphBreakTimer = null;
+              console.log('⏹️ Cancelled pending paragraph break timer (speech resumed)');
+            }
+            // Reset accumulated silence when speech starts
+            accumulatedSilenceDuration = 0;
+
             clientWs.send(JSON.stringify({
               type: 'speech_started',
               audio_start_ms: message.audio_start_ms
@@ -354,17 +394,60 @@ app.prepare().then(() => {
             break;
             
           case 'input_audio_buffer.speech_stopped':
-            console.log('Speech ended');
+            // VAD fires speech_stopped after detecting vadSilenceDuration ms of silence
+            // Use the larger of: accumulated silence OR vadSilenceDuration (VAD's minimum)
+            const silenceGapMs = Math.max(accumulatedSilenceDuration, vadSilenceDuration);
+            console.log(`Speech ended (accumulated: ${accumulatedSilenceDuration.toFixed(0)}ms, VAD min: ${vadSilenceDuration}ms, using: ${silenceGapMs.toFixed(0)}ms, paragraph threshold: ${paragraphBreakThreshold}ms)`);
+
+            // Send speech_stopped to client immediately
             clientWs.send(JSON.stringify({
               type: 'speech_stopped',
               audio_end_ms: message.audio_end_ms,
-              marker: speechBreakDetection ? speechBreakMarker : null
+              marker: speechBreakDetection ? speechBreakMarker : null,
+              silence_gap_ms: silenceGapMs,
+              silence_threshold_ms: paragraphBreakThreshold
             }));
 
-            // Create paragraph break to Hocuspocus document if enabled
-            if (speechBreakDetection && currentSessionId) {
-              console.log('🔸 Creating paragraph break in document');
-              createParagraphBreak(currentSessionId, speechBreakMarker);
+            // For paragraph breaks: if current silence is already enough, insert immediately
+            // Otherwise, set a timer to wait for more silence and insert if speech doesn't resume
+            if (speechBreakDetection && silenceGapMs >= paragraphBreakThreshold) {
+              console.log(`🔸 Immediate paragraph break (silence: ${silenceGapMs.toFixed(0)}ms >= threshold: ${paragraphBreakThreshold}ms)`);
+              // Send marker to client for text display
+              clientWs.send(JSON.stringify({
+                type: 'paragraph_break',
+                marker: speechBreakMarker
+              }));
+              if (currentSessionId) {
+                createParagraphBreak(currentSessionId, speechBreakMarker);
+                // Auto-rewrite the completed paragraph if enabled
+                if (autoRewriteOnParagraphBreak) {
+                  autoRewriteLastParagraph(currentSessionId, clientWs);
+                }
+              }
+            } else if (speechBreakDetection && paragraphBreakThreshold > vadSilenceDuration) {
+              // Set a delayed timer to insert paragraph break if silence continues
+              const remainingWaitMs = paragraphBreakThreshold - silenceGapMs;
+              console.log(`⏳ Waiting ${remainingWaitMs}ms more for paragraph break...`);
+
+              // Store the timer so we can cancel it if speech_started fires
+              if (paragraphBreakTimer) {
+                clearTimeout(paragraphBreakTimer);
+              }
+              paragraphBreakTimer = setTimeout(() => {
+                console.log(`🔸 Delayed paragraph break after ${paragraphBreakThreshold}ms total silence`);
+                clientWs.send(JSON.stringify({
+                  type: 'paragraph_break',
+                  marker: speechBreakMarker
+                }));
+                if (currentSessionId) {
+                  createParagraphBreak(currentSessionId, speechBreakMarker);
+                  // Auto-rewrite the completed paragraph if enabled
+                  if (autoRewriteOnParagraphBreak) {
+                    autoRewriteLastParagraph(currentSessionId, clientWs);
+                  }
+                }
+                paragraphBreakTimer = null;
+              }, remainingWaitMs);
             }
             // Clear transcription status (will be confirmed in transcription_completed)
             if (currentSessionId) {
@@ -555,22 +638,28 @@ app.prepare().then(() => {
             break;
             
           case 'set_vad_params':
-            // Update VAD parameters
+            // Update VAD parameters (with validation to prevent null values)
+            // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間
             if (message.enabled !== undefined) {
               vadEnabled = message.enabled;
               console.log('🎛️ VAD enabled set to:', vadEnabled);
             }
-            if (message.threshold !== undefined) {
-              vadThreshold = message.threshold;
+            if (message.threshold !== undefined && message.threshold !== null && typeof message.threshold === 'number') {
+              vadThreshold = Math.max(0.0, Math.min(1.0, Number(message.threshold))); // Ensure number and clamp to 0.0-1.0
               console.log('🎛️ VAD threshold set to:', vadThreshold);
             }
-            if (message.silence_duration_ms !== undefined) {
-              vadSilenceDuration = message.silence_duration_ms;
-              console.log('🎛️ VAD silence duration set to:', vadSilenceDuration + 'ms');
+            if (message.silence_duration_ms !== undefined && message.silence_duration_ms !== null && typeof message.silence_duration_ms === 'number') {
+              vadSilenceDuration = Math.max(200, Math.min(10000, Number(message.silence_duration_ms))); // Ensure number and clamp to valid range
+              console.log('🎛️ VAD発話終了判定時間 set to:', vadSilenceDuration + 'ms');
             }
-            if (message.prefix_padding_ms !== undefined) {
-              vadPrefixPadding = message.prefix_padding_ms;
+            if (message.prefix_padding_ms !== undefined && message.prefix_padding_ms !== null && typeof message.prefix_padding_ms === 'number') {
+              vadPrefixPadding = Math.max(0, Math.min(2000, Number(message.prefix_padding_ms))); // Ensure number and clamp to 0-2000
               console.log('🎛️ VAD prefix padding set to:', vadPrefixPadding + 'ms');
+            }
+            // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入
+            if (message.paragraph_break_threshold_ms !== undefined && message.paragraph_break_threshold_ms !== null && typeof message.paragraph_break_threshold_ms === 'number') {
+              paragraphBreakThreshold = Math.max(500, Math.min(30000, Number(message.paragraph_break_threshold_ms))); // Ensure number and clamp to 500-30000
+              console.log('📝 パラグラフ区切り判定時間 set to:', paragraphBreakThreshold + 'ms');
             }
 
             // Update session configuration with new VAD parameters
@@ -581,6 +670,14 @@ app.prepare().then(() => {
               console.log('🔄 Updating OpenAI session with new VAD parameters...');
               openaiWs.send(JSON.stringify(sessionConfig));
               console.log('✅ Session updated with VAD parameters');
+            }
+            break;
+
+          case 'set_auto_rewrite':
+            // Update auto-rewrite on paragraph break setting
+            if (message.enabled !== undefined) {
+              autoRewriteOnParagraphBreak = message.enabled;
+              console.log('🔄 Auto-rewrite on paragraph break:', autoRewriteOnParagraphBreak ? 'enabled' : 'disabled');
             }
             break;
 
@@ -608,7 +705,11 @@ app.prepare().then(() => {
             
             // Validate audio data first
             const audioData = Buffer.from(message.audio, 'base64');
-            const int16Array = new Int16Array(audioData.buffer, audioData.byteOffset, audioData.length / 2);
+            // Node.js Bufferの共有プール問題とbyteOffsetアライメント問題を回避
+            // audioData.bufferは共有プールを指す可能性があり、byteOffsetが2バイト境界でない場合、
+            // Int16Arrayの読み取りが正しく動作しない
+            const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.length);
+            const int16Array = new Int16Array(arrayBuffer);
             // Use loop instead of spread operator to avoid stack overflow with large arrays
             let maxSample = 0;
             let sumSample = 0;
@@ -622,8 +723,18 @@ app.prepare().then(() => {
             audioChunkCount++;
 
             // Log silent audio chunks but don't skip (for accurate VAD detection)
+            // Track accumulated silence duration for paragraph break detection
+            const sampleDurationMs = (audioData.length / 2 / 24000) * 1000; // ms per chunk at 24kHz
             if (maxSample < 100) {
-              console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample} (sending anyway for VAD accuracy)`);
+              // Silent chunk - accumulate silence duration
+              accumulatedSilenceDuration += sampleDurationMs;
+              console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample}, accumulated silence=${accumulatedSilenceDuration.toFixed(0)}ms`);
+            } else {
+              // Voice detected - reset accumulated silence
+              if (accumulatedSilenceDuration > 0) {
+                console.log(`🎤 Voice detected - resetting accumulated silence (was ${accumulatedSilenceDuration.toFixed(0)}ms)`);
+              }
+              accumulatedSilenceDuration = 0;
             }
 
             // Track audio buffer duration for all chunks (including silent)
@@ -1037,28 +1148,36 @@ app.prepare().then(() => {
         const hasContent = fragment.length > 0;
         
         if (hasContent) {
-          // Get the last paragraph and append the marker to its end
-          const lastParagraph = fragment.get(fragment.length - 1);
-          if (lastParagraph && lastParagraph instanceof (require('yjs')).XmlElement) {
-            // Find or create text node in the last paragraph to append marker
-            let lastTextNode = null;
-            for (let i = lastParagraph.length - 1; i >= 0; i--) {
-              const child = lastParagraph.get(i);
-              if (child instanceof (require('yjs')).XmlText) {
-                lastTextNode = child;
-                break;
+          // ⏎は新段落のみ作成し、マーカー文字は追加しない（改行記号なので）
+          // それ以外のマーカー（↩️, 🔄, 📝など）はテキストとして追加後、新段落を作成
+          const isNewlineMarker = marker === '⏎';
+
+          if (!isNewlineMarker) {
+            // Get the last paragraph and append the marker to its end
+            const lastParagraph = fragment.get(fragment.length - 1);
+            if (lastParagraph && lastParagraph instanceof (require('yjs')).XmlElement) {
+              // Find or create text node in the last paragraph to append marker
+              let lastTextNode = null;
+              for (let i = lastParagraph.length - 1; i >= 0; i--) {
+                const child = lastParagraph.get(i);
+                if (child instanceof (require('yjs')).XmlText) {
+                  lastTextNode = child;
+                  break;
+                }
               }
+              if (lastTextNode) {
+                // Append marker to existing text
+                lastTextNode.insert(lastTextNode.length, ' ' + marker);
+              } else {
+                // Create new text node with marker
+                const newTextNode = new (require('yjs')).XmlText();
+                newTextNode.insert(0, ' ' + marker);
+                lastParagraph.insert(lastParagraph.length, [newTextNode]);
+              }
+              console.log(`[Hocuspocus Integration] ✅ Marker '${marker}' appended to last paragraph in '${fieldName}'`);
             }
-            if (lastTextNode) {
-              // Append marker to existing text
-              lastTextNode.insert(lastTextNode.length, ' ' + marker);
-            } else {
-              // Create new text node with marker
-              const newTextNode = new (require('yjs')).XmlText();
-              newTextNode.insert(0, ' ' + marker);
-              lastParagraph.insert(lastParagraph.length, [newTextNode]);
-            }
-            console.log(`[Hocuspocus Integration] ✅ Marker appended to last paragraph in '${fieldName}'`);
+          } else {
+            console.log(`[Hocuspocus Integration] ℹ️ Newline marker '${marker}' - skipping text append, creating new paragraph only`);
           }
 
           // Create a new empty paragraph for the next content
@@ -1082,26 +1201,212 @@ app.prepare().then(() => {
     }
   }
 
+  // Function to get the text of the last (completed) paragraph from Hocuspocus document
+  function getLastParagraphText(sessionId) {
+    try {
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+
+      if (!document) {
+        console.log(`[Auto-Rewrite] ⚠️ Document not found: ${roomName}`);
+        return null;
+      }
+
+      const fieldName = `content-${sessionId}`;
+      const fragment = document.getXmlFragment(fieldName);
+
+      // Get the second-to-last paragraph (the one just completed, before the new empty paragraph)
+      if (fragment.length < 2) {
+        console.log(`[Auto-Rewrite] ⚠️ Not enough paragraphs for rewrite`);
+        return null;
+      }
+
+      const lastCompletedParagraph = fragment.get(fragment.length - 2);
+      if (!lastCompletedParagraph) {
+        return null;
+      }
+
+      // Extract text from the paragraph
+      let paragraphText = '';
+      for (let i = 0; i < lastCompletedParagraph.length; i++) {
+        const child = lastCompletedParagraph.get(i);
+        if (child instanceof (require('yjs')).XmlText) {
+          paragraphText += child.toString();
+        }
+      }
+
+      return paragraphText.trim();
+    } catch (error) {
+      console.error(`[Auto-Rewrite] ❌ Error getting last paragraph text:`, error);
+      return null;
+    }
+  }
+
+  // Function to rewrite text using OpenAI Chat API
+  async function rewriteText(text) {
+    try {
+      const OpenAI = require('openai');
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+      const systemPrompt = `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
+
+校正のルール:
+1. 誤字脱字を修正
+2. 句読点を適切に整理
+3. 明らかに誤った専門用語があれば補完・修正
+4. 文の意味や内容は変更しない
+5. 原文の文体やトーンを維持
+
+修正した文章のみを出力してください。説明は不要です。`;
+
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.3,
+        max_tokens: 2048
+      });
+
+      return response.choices[0]?.message?.content || text;
+    } catch (error) {
+      console.error(`[Auto-Rewrite] ❌ Error rewriting text:`, error);
+      return text; // Return original text on error
+    }
+  }
+
+  // Function to replace the last completed paragraph with rewritten text
+  function replaceLastParagraphText(sessionId, newText) {
+    try {
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+
+      if (!document) {
+        console.log(`[Auto-Rewrite] ⚠️ Document not found: ${roomName}`);
+        return false;
+      }
+
+      const fieldName = `content-${sessionId}`;
+      const fragment = document.getXmlFragment(fieldName);
+
+      if (fragment.length < 2) {
+        return false;
+      }
+
+      const lastCompletedParagraph = fragment.get(fragment.length - 2);
+      if (!lastCompletedParagraph || !(lastCompletedParagraph instanceof (require('yjs')).XmlElement)) {
+        return false;
+      }
+
+      // Clear existing content
+      while (lastCompletedParagraph.length > 0) {
+        lastCompletedParagraph.delete(0, 1);
+      }
+
+      // Add new text
+      const newTextNode = new (require('yjs')).XmlText();
+      newTextNode.insert(0, newText);
+      lastCompletedParagraph.insert(0, [newTextNode]);
+
+      console.log(`[Auto-Rewrite] ✅ Paragraph replaced with rewritten text`);
+      return true;
+    } catch (error) {
+      console.error(`[Auto-Rewrite] ❌ Error replacing paragraph text:`, error);
+      return false;
+    }
+  }
+
+  // Function to auto-rewrite the last paragraph on paragraph break
+  async function autoRewriteLastParagraph(sessionId, clientWs) {
+    try {
+      console.log(`[Auto-Rewrite] 🔄 Starting auto-rewrite for session: ${sessionId}`);
+
+      // Get the text of the last completed paragraph
+      const originalText = getLastParagraphText(sessionId);
+      if (!originalText || originalText.length < 5) {
+        console.log(`[Auto-Rewrite] ⏭️ Skipping rewrite - text too short or empty`);
+        return;
+      }
+
+      console.log(`[Auto-Rewrite] 📝 Original text: "${originalText.substring(0, 50)}..."`);
+
+      // Notify client that rewrite is starting
+      clientWs.send(JSON.stringify({
+        type: 'auto_rewrite_started',
+        originalText: originalText
+      }));
+
+      // Rewrite the text using OpenAI
+      const rewrittenText = await rewriteText(originalText);
+
+      if (rewrittenText !== originalText) {
+        console.log(`[Auto-Rewrite] ✅ Rewritten text: "${rewrittenText.substring(0, 50)}..."`);
+
+        // Replace the paragraph text in the document
+        replaceLastParagraphText(sessionId, rewrittenText);
+
+        // Notify client about the rewrite result
+        clientWs.send(JSON.stringify({
+          type: 'auto_rewrite_completed',
+          originalText: originalText,
+          rewrittenText: rewrittenText
+        }));
+      } else {
+        console.log(`[Auto-Rewrite] ℹ️ No changes needed`);
+        clientWs.send(JSON.stringify({
+          type: 'auto_rewrite_completed',
+          originalText: originalText,
+          rewrittenText: originalText,
+          noChanges: true
+        }));
+      }
+    } catch (error) {
+      console.error(`[Auto-Rewrite] ❌ Error in auto-rewrite:`, error);
+      clientWs.send(JSON.stringify({
+        type: 'auto_rewrite_error',
+        error: error.message
+      }));
+    }
+  }
+
 
   // Function to send dummy audio data from client (localStorage)
   function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress, onComplete, sendInterval = 50) {
     let currentTimeoutId = null;
-    try {
-      console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
 
-      // Convert base64 to buffer
-      const audioBuffer = Buffer.from(base64AudioData, 'base64');
-      console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
+    const startSending = () => {
+      try {
+        console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
 
-      // Check if WebSocket is ready
-      if (openaiWs.readyState !== 1) { // WebSocket.OPEN
-        console.error(`❌ OpenAI WebSocket not ready (state: ${openaiWs.readyState})`);
+        // Convert base64 to buffer
+        const audioBuffer = Buffer.from(base64AudioData, 'base64');
+        console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
+
+        // Double-check WebSocket is ready
+        if (openaiWs.readyState !== 1) { // WebSocket.OPEN
+          console.error(`❌ OpenAI WebSocket not ready after wait (state: ${openaiWs.readyState})`);
+          clientWs.send(JSON.stringify({
+            type: 'error',
+            error: 'WebSocket connection not ready'
+          }));
+          if (onComplete) onComplete();
+          return;
+        }
+
+        // Continue with the rest of the function...
+        sendAudioChunks(audioBuffer);
+      } catch (error) {
+        console.error('[Dummy Audio Data] ❌ Error in startSending:', error);
         clientWs.send(JSON.stringify({
           type: 'error',
-          error: 'WebSocket connection not ready'
+          error: error.message
         }));
-        return;
+        if (onComplete) onComplete();
       }
+    };
+
+    const sendAudioChunks = (audioBuffer) => {
 
       // Calculate total duration (24kHz, 16-bit = 2 bytes per sample)
       const totalSamples = audioBuffer.length / 2;
@@ -1235,20 +1540,63 @@ app.prepare().then(() => {
       }));
 
       sendNextChunk();
-      return currentTimeoutId;
+    };
 
-    } catch (error) {
-      console.error(`[Dummy Audio Data] ❌ Error processing client audio data:`, error);
+    // Wait for OpenAI WebSocket to be ready before sending
+    if (openaiWs.readyState === 1) { // WebSocket.OPEN
+      console.log(`[Dummy Audio Data] ✅ OpenAI WebSocket already open, starting immediately`);
+      startSending();
+    } else if (openaiWs.readyState === 0) { // WebSocket.CONNECTING
+      console.log(`[Dummy Audio Data] ⏳ Waiting for OpenAI WebSocket to connect...`);
+      clientWs.send(JSON.stringify({
+        type: 'status',
+        message: 'OpenAI APIへ接続中...'
+      }));
+
+      const onOpen = () => {
+        console.log(`[Dummy Audio Data] ✅ OpenAI WebSocket connected, starting to send audio`);
+        openaiWs.removeListener('open', onOpen);
+        openaiWs.removeListener('error', onError);
+        startSending();
+      };
+
+      const onError = (error) => {
+        console.error(`[Dummy Audio Data] ❌ OpenAI WebSocket connection error:`, error);
+        openaiWs.removeListener('open', onOpen);
+        openaiWs.removeListener('error', onError);
+        clientWs.send(JSON.stringify({
+          type: 'error',
+          error: 'OpenAI APIへの接続に失敗しました'
+        }));
+        if (onComplete) onComplete();
+      };
+
+      openaiWs.on('open', onOpen);
+      openaiWs.on('error', onError);
+
+      // Timeout after 10 seconds
+      setTimeout(() => {
+        if (openaiWs.readyState !== 1) {
+          openaiWs.removeListener('open', onOpen);
+          openaiWs.removeListener('error', onError);
+          console.error(`[Dummy Audio Data] ❌ OpenAI WebSocket connection timeout`);
+          clientWs.send(JSON.stringify({
+            type: 'error',
+            error: 'OpenAI APIへの接続がタイムアウトしました'
+          }));
+          if (onComplete) onComplete();
+        }
+      }, 10000);
+    } else {
+      console.error(`❌ OpenAI WebSocket in invalid state (state: ${openaiWs.readyState})`);
       clientWs.send(JSON.stringify({
         type: 'error',
-        error: `Failed to process client audio data: ${error.message}`
+        error: 'WebSocket connection not available'
       }));
-      // Reset sending flag on error
-      if (onComplete) {
-        onComplete();
-      }
-      return null;
+      if (onComplete) onComplete();
     }
+
+    return currentTimeoutId;
   }
 
   server.listen(port, hostname, () => {
