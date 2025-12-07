@@ -1,9 +1,59 @@
 "use client";
 
 import React, { useEffect, useState, useRef } from 'react';
-import { EditorContent, useEditor } from '@tiptap/react';
+import { EditorContent, useEditor, Mark } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
+import TurndownService from 'turndown';
+import { marked } from 'marked';
+import { DOMSerializer } from '@tiptap/pm/model';
+
+// Custom UserUnderline Mark - shows colored underline for user edits
+const UserUnderline = Mark.create({
+  name: 'userUnderline',
+
+  addAttributes() {
+    return {
+      color: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-color'),
+        renderHTML: attributes => {
+          if (!attributes.color) {
+            return {};
+          }
+          return {
+            'data-color': attributes.color,
+            style: `text-decoration: underline; text-decoration-color: ${attributes.color}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
+          };
+        },
+      },
+      userId: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-user-id'),
+        renderHTML: attributes => {
+          if (!attributes.userId) {
+            return {};
+          }
+          return {
+            'data-user-id': attributes.userId,
+          };
+        },
+      },
+    };
+  },
+
+  parseHTML() {
+    return [
+      {
+        tag: 'span[data-user-underline]',
+      },
+    ];
+  },
+
+  renderHTML({ HTMLAttributes }) {
+    return ['span', { ...HTMLAttributes, 'data-user-underline': '' }, 0];
+  },
+});
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -67,17 +117,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // AI Rewrite states
   const [isRewriting, setIsRewriting] = useState(false);
-  const [autoRewrite, setAutoRewrite] = useState(false);
   const [showRewriteModal, setShowRewriteModal] = useState(false);
+  const [rewriteModalPhase, setRewriteModalPhase] = useState<'selection' | 'result'>('selection');
+  const [selectedTextForRewrite, setSelectedTextForRewrite] = useState('');
   const [rewriteResult, setRewriteResult] = useState<{ original: string; rewritten: string } | null>(null);
   const [customPrompt, setCustomPrompt] = useState('');
-  const autoRewriteTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Edit highlighting state
   const [highlightEdits, setHighlightEdits] = useState(true);
+  const highlightEditsRef = useRef(highlightEdits);
+  highlightEditsRef.current = highlightEdits;
+
+  // Font size state (prose-xs, prose-sm, prose-base, prose-lg)
+  const [fontSize, setFontSize] = useState<'xs' | 'sm' | 'base' | 'lg'>('sm');
 
   // User info state (initialized with default, updated on client side)
   const [userInfo, setUserInfo] = useState(defaultUserInfo);
+  const userInfoRef = useRef(userInfo);
+  userInfoRef.current = userInfo;
   const [isEditingUserName, setIsEditingUserName] = useState(false);
   const [userNameInput, setUserNameInput] = useState('');
 
@@ -235,6 +292,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       Highlight.configure({
         multicolor: true,
       }),
+      // Add UserUnderline extension for tracking user edits
+      UserUnderline,
       // Add Collaboration when extension is loaded
       ...(CollaborationExtension && ydocRef.current ? [CollaborationExtension.configure({
         document: ydocRef.current,
@@ -257,6 +316,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     editorProps: {
       attributes: {
         class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
+      },
+      // Auto-apply userUnderline mark when typing (if edit tracking is enabled)
+      handleTextInput: (view, from, to, text) => {
+        if (!highlightEditsRef.current) return false;
+
+        const { state } = view;
+        const userUnderlineMark = state.schema.marks.userUnderline;
+        if (!userUnderlineMark) return false;
+
+        const mark = userUnderlineMark.create({
+          color: userInfoRef.current.color,
+          userId: userIdRef.current,
+        });
+
+        const tr = state.tr.insertText(text, from, to);
+        tr.addMark(from, from + text.length, mark);
+        view.dispatch(tr);
+        return true; // Handled
       },
     },
     onUpdate: ({ editor }) => {
@@ -460,22 +537,67 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setIsEditingUserName(false);
   };
 
-  // AI Rewrite function
-  const handleRewrite = async () => {
-    if (!editor || isRewriting) return;
+  // HTML→Markdown変換
+  const htmlToMarkdown = (html: string): string => {
+    const turndownService = new TurndownService({
+      headingStyle: 'atx',
+      codeBlockStyle: 'fenced',
+    });
+    return turndownService.turndown(html);
+  };
 
-    const currentText = editor.getText();
-    if (!currentText.trim()) {
-      alert('テキストがありません');
+  // Markdown→HTML変換
+  const markdownToHtml = (markdown: string): string => {
+    const html = marked.parse(markdown, { async: false }) as string;
+    return html;
+  };
+
+  // 選択範囲のHTMLを取得
+  const getSelectedHtml = (): string => {
+    if (!editor) return '';
+    const { from, to } = editor.state.selection;
+    const slice = editor.state.doc.slice(from, to);
+    const serializer = DOMSerializer.fromSchema(editor.schema);
+    const fragment = serializer.serializeFragment(slice.content);
+    const div = document.createElement('div');
+    div.appendChild(fragment);
+    return div.innerHTML;
+  };
+
+  // AI Rewrite - モーダルを開く
+  const handleRewrite = () => {
+    if (!editor) return;
+
+    // 選択されたテキストを取得
+    const { from, to } = editor.state.selection;
+    const selectedText = editor.state.doc.textBetween(from, to, ' ');
+
+    if (!selectedText.trim()) {
+      alert('テキストを選択してAI再編の範囲を指定してください');
       return;
     }
+
+    // 選択範囲のHTMLを取得してMarkdownに変換
+    const selectedHtml = getSelectedHtml();
+    const markdown = htmlToMarkdown(selectedHtml);
+
+    // モーダルを開く（選択フェーズ）
+    setSelectedTextForRewrite(markdown);
+    setRewriteModalPhase('selection');
+    setRewriteResult(null);
+    setShowRewriteModal(true);
+  };
+
+  // AI Rewrite - 実行
+  const executeRewrite = async () => {
+    if (!editor || isRewriting || !selectedTextForRewrite.trim()) return;
 
     setIsRewriting(true);
     try {
       const response = await fetch('/api/rewrite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: currentText, prompt: customPrompt }),
+        body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
       });
 
       if (!response.ok) {
@@ -484,7 +606,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
       const data = await response.json();
       setRewriteResult({ original: data.original, rewritten: data.rewritten });
-      setShowRewriteModal(true);
+      setRewriteModalPhase('result');
     } catch (error) {
       console.error('[AI Rewrite] Error:', error);
       alert('AI再編に失敗しました');
@@ -493,34 +615,29 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     }
   };
 
-  // Apply rewritten text
+  // Apply rewritten text - 選択範囲を置換（Markdown→HTML変換）
   const applyRewrite = () => {
     if (!editor || !rewriteResult) return;
 
-    editor.commands.setContent(`<p>${rewriteResult.rewritten.replace(/\n/g, '</p><p>')}</p>`);
+    // MarkdownをHTMLに変換
+    const html = markdownToHtml(rewriteResult.rewritten);
+
+    // 現在の選択範囲を置換（選択が変わっていない前提）
+    const { from, to } = editor.state.selection;
+    editor.chain().focus().deleteRange({ from, to }).insertContent(html).run();
+
     setShowRewriteModal(false);
     setRewriteResult(null);
+    setSelectedTextForRewrite('');
   };
 
-  // Auto rewrite timer effect
-  useEffect(() => {
-    if (autoRewrite && editor) {
-      autoRewriteTimerRef.current = setInterval(() => {
-        handleRewrite();
-      }, 30000); // 30 seconds
-    } else {
-      if (autoRewriteTimerRef.current) {
-        clearInterval(autoRewriteTimerRef.current);
-        autoRewriteTimerRef.current = null;
-      }
-    }
-
-    return () => {
-      if (autoRewriteTimerRef.current) {
-        clearInterval(autoRewriteTimerRef.current);
-      }
-    };
-  }, [autoRewrite, editor]);
+  // モーダルを閉じる
+  const closeRewriteModal = () => {
+    setShowRewriteModal(false);
+    setRewriteResult(null);
+    setSelectedTextForRewrite('');
+    setRewriteModalPhase('selection');
+  };
 
   // Early return during SSR - render nothing until mounted on client
   if (!mounted) {
@@ -680,6 +797,18 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               ✏️ 編集追跡
             </button>
+            {/* Font Size Selector */}
+            <select
+              value={fontSize}
+              onChange={(e) => setFontSize(e.target.value as 'xs' | 'sm' | 'base' | 'lg')}
+              className="px-2 py-1 text-sm border border-gray-300 rounded bg-white"
+              title="文字サイズ"
+            >
+              <option value="xs">極小</option>
+              <option value="sm">小</option>
+              <option value="base">中</option>
+              <option value="lg">大</option>
+            </select>
           </div>
           <div className="flex items-center space-x-2">
             <button
@@ -701,15 +830,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               {isRewriting ? '処理中...' : 'AI再編'}
             </button>
-            <label className="flex items-center space-x-1 text-sm text-gray-600">
-              <input
-                type="checkbox"
-                checked={autoRewrite}
-                onChange={(e) => setAutoRewrite(e.target.checked)}
-                className="rounded"
-              />
-              <span>自動(30秒)</span>
-            </label>
           </div>
         </div>
       </div>
@@ -719,7 +839,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="flex gap-4">
         {/* Editor */}
         <div className="flex-1">
-          <div className="bg-white rounded-lg shadow-sm border min-h-[600px]">
+          <div className={`bg-white rounded-lg shadow-sm border min-h-[600px] editor-font-${fontSize}`}>
             <EditorContent editor={editor} />
             {pendingText && (
               <div className="px-4 pb-4">
@@ -805,63 +925,103 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       </div>
 
       {/* AI Rewrite Modal */}
-      {showRewriteModal && rewriteResult && (
+      {showRewriteModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden">
+            {/* ヘッダー */}
             <div className="p-4 border-b">
-              <h3 className="text-lg font-medium text-gray-900">AI再編の結果</h3>
+              <h3 className="text-lg font-medium text-gray-900">
+                {rewriteModalPhase === 'selection' ? 'AI再編 - テキスト選択' : 'AI再編 - プレビュー'}
+              </h3>
             </div>
+
+            {/* コンテンツ */}
             <div className="p-4 overflow-y-auto max-h-[60vh]">
-              <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  カスタムプロンプト（任意）
-                </label>
-                <input
-                  type="text"
-                  value={customPrompt}
-                  onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="例: 専門用語を正確に校正してください"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <h4 className="text-sm font-medium text-gray-700 mb-2">元のテキスト</h4>
-                  <div className="p-3 bg-gray-50 rounded border text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
-                    {rewriteResult.original}
+              {rewriteModalPhase === 'selection' ? (
+                /* 選択フェーズ */
+                <>
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      以下の箇所を選択しています
+                    </label>
+                    <div className="p-3 bg-yellow-50 rounded border border-yellow-200 text-sm whitespace-pre-wrap max-h-40 overflow-y-auto">
+                      {selectedTextForRewrite}
+                    </div>
                   </div>
-                </div>
-                <div>
-                  <h4 className="text-sm font-medium text-gray-700 mb-2">修正後のテキスト</h4>
-                  <div className="p-3 bg-green-50 rounded border border-green-200 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
-                    {rewriteResult.rewritten}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      編集プロンプト（任意）
+                    </label>
+                    <textarea
+                      value={customPrompt}
+                      onChange={(e) => setCustomPrompt(e.target.value)}
+                      placeholder="例: 専門用語を正確に校正してください&#10;例: 敬語に直してください&#10;例: 箇条書きにしてください"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm h-24"
+                    />
                   </div>
-                </div>
-              </div>
+                </>
+              ) : (
+                /* 結果フェーズ */
+                <>
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      編集プロンプト
+                    </label>
+                    <div className="p-2 bg-gray-100 rounded text-sm text-gray-600">
+                      {customPrompt || '（指定なし - デフォルト校正）'}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-700 mb-2">元のテキスト</h4>
+                      <div className="p-3 bg-gray-50 rounded border text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                        {rewriteResult?.original}
+                      </div>
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-700 mb-2">修正後のテキスト</h4>
+                      <div className="p-3 bg-green-50 rounded border border-green-200 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                        {rewriteResult?.rewritten}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
+
+            {/* フッター */}
             <div className="p-4 border-t flex justify-end space-x-3">
               <button
-                onClick={() => {
-                  setShowRewriteModal(false);
-                  setRewriteResult(null);
-                }}
+                onClick={closeRewriteModal}
                 className="px-4 py-2 text-sm text-gray-700 bg-gray-200 rounded hover:bg-gray-300"
               >
                 キャンセル
               </button>
-              <button
-                onClick={handleRewrite}
-                disabled={isRewriting}
-                className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
-              >
-                {isRewriting ? '処理中...' : '再実行'}
-              </button>
-              <button
-                onClick={applyRewrite}
-                className="px-4 py-2 text-sm text-white bg-blue-600 rounded hover:bg-blue-700"
-              >
-                適用
-              </button>
+              {rewriteModalPhase === 'selection' ? (
+                <button
+                  onClick={executeRewrite}
+                  disabled={isRewriting}
+                  className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
+                >
+                  {isRewriting ? '処理中...' : 'AI再編を実行'}
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setRewriteModalPhase('selection')}
+                    disabled={isRewriting}
+                    className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
+                  >
+                    {isRewriting ? '処理中...' : '再実行'}
+                  </button>
+                  <button
+                    onClick={applyRewrite}
+                    className="px-4 py-2 text-sm text-white bg-blue-600 rounded hover:bg-blue-700"
+                  >
+                    適用
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
