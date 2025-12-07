@@ -202,6 +202,7 @@ app.prepare().then(() => {
 
     // Auto-rewrite on paragraph break - automatically rewrite the completed paragraph
     let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
+    let rewriteModel = 'gpt-4o-mini'; // AI再編モデル（gpt-4o-mini, gpt-4o, gpt-4.1-mini, gpt-4.1）
 
     // Auto-commit threshold (milliseconds) - can be adjusted by client
     let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
@@ -421,7 +422,7 @@ app.prepare().then(() => {
                 createParagraphBreak(currentSessionId, speechBreakMarker);
                 // Auto-rewrite the completed paragraph if enabled
                 if (autoRewriteOnParagraphBreak) {
-                  autoRewriteLastParagraph(currentSessionId, clientWs);
+                  autoRewriteLastParagraph(currentSessionId, clientWs, rewriteModel);
                 }
               }
             } else if (speechBreakDetection && paragraphBreakThreshold > vadSilenceDuration) {
@@ -443,7 +444,7 @@ app.prepare().then(() => {
                   createParagraphBreak(currentSessionId, speechBreakMarker);
                   // Auto-rewrite the completed paragraph if enabled
                   if (autoRewriteOnParagraphBreak) {
-                    autoRewriteLastParagraph(currentSessionId, clientWs);
+                    autoRewriteLastParagraph(currentSessionId, clientWs, rewriteModel);
                   }
                 }
                 paragraphBreakTimer = null;
@@ -678,6 +679,20 @@ app.prepare().then(() => {
             if (message.enabled !== undefined) {
               autoRewriteOnParagraphBreak = message.enabled;
               console.log('🔄 Auto-rewrite on paragraph break:', autoRewriteOnParagraphBreak ? 'enabled' : 'disabled');
+            }
+            // Update rewrite model
+            if (message.model) {
+              const validRewriteModels = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1'];
+              if (validRewriteModels.includes(message.model)) {
+                rewriteModel = message.model;
+                console.log('🤖 Rewrite model set to:', rewriteModel);
+              } else {
+                console.error('❌ Invalid rewrite model:', message.model);
+                clientWs.send(JSON.stringify({
+                  type: 'error',
+                  error: `Invalid rewrite model. Use: ${validRewriteModels.join(', ')}`
+                }));
+              }
             }
             break;
 
@@ -1243,7 +1258,7 @@ app.prepare().then(() => {
   }
 
   // Function to rewrite text using OpenAI Chat API
-  async function rewriteText(text) {
+  async function rewriteText(text, model = 'gpt-4o-mini') {
     try {
       const OpenAI = require('openai');
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -1259,8 +1274,9 @@ app.prepare().then(() => {
 
 修正した文章のみを出力してください。説明は不要です。`;
 
+      console.log(`[Auto-Rewrite] 🤖 Using model: ${model}`);
       const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: text }
@@ -1318,9 +1334,9 @@ app.prepare().then(() => {
   }
 
   // Function to auto-rewrite the last paragraph on paragraph break
-  async function autoRewriteLastParagraph(sessionId, clientWs) {
+  async function autoRewriteLastParagraph(sessionId, clientWs, model = 'gpt-4o-mini') {
     try {
-      console.log(`[Auto-Rewrite] 🔄 Starting auto-rewrite for session: ${sessionId}`);
+      console.log(`[Auto-Rewrite] 🔄 Starting auto-rewrite for session: ${sessionId} with model: ${model}`);
 
       // Get the text of the last completed paragraph
       const originalText = getLastParagraphText(sessionId);
@@ -1334,11 +1350,12 @@ app.prepare().then(() => {
       // Notify client that rewrite is starting
       clientWs.send(JSON.stringify({
         type: 'auto_rewrite_started',
-        originalText: originalText
+        originalText: originalText,
+        model: model
       }));
 
       // Rewrite the text using OpenAI
-      const rewrittenText = await rewriteText(originalText);
+      const rewrittenText = await rewriteText(originalText, model);
 
       if (rewrittenText !== originalText) {
         console.log(`[Auto-Rewrite] ✅ Rewritten text: "${rewrittenText.substring(0, 50)}..."`);
