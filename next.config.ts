@@ -13,7 +13,7 @@ if (typeof require !== 'undefined') {
 const nextConfig: NextConfig = {
   // Disable React StrictMode in development to reduce duplicate component mounting
   reactStrictMode: false,
-  
+
   // Custom WebSocket handling
   webpack: (config, { dev }) => {
     if (dev) {
@@ -23,7 +23,7 @@ const nextConfig: NextConfig = {
         aggregateTimeout: 300,
       };
     }
-    
+
     // Fix YJS duplicate import issue
     config.resolve = config.resolve || {};
     config.resolve.alias = {
@@ -31,7 +31,7 @@ const nextConfig: NextConfig = {
       'yjs/dist/yjs.mjs': 'yjs',
       'yjs/dist/yjs.cjs': 'yjs',
     };
-    
+
     return config;
   },
 };
