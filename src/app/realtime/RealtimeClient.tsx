@@ -159,6 +159,7 @@ export default function RealtimeClient() {
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(false);
   const [settingsUpdateMessage, setSettingsUpdateMessage] = useState<string>(''); // 設定更新のフィードバックメッセージ
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
+  const [rewriteModel, setRewriteModel] = useState<string>('gpt-4.1-mini'); // AI再編モデル
 
   // Get current prompt for transcription
   const getCurrentPrompt = useCallback((): string => {
@@ -521,6 +522,27 @@ export default function RealtimeClient() {
 
     // フィードバックメッセージを表示
     setSettingsUpdateMessage('設定を更新しました');
+    setTimeout(() => setSettingsUpdateMessage(''), 3000);
+
+    return true;
+  }, []);
+
+  // AI再編モデルをサーバーに送信する関数
+  const sendRewriteModelToServer = useCallback((model: string) => {
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
+      console.log('[Rewrite Settings] ⚠️ WebSocket not connected, settings will be applied on next connection');
+      return false;
+    }
+
+    const message = {
+      type: 'set_auto_rewrite',
+      model: model
+    };
+
+    websocketRef.current.send(JSON.stringify(message));
+    console.log('[Rewrite Settings] 🤖 Sent rewrite model to server:', model);
+
+    setSettingsUpdateMessage('AI再編モデルを更新しました');
     setTimeout(() => setSettingsUpdateMessage(''), 3000);
 
     return true;
@@ -1763,6 +1785,28 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 {settingsUpdateMessage}
               </div>
             )}
+
+            {/* AI再編モデル設定 */}
+            <div className="mt-6 pt-4 border-t border-gray-200">
+              <h4 className="text-sm font-medium text-gray-700 mb-2">AI再編モデル</h4>
+              <select
+                value={rewriteModel}
+                onChange={(e) => {
+                  const newModel = e.target.value;
+                  setRewriteModel(newModel);
+                  sendRewriteModelToServer(newModel);
+                }}
+                className="block w-full px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+              >
+                <option value="gpt-4.1-mini">GPT-4.1 Mini（高速・低コスト）</option>
+                <option value="gpt-4.1">GPT-4.1（高精度）</option>
+                <option value="gpt-4o-mini">GPT-4o Mini</option>
+                <option value="gpt-4o">GPT-4o</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                共同校正画面でのAI再編に使用するモデル
+              </p>
+            </div>
           </div>
         </div>
 
@@ -1833,6 +1877,11 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   ? `音声入力停止後${autoDisconnectDelay}秒で自動切断されます`
                   : '音声入力開始時に自動的に接続され、停止後に自動切断されます'}
               </p>
+
+              {/* 60分セッション制限の注意 */}
+              <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
+                <span className="font-medium">注意:</span> OpenAI Realtime APIは1セッション最大60分です。60分を超えると自動切断されます。再度「音声入力で文字おこし」を押して再接続してください。
+              </div>
             </div>
           </div>
 

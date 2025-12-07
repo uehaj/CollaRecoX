@@ -89,3 +89,52 @@ body {
     box-shadow: inset 0 0 0 0 transparent;
   }
 }
+
+/* Editor Font Size Styles */
+.editor-font-xs .prose {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  max-width: 100%;  /* 極小: 幅いっぱい（多くの文字） */
+}
+.editor-font-xs .prose h1, .editor-font-xs .prose h2, .editor-font-xs .prose h3 {
+  font-size: 1rem;
+  line-height: 1.3;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+
+.editor-font-sm .prose {
+  font-size: 0.875rem;
+  line-height: 1.6;
+  max-width: 85ch;  /* 小: やや広め */
+}
+.editor-font-sm .prose h1, .editor-font-sm .prose h2, .editor-font-sm .prose h3 {
+  font-size: 1.125rem;
+  line-height: 1.3;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+
+.editor-font-base .prose {
+  font-size: 1rem;
+  line-height: 1.7;
+  max-width: 70ch;  /* 中: 標準的な読みやすさ */
+}
+.editor-font-base .prose h1, .editor-font-base .prose h2, .editor-font-base .prose h3 {
+  font-size: 1.25rem;
+  line-height: 1.3;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+
+.editor-font-lg .prose {
+  font-size: 1.125rem;
+  line-height: 1.8;
+  max-width: 60ch;  /* 大: 狭め（少ない文字） */
+}
+.editor-font-lg .prose h1, .editor-font-lg .prose h2, .editor-font-lg .prose h3 {
+  font-size: 1.5rem;
+  line-height: 1.3;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
