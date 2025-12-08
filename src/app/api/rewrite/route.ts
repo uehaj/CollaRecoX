@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+
+// プロキシ設定を取得
+const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+const httpAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  httpAgent: httpAgent,
 });
 
 // AI再編エージェントのAPIエンドポイント
@@ -33,7 +39,7 @@ ${prompt ? `追加の指示: ${prompt}` : ''}
 修正した文章のみを出力してください。説明は不要です。`;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
