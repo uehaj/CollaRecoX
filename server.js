@@ -202,7 +202,7 @@ app.prepare().then(() => {
 
     // Auto-rewrite on paragraph break - automatically rewrite the completed paragraph
     let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
-    let rewriteModel = 'gpt-4o-mini'; // AI再編モデル（gpt-4o-mini, gpt-4o, gpt-4.1-mini, gpt-4.1）
+    let rewriteModel = 'gpt-4.1-mini'; // AI再編モデル（デフォルト: gpt-4.1-mini）
 
     // Auto-commit threshold (milliseconds) - can be adjusted by client
     let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
