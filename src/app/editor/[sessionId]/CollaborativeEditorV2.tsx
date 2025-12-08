@@ -4,9 +4,11 @@ import React, { useEffect, useState, useRef } from 'react';
 import { EditorContent, useEditor, Mark } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
+import Link from '@tiptap/extension-link';
 import TurndownService from 'turndown';
 import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
+import * as Diff from 'diff';
 
 // Custom UserUnderline Mark - shows colored underline for user edits
 const UserUnderline = Mark.create({
@@ -122,6 +124,25 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [selectedTextForRewrite, setSelectedTextForRewrite] = useState('');
   const [rewriteResult, setRewriteResult] = useState<{ original: string; rewritten: string } | null>(null);
   const [customPrompt, setCustomPrompt] = useState('');
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
+
+  // Markdown Edit states
+  const [showMarkdownModal, setShowMarkdownModal] = useState(false);
+  const [markdownText, setMarkdownText] = useState('');
+
+  // AI Rewrite - 定義済みテンプレート
+  const promptTemplates = [
+    { label: '見出し追加', prompt: 'パラグラフごとに内容に応じた見出しを追加する' },
+    { label: 'パラグラフ分割', prompt: '内容をもとにしてパラグラフに分割する' },
+    { label: '文の結合', prompt: '文が不要な句読点でとぎれている場合、それを結合して1文にする' },
+    { label: '誤字脱字修正', prompt: '誤字脱字を修正する' },
+    { label: '句読点整理', prompt: '句読点を適切な位置に配置し直す' },
+    { label: '敬語に変換', prompt: '文章を敬語（です・ます調）に変換する' },
+    { label: '箇条書き化', prompt: '内容を箇条書きに変換する' },
+    { label: '要約', prompt: '内容を簡潔に要約する' },
+    { label: '日時挿入', prompt: '文章の先頭に現在日時を挿入する' },
+    { label: 'URL→リンク', prompt: 'URLらしい文字列をMarkdownのリンク形式[テキスト](URL)に変換する' },
+  ];
 
   // Edit highlighting state
   const [highlightEdits, setHighlightEdits] = useState(true);
@@ -169,6 +190,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
     const colorIndex = userId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % userColors.length;
     setUserInfo({ name: userName, color: userColors[colorIndex] });
+
+    // プロンプト履歴を読み込み
+    const savedHistory = localStorage.getItem('ai-rewrite-prompt-history');
+    if (savedHistory) {
+      try {
+        const parsed = JSON.parse(savedHistory);
+        if (Array.isArray(parsed)) {
+          setPromptHistory(parsed.slice(0, 10)); // 最大10件
+        }
+      } catch (e) {
+        console.error('Failed to parse prompt history:', e);
+      }
+    }
   }, [mounted]);
 
   // Initialize Y.Doc and load Collaboration extensions - dynamically import to avoid SSR localStorage issues
@@ -294,6 +328,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       }),
       // Add UserUnderline extension for tracking user edits
       UserUnderline,
+      // Add Link extension for handling links
+      Link.configure({
+        openOnClick: true,
+        autolink: true,
+        HTMLAttributes: {
+          class: 'text-blue-600 underline hover:text-blue-800',
+        },
+      }),
       // Add Collaboration when extension is loaded
       ...(CollaborationExtension && ydocRef.current ? [CollaborationExtension.configure({
         document: ydocRef.current,
@@ -548,8 +590,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Markdown→HTML変換
   const markdownToHtml = (markdown: string): string => {
-    const html = marked.parse(markdown, { async: false }) as string;
-    return html;
+    // markedの設定: GFM有効、改行をbrに変換
+    const html = marked.parse(markdown, {
+      async: false,
+      gfm: true,
+      breaks: true,
+    }) as string;
+    // 末尾の余分な改行を削除
+    return html.trim();
   };
 
   // 選択範囲のHTMLを取得
@@ -592,6 +640,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const executeRewrite = async () => {
     if (!editor || isRewriting || !selectedTextForRewrite.trim()) return;
 
+    // プロンプトは必須
+    if (!customPrompt.trim()) {
+      alert('編集プロンプトを入力してください');
+      return;
+    }
+
     setIsRewriting(true);
     try {
       const response = await fetch('/api/rewrite', {
@@ -607,6 +661,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       const data = await response.json();
       setRewriteResult({ original: data.original, rewritten: data.rewritten });
       setRewriteModalPhase('result');
+
+      // プロンプト履歴に保存（重複排除、最大10件）
+      const trimmedPrompt = customPrompt.trim();
+      const newHistory = [trimmedPrompt, ...promptHistory.filter(p => p !== trimmedPrompt)].slice(0, 10);
+      setPromptHistory(newHistory);
+      localStorage.setItem('ai-rewrite-prompt-history', JSON.stringify(newHistory));
     } catch (error) {
       console.error('[AI Rewrite] Error:', error);
       alert('AI再編に失敗しました');
@@ -637,6 +697,43 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setRewriteResult(null);
     setSelectedTextForRewrite('');
     setRewriteModalPhase('selection');
+  };
+
+  // Markdown Edit - 開く
+  const handleMarkdownEdit = () => {
+    if (!editor) return;
+
+    // 選択範囲のHTMLを取得してMarkdownに変換
+    const selectedHtml = getSelectedHtml();
+    if (!selectedHtml.trim()) {
+      alert('テキストを選択してMarkdown編集の範囲を指定してください');
+      return;
+    }
+
+    const markdown = htmlToMarkdown(selectedHtml);
+    setMarkdownText(markdown);
+    setShowMarkdownModal(true);
+  };
+
+  // Markdown Edit - 適用
+  const applyMarkdownEdit = () => {
+    if (!editor) return;
+
+    // MarkdownをHTMLに変換
+    const html = markdownToHtml(markdownText);
+
+    // 現在の選択範囲を置換
+    const { from, to } = editor.state.selection;
+    editor.chain().focus().deleteRange({ from, to }).insertContent(html).run();
+
+    setShowMarkdownModal(false);
+    setMarkdownText('');
+  };
+
+  // Markdown Edit - モーダルを閉じる
+  const closeMarkdownModal = () => {
+    setShowMarkdownModal(false);
+    setMarkdownText('');
   };
 
   // Early return during SSR - render nothing until mounted on client
@@ -790,13 +887,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               🖍 ハイライト
             </button>
-            <button
-              onClick={() => setHighlightEdits(!highlightEdits)}
-              className={`px-3 py-1 text-sm rounded ${highlightEdits ? 'bg-orange-500 text-white' : 'bg-gray-200 text-gray-700'}`}
-              title="編集時に自動でハイライトを付ける"
-            >
-              ✏️ 編集追跡
-            </button>
+            <label className="flex items-center space-x-1 text-sm text-gray-600" title="他者の編集を下線で表示">
+              <input
+                type="checkbox"
+                checked={highlightEdits}
+                onChange={(e) => setHighlightEdits(e.target.checked)}
+                className="rounded"
+              />
+              <span>下線表示</span>
+            </label>
             {/* Font Size Selector */}
             <select
               value={fontSize}
@@ -829,6 +928,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
             >
               {isRewriting ? '処理中...' : 'AI再編'}
+            </button>
+            <button
+              onClick={handleMarkdownEdit}
+              title="選択箇所をMarkdownで編集します"
+              className="px-3 py-1 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors"
+            >
+              Markdown編集
             </button>
           </div>
         </div>
@@ -948,16 +1054,62 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       {selectedTextForRewrite}
                     </div>
                   </div>
+
+                  {/* テンプレート選択 */}
                   <div className="mb-4">
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      編集プロンプト（任意）
+                      テンプレートから選択
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      {promptTemplates.map((template, index) => (
+                        <button
+                          key={index}
+                          onClick={() => setCustomPrompt(prev => prev ? `${prev}\n${template.prompt}` : template.prompt)}
+                          className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
+                        >
+                          {template.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 履歴選択 */}
+                  {promptHistory.length > 0 && (
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        履歴から選択
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        {promptHistory.map((prompt, index) => (
+                          <button
+                            key={index}
+                            onClick={() => setCustomPrompt(prompt)}
+                            className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors max-w-xs truncate"
+                            title={prompt}
+                          >
+                            {prompt.length > 20 ? prompt.substring(0, 20) + '...' : prompt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* プロンプト入力 */}
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      編集プロンプト <span className="text-red-500">*</span>
                     </label>
                     <textarea
                       value={customPrompt}
                       onChange={(e) => setCustomPrompt(e.target.value)}
-                      placeholder="例: 専門用語を正確に校正してください&#10;例: 敬語に直してください&#10;例: 箇条書きにしてください"
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm h-24"
+                      placeholder="どのように編集するか指示を入力してください"
+                      className={`w-full px-3 py-2 border rounded-md text-sm h-24 ${
+                        !customPrompt.trim() ? 'border-red-300 bg-red-50' : 'border-gray-300'
+                      }`}
                     />
+                    {!customPrompt.trim() && (
+                      <p className="text-xs text-red-500 mt-1">編集プロンプトは必須です</p>
+                    )}
                   </div>
                 </>
               ) : (
@@ -965,23 +1117,59 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 <>
                   <div className="mb-4">
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      編集プロンプト
+                      使用した編集プロンプト
                     </label>
-                    <div className="p-2 bg-gray-100 rounded text-sm text-gray-600">
-                      {customPrompt || '（指定なし - デフォルト校正）'}
+                    <div className="p-2 bg-purple-50 border border-purple-200 rounded text-sm text-purple-800">
+                      {customPrompt}
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">元のテキスト</h4>
+                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                        元のテキスト
+                        <span className="ml-2 text-xs text-red-500">（削除部分に<span className="line-through">取り消し線</span>）</span>
+                      </h4>
                       <div className="p-3 bg-gray-50 rounded border text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
-                        {rewriteResult?.original}
+                        {rewriteResult && (() => {
+                          const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
+                          return diff.map((part, index) => {
+                            if (part.added) {
+                              return null; // 追加部分は元のテキストには表示しない
+                            }
+                            if (part.removed) {
+                              return (
+                                <span key={index} className="bg-red-100 text-red-800 line-through">
+                                  {part.value}
+                                </span>
+                              );
+                            }
+                            return <span key={index}>{part.value}</span>;
+                          });
+                        })()}
                       </div>
                     </div>
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">修正後のテキスト</h4>
+                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                        修正後のテキスト
+                        <span className="ml-2 text-xs text-green-600">（追加部分に<span className="underline decoration-green-500 decoration-2">下線</span>）</span>
+                      </h4>
                       <div className="p-3 bg-green-50 rounded border border-green-200 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
-                        {rewriteResult?.rewritten}
+                        {rewriteResult && (() => {
+                          const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
+                          return diff.map((part, index) => {
+                            if (part.removed) {
+                              return null; // 削除部分は修正後には表示しない
+                            }
+                            if (part.added) {
+                              return (
+                                <span key={index} className="bg-green-100 text-green-800 underline decoration-green-500 decoration-2">
+                                  {part.value}
+                                </span>
+                              );
+                            }
+                            return <span key={index}>{part.value}</span>;
+                          });
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -1000,8 +1188,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               {rewriteModalPhase === 'selection' ? (
                 <button
                   onClick={executeRewrite}
-                  disabled={isRewriting}
-                  className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
+                  disabled={isRewriting || !customPrompt.trim()}
+                  className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
                 >
                   {isRewriting ? '処理中...' : 'AI再編を実行'}
                 </button>
@@ -1022,6 +1210,56 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   </button>
                 </>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Markdown Edit Modal */}
+      {showMarkdownModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
+            {/* ヘッダー */}
+            <div className="p-4 border-b flex justify-between items-center">
+              <h3 className="text-lg font-medium text-gray-900">Markdown編集</h3>
+              <button
+                onClick={closeMarkdownModal}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* コンテンツ */}
+            <div className="p-4 overflow-y-auto flex-1">
+              <p className="text-sm text-gray-600 mb-3">
+                選択箇所をMarkdown形式で編集できます。リンクや基本的なHTMLタグの挿入が可能です。
+              </p>
+              <textarea
+                value={markdownText}
+                onChange={(e) => setMarkdownText(e.target.value)}
+                className="w-full h-64 px-3 py-2 border border-gray-300 rounded-md font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="Markdownを入力..."
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                例: **太字**, *斜体*, [リンク](URL), # 見出し, - リスト
+              </p>
+            </div>
+
+            {/* フッター */}
+            <div className="p-4 border-t flex justify-end gap-2">
+              <button
+                onClick={closeMarkdownModal}
+                className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded hover:bg-gray-200"
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={applyMarkdownEdit}
+                className="px-4 py-2 text-sm text-white bg-indigo-600 rounded hover:bg-indigo-700"
+              >
+                適用
+              </button>
             </div>
           </div>
         </div>
