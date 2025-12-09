@@ -118,6 +118,15 @@ export default function RealtimeClient() {
     textRef.current = text;
   }, [text]);
 
+  // Initialize session ID on component mount
+  useEffect(() => {
+    if (!currentSessionId) {
+      const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      setCurrentSessionId(newSessionId);
+      console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+    }
+  }, []); // Empty dependency array - runs only once on mount
+
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false); // 接続中の状態

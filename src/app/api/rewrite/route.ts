@@ -1,15 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import fetch from 'node-fetch';
 
 // プロキシ設定を取得
 const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
-const httpAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  httpAgent: httpAgent,
-});
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  fetch: proxyUrl ? (url: any, init: any) => {
+    const agent = new HttpsProxyAgent(proxyUrl);
+    return fetch(url, { ...init, agent });
+  } : undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+} as any);
 
 // AI再編エージェントのAPIエンドポイント
 // テキストを受け取り、誤字修正、句読点整理、専門用語補完を行う
