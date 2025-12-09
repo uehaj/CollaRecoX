@@ -138,6 +138,16 @@ echo "🎤 Realtime API: ws://localhost:8888/api/realtime-ws"
 echo "📡 Hocuspocus: ws://localhost:8888/api/yjs-ws"
 echo ""
 
+# Build the project for production
+echo "🔨 Building project for production..."
+npm run build
+if [ $? -ne 0 ]; then
+    echo "❌ Build failed"
+    exit 1
+fi
+echo "✅ Build completed successfully"
+echo ""
+
 # Start production server with or without logging
 if [ "$ENABLE_LOG" = true ]; then
     echo "📋 Server logs will be saved to: $LOG_FILE"
