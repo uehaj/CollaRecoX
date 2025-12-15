@@ -130,6 +130,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [showMarkdownModal, setShowMarkdownModal] = useState(false);
   const [markdownText, setMarkdownText] = useState('');
 
+  // Force Commit state
+  const [isForceCommitPending, setIsForceCommitPending] = useState(false);
+
   // AI Rewrite - 定義済みテンプレート
   const promptTemplates = [
     { label: '見出し追加', prompt: 'パラグラフごとに内容に応じた見出しを追加する' },
@@ -736,6 +739,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setMarkdownText('');
   };
 
+  // Force Commit - 音声バッファを強制的にコミット
+  const handleForceCommit = () => {
+    if (!ydocRef.current || isForceCommitPending || !isTranscribing) return;
+
+    setIsForceCommitPending(true);
+    const statusMap = ydocRef.current.getMap(`status-${sessionId}`);
+    statusMap.set('forceCommit', true);
+    console.log('[Editor] 🎤 Force commit requested');
+
+    // 1秒後にボタンを再有効化（デバウンス）
+    setTimeout(() => setIsForceCommitPending(false), 1000);
+  };
+
   // Early return during SSR - render nothing until mounted on client
   if (!mounted) {
     return (
@@ -935,6 +951,18 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               className="px-3 py-1 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors"
             >
               Markdown編集
+            </button>
+            <button
+              onClick={handleForceCommit}
+              disabled={!isTranscribing || isForceCommitPending}
+              title="現在の認識バッファを強制的に確定します"
+              className={`px-3 py-1 text-sm rounded transition-colors ${
+                !isTranscribing || isForceCommitPending
+                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  : 'bg-orange-500 text-white hover:bg-orange-600'
+              }`}
+            >
+              {isForceCommitPending ? '送信中...' : '🎤 認識確定'}
             </button>
           </div>
         </div>

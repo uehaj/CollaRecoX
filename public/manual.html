@@ -293,9 +293,33 @@
         <li>リアルタイム音声文字起こし（マイク入力）</li>
         <li>録音データからの文字起こし</li>
         <li>VAD（音声区間検出）による自動文字起こし</li>
-        <li>共同校正機能</li>
+        <li>共同校正機能（リアルタイム同期）</li>
+        <li>AI再編機能（GPT-4による自動編集）</li>
+        <li>Markdown編集機能</li>
         <li>文字起こし結果のコピー・クリア</li>
       </ul>
+
+      <h3>料金目安（OpenAI API）</h3>
+      <div class="warning">
+        料金はOpenAIの価格改定により変更される場合があります。最新の料金は<a href="https://openai.com/api/pricing/" target="_blank">OpenAI公式サイト</a>でご確認ください。
+      </div>
+      <table class="param-table">
+        <tr>
+          <th>機能</th>
+          <th>使用モデル</th>
+          <th>料金目安</th>
+        </tr>
+        <tr>
+          <td>リアルタイム文字起こし</td>
+          <td>GPT-4o Realtime</td>
+          <td>約$0.06〜0.24/分（入力・出力により変動）</td>
+        </tr>
+        <tr>
+          <td>AI再編</td>
+          <td>GPT-4.1-mini（デフォルト）<br>GPT-4o-mini / GPT-4o / GPT-4.1</td>
+          <td>テキスト量により変動（通常は数セント/回）</td>
+        </tr>
+      </table>
     </section>
 
     <section id="quickstart">
@@ -358,21 +382,13 @@
       <div class="step">
         <div class="step-number">7</div>
         <div class="step-content">
-          <h4>サーバーに接続</h4>
-          <p><span class="button-example">Connect</span> ボタンをクリックしてWebSocket接続を確立します。「Connected to Realtime API」と表示されれば接続完了です。</p>
+          <h4>録音開始（自動接続）</h4>
+          <p><span class="button-example green">音声入力で文字起こし</span> ボタンをクリックして録音を開始します。<strong>OpenAI APIへの接続は自動的に行われます</strong>。初回はブラウザからマイクへのアクセス許可を求められるので「許可」をクリックしてください。</p>
         </div>
       </div>
 
       <div class="step">
         <div class="step-number">8</div>
-        <div class="step-content">
-          <h4>録音開始</h4>
-          <p><span class="button-example green">音声入力で文字起こし</span> ボタンをクリックして録音を開始します。初回はブラウザからマイクへのアクセス許可を求められるので「許可」をクリックしてください。</p>
-        </div>
-      </div>
-
-      <div class="step">
-        <div class="step-number">9</div>
         <div class="step-content">
           <h4>文字起こし</h4>
           <p>マイクに向かって話すと、リアルタイムで文字起こしが行われます。結果は「文字起こし結果」エリアに表示されます。</p>
@@ -386,10 +402,10 @@
       </div>
 
       <div class="step">
-        <div class="step-number">10</div>
+        <div class="step-number">9</div>
         <div class="step-content">
           <h4>録音停止</h4>
-          <p><span class="button-example red">⏹ 停止</span> ボタンをクリックして録音を停止します。</p>
+          <p><span class="button-example red">⏹ 停止</span> ボタンをクリックして録音を停止します。停止後30秒で自動的にAPIとの接続が切断されます。</p>
         </div>
       </div>
 
@@ -407,12 +423,15 @@
 
       <h3>操作方法</h3>
       <ol style="margin-left: 20px;">
-        <li><span class="button-example">Connect</span> ボタンをクリックしてサーバーに接続</li>
-        <li>「音声入力からの文字起こし」セクションの <span class="button-example green">音声入力で文字起こし</span> ボタンをクリック</li>
+        <li>「音声入力からの文字起こし」セクションの <span class="button-example green">音声入力で文字起こし</span> ボタンをクリック（自動的にサーバーに接続されます）</li>
         <li>マイクに向かって話す</li>
         <li>文字起こし結果が下部に表示される</li>
-        <li><span class="button-example red">⏹ 停止</span> ボタンで停止</li>
+        <li><span class="button-example red">⏹ 停止</span> ボタンで停止（停止後30秒で自動切断）</li>
       </ol>
+
+      <div class="warning">
+        OpenAI Realtime APIは1セッション最大60分の制限があります。60分を超えると自動的に切断されますので、再度「音声入力で文字起こし」ボタンを押して再接続してください。
+      </div>
 
       <div class="tip">
         録音中も <span class="button-example">📋 コピー</span> ボタンで現在の文字起こし結果をコピーできます。
@@ -633,6 +652,100 @@
         <li>セッションIDを入力欄に入力</li>
         <li><span class="button-example green">参加</span> ボタンをクリック</li>
       </ol>
+
+      <h3>共同編集画面の機能</h3>
+      <p>共同編集画面では、以下の機能が利用できます。</p>
+
+      <h4 style="margin-top: 20px; color: #555;">ツールバー機能</h4>
+      <table class="param-table">
+        <tr>
+          <th>ボタン</th>
+          <th>説明</th>
+        </tr>
+        <tr>
+          <td><span class="button-example">URLをコピー</span></td>
+          <td>共同編集画面のURLをクリップボードにコピー。他のユーザーに共有する際に使用</td>
+        </tr>
+        <tr>
+          <td><span class="button-example green">テキストをコピー</span></td>
+          <td>エディタ内のすべてのテキストをクリップボードにコピー</td>
+        </tr>
+        <tr>
+          <td><span class="button-example" style="background: #9333ea;">AI再編</span></td>
+          <td>選択したテキストをAIで再編集（詳細は下記）</td>
+        </tr>
+        <tr>
+          <td><span class="button-example" style="background: #4f46e5;">Markdown編集</span></td>
+          <td>選択したテキストをMarkdown形式で直接編集（詳細は下記）</td>
+        </tr>
+        <tr>
+          <td>フォントサイズ（小/中/大）</td>
+          <td>エディタのフォントサイズを変更</td>
+        </tr>
+        <tr>
+          <td>編集ハイライト表示</td>
+          <td>他のユーザーの編集箇所を色付き下線で表示（デフォルトON）</td>
+        </tr>
+        <tr>
+          <td><span class="button-example" style="background: #f97316;">🎤 認識確定</span></td>
+          <td>音声バッファを強制的にコミットし、即座に認識結果を取得（文字起こし中のみ有効）</td>
+        </tr>
+      </table>
+
+      <h4 style="margin-top: 25px; color: #555;">AI再編機能</h4>
+      <p>選択したテキストをAI（GPT-4シリーズ）で自動編集できます。</p>
+      <ol style="margin-left: 20px;">
+        <li>編集したいテキストを選択</li>
+        <li><span class="button-example" style="background: #9333ea;">AI再編</span> ボタンをクリック</li>
+        <li>モーダルダイアログで編集プロンプトを入力（必須）</li>
+        <li>テンプレートから選択して追加することも可能</li>
+        <li>「AI再編を実行」をクリック</li>
+        <li>変更箇所がDiff表示（削除は赤＋取り消し線、追加は緑＋下線）されるので確認</li>
+        <li>「適用」で反映、または「戻る」で再編集</li>
+      </ol>
+
+      <p style="margin-top: 15px;"><strong>用意されているテンプレート：</strong></p>
+      <ul style="margin-left: 20px; margin-bottom: 15px;">
+        <li>見出し追加 - パラグラフごとに見出しを追加</li>
+        <li>パラグラフ分割 - 内容をパラグラフに分割</li>
+        <li>文の結合 - 不要な句読点で途切れた文を結合</li>
+        <li>誤字脱字修正 - 誤字脱字を修正</li>
+        <li>句読点整理 - 句読点を適切な位置に配置</li>
+        <li>敬語に変換 - です・ます調に変換</li>
+        <li>箇条書き化 - 内容を箇条書きに変換</li>
+        <li>要約 - 内容を簡潔に要約</li>
+        <li>日時挿入 - 文章の先頭に現在日時を挿入</li>
+        <li>URL→リンク - URLをMarkdownリンク形式に変換</li>
+      </ul>
+
+      <div class="tip">
+        テンプレートは複数組み合わせて使用できます。ボタンをクリックするごとにプロンプトに追記されます。
+      </div>
+
+      <h4 style="margin-top: 25px; color: #555;">Markdown編集機能</h4>
+      <p>選択したテキストをMarkdown形式で直接編集できます。リンクの挿入などに便利です。</p>
+      <ol style="margin-left: 20px;">
+        <li>編集したいテキストを選択</li>
+        <li><span class="button-example" style="background: #4f46e5;">Markdown編集</span> ボタンをクリック</li>
+        <li>テキストがMarkdown形式で表示されるので編集</li>
+        <li>「適用」でHTMLに変換して反映</li>
+      </ol>
+
+      <p style="margin-top: 15px;"><strong>使用可能なMarkdown記法：</strong></p>
+      <ul style="margin-left: 20px; margin-bottom: 15px;">
+        <li><code>**太字**</code> → <strong>太字</strong></li>
+        <li><code>*斜体*</code> → <em>斜体</em></li>
+        <li><code>[リンクテキスト](URL)</code> → リンク</li>
+        <li><code># 見出し</code> → 見出し</li>
+        <li><code>- リスト項目</code> → リスト</li>
+      </ul>
+
+      <h4 style="margin-top: 25px; color: #555;">編集ハイライト</h4>
+      <p>
+        他のユーザーが編集した箇所は、そのユーザーの色で下線表示されます。
+        誰がどの部分を編集したかが一目でわかります。
+        ツールバーのチェックボックスでON/OFFを切り替えられます。
+      </p>
     </section>
 
     <section id="troubleshooting">

@@ -576,6 +576,36 @@ app.prepare().then(() => {
               currentSessionId = message.sessionId;
               console.log(`📋 Set current session ID: ${currentSessionId}`);
               console.log(`[Debug] Session ID successfully stored for Hocuspocus integration`);
+
+              // Set up forceCommit observer on statusMap
+              try {
+                const roomName = `transcribe-editor-v2-${message.sessionId}`;
+                const document = hocuspocus.documents.get(roomName);
+                if (document) {
+                  const statusMap = document.getMap(`status-${message.sessionId}`);
+                  statusMap.observe((event) => {
+                    const forceCommit = statusMap.get('forceCommit');
+                    if (forceCommit === true) {
+                      console.log(`[Yjs] 🎤 Force commit requested for session ${message.sessionId}`);
+                      statusMap.set('forceCommit', false); // Reset immediately
+
+                      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                        openaiWs.send(JSON.stringify({
+                          type: 'input_audio_buffer.commit'
+                        }));
+                        console.log('[Server] 🎤 Force commit sent to OpenAI');
+                      } else {
+                        console.log('[Server] ⚠️ No active OpenAI connection for force commit');
+                      }
+                    }
+                  });
+                  console.log(`[Yjs] 👀 ForceCommit observer set up for session ${message.sessionId}`);
+                } else {
+                  console.log(`[Yjs] ⚠️ Document not found for forceCommit observer: ${roomName}`);
+                }
+              } catch (observerError) {
+                console.error(`[Yjs] ❌ Error setting up forceCommit observer:`, observerError);
+              }
             } else {
               console.log(`[Debug] ❌ set_session_id message received but sessionId is empty:`, message);
             }
