@@ -143,7 +143,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     { label: '敬語に変換', prompt: '文章を敬語（です・ます調）に変換する' },
     { label: '箇条書き化', prompt: '内容を箇条書きに変換する' },
     { label: '要約', prompt: '内容を簡潔に要約する' },
-    { label: '日時挿入', prompt: '文章の先頭に現在日時を挿入する' },
     { label: 'URL→リンク', prompt: 'URLらしい文字列をMarkdownのリンク形式[テキスト](URL)に変換する' },
   ];
 
@@ -962,7 +961,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   : 'bg-orange-500 text-white hover:bg-orange-600'
               }`}
             >
-              {isForceCommitPending ? '送信中...' : '🎤 認識確定'}
+              {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
             </button>
           </div>
         </div>
