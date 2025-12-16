@@ -1048,11 +1048,20 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
   const connectToExistingSession = useCallback(() => {
     if (existingSessionInput.trim()) {
-      const sessionId = existingSessionInput.trim();
+      let sessionId: string;
+
+      // Handle new session creation
+      if (existingSessionInput === '__new__') {
+        sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        console.log('[Session] 🆕 Created new session:', sessionId);
+      } else {
+        sessionId = existingSessionInput.trim();
+        console.log('[Session] 🔗 Connected to existing session:', sessionId);
+      }
+
       setCurrentSessionId(sessionId);
       setExistingSessionInput('');
-      console.log('[Session] 🔗 Connected to existing session:', sessionId);
-      
+
       // Send session ID to server if WebSocket is connected
       if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
         websocketRef.current.send(JSON.stringify({
@@ -1061,7 +1070,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
         }));
         console.log('[WebSocket] 📋 Updated session ID on server:', sessionId);
       }
-      
+
     }
   }, [existingSessionInput]);
 
@@ -1944,18 +1953,20 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
             )}
           </div>
 
-          {/* Connect to Existing Session */}
+          {/* Connect to Session */}
           <div className="mb-4">
             <label className="block text-sm font-medium text-gray-700 mb-2">
-              既存セッションに接続:
+              セッションに接続:
             </label>
             <div className="flex space-x-2">
               <select
                 value={existingSessionInput}
                 onChange={(e) => setExistingSessionInput(e.target.value)}
+                onFocus={fetchSessions}
                 className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
               >
                 <option value="">セッションを選択...</option>
+                <option value="__new__">＋ 新しいセッションを作成</option>
                 {activeSessions.map(s => (
                   <option key={s.sessionId} value={s.sessionId}>
                     {s.sessionId} ({s.connectionCount}人接続中)
@@ -2297,11 +2308,11 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               <div className="flex justify-center pt-2">
                 <button
                   onClick={isDummyAudioSending ? stopDummyAudio : sendDummyAudio}
-                  disabled={isConnecting || (isRecording && !isDummyAudioSending)}
+                  disabled={isConnecting || (isRecording && !isDummyAudioSending) || (!isDummyAudioSending && localStorageRecordings.length === 0)}
                   className={`px-6 py-3 text-sm font-medium rounded-lg transition-colors ${
                     isDummyAudioSending
                       ? "bg-red-600 hover:bg-red-700 text-white"
-                      : isConnecting || (isRecording && !isDummyAudioSending)
+                      : isConnecting || (isRecording && !isDummyAudioSending) || localStorageRecordings.length === 0
                       ? "bg-gray-400 cursor-not-allowed text-gray-200"
                       : "bg-orange-600 hover:bg-orange-700 text-white"
                   }`}
