@@ -212,6 +212,8 @@ app.prepare().then(() => {
 
     // Session management for Hocuspocus integration
     let currentSessionId = null;
+    let forceCommitObserver = null; // Store observer function for cleanup
+    let forceCommitStatusMap = null; // Store statusMap reference for cleanup
 
     // Use Realtime API in transcription-only mode (cost-effective)
     // Connect with mini model, but configure for ASR-only processing
@@ -578,12 +580,24 @@ app.prepare().then(() => {
               console.log(`[Debug] Session ID successfully stored for Hocuspocus integration`);
 
               // Set up forceCommit observer on statusMap
+              // Clean up previous observer if exists
+              if (forceCommitObserver && forceCommitStatusMap) {
+                try {
+                  forceCommitStatusMap.unobserve(forceCommitObserver);
+                  console.log(`[Yjs] 🧹 Cleaned up previous forceCommit observer`);
+                } catch (cleanupError) {
+                  console.warn(`[Yjs] ⚠️ Failed to clean up previous observer:`, cleanupError);
+                }
+              }
+
               try {
                 const roomName = `transcribe-editor-v2-${message.sessionId}`;
                 const document = hocuspocus.documents.get(roomName);
                 if (document) {
                   const statusMap = document.getMap(`status-${message.sessionId}`);
-                  statusMap.observe((event) => {
+
+                  // Create observer function and store reference for cleanup
+                  forceCommitObserver = (event) => {
                     const forceCommit = statusMap.get('forceCommit');
                     if (forceCommit === true) {
                       console.log(`[Yjs] 🎤 Force commit requested for session ${message.sessionId}`);
@@ -598,7 +612,10 @@ app.prepare().then(() => {
                         console.log('[Server] ⚠️ No active OpenAI connection for force commit');
                       }
                     }
-                  });
+                  };
+                  forceCommitStatusMap = statusMap;
+
+                  statusMap.observe(forceCommitObserver);
                   console.log(`[Yjs] 👀 ForceCommit observer set up for session ${message.sessionId}`);
                 } else {
                   console.log(`[Yjs] ⚠️ Document not found for forceCommit observer: ${roomName}`);
@@ -996,6 +1013,17 @@ app.prepare().then(() => {
 
     clientWs.on('close', () => {
       console.log('Client WebSocket disconnected');
+      // Clean up forceCommit observer
+      if (forceCommitObserver && forceCommitStatusMap) {
+        try {
+          forceCommitStatusMap.unobserve(forceCommitObserver);
+          console.log('[Yjs] 🧹 Cleaned up forceCommit observer on disconnect');
+        } catch (cleanupError) {
+          console.warn('[Yjs] ⚠️ Failed to cleanup observer on disconnect:', cleanupError);
+        }
+        forceCommitObserver = null;
+        forceCommitStatusMap = null;
+      }
       if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.close();
       }
@@ -1003,6 +1031,17 @@ app.prepare().then(() => {
 
     clientWs.on('error', (error) => {
       console.error('Client WebSocket error:', error);
+      // Clean up forceCommit observer
+      if (forceCommitObserver && forceCommitStatusMap) {
+        try {
+          forceCommitStatusMap.unobserve(forceCommitObserver);
+          console.log('[Yjs] 🧹 Cleaned up forceCommit observer on error');
+        } catch (cleanupError) {
+          // Ignore cleanup errors
+        }
+        forceCommitObserver = null;
+        forceCommitStatusMap = null;
+      }
       if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.close();
       }
