@@ -2,6 +2,7 @@
   "name": "transcribe",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "node server.js -h 0.0.0.0 -p 8888",
     "build": "next build",
