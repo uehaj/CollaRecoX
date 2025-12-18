@@ -61,3 +61,31 @@ server.pid
 worklog/
 tasks/
 ._.devcontainer
+
+# Spec workflow
+.spec-workflow/
+
+# Backup files
+*.bak
+*.bak2
+*.bak3
+*-old.js
+
+# Test files in root
+*-test.js
+test-*.txt
+
+# Mac resource forks
+._*
+
+# Logs
+nohup.out
+
+# Misc
+transcribe@*
+
+# Service files
+*.service
+
+# PID files
+*.pid
