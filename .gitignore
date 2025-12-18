@@ -56,3 +56,8 @@ a.env~
 .env.local.bak
 working
 server.pid
+
+# Work logs and tasks
+worklog/
+tasks/
+._.devcontainer
