@@ -3,7 +3,7 @@ import type { NextConfig } from "next";
 // Next.jsサーバーサイドでもyjs-lockerを適用
 if (typeof require !== 'undefined') {
   try {
-    require('./yjs-locker');
+    require('./src/util/yjs-locker');
     console.log('[next.config] yjs-locker applied to Next.js');
   } catch (err: any) {
     console.warn('[next.config] Failed to apply yjs-locker:', err?.message || err);
