@@ -204,6 +204,9 @@ app.prepare().then(() => {
     let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
     let rewriteModel = 'gpt-4.1-mini'; // AI再編モデル（デフォルト: gpt-4.1-mini）
 
+    // Force line break at period - adds newline after each Japanese period (。)
+    let forceLineBreakAtPeriod = true; // デフォルト: 有効
+
     // Auto-commit threshold (milliseconds) - can be adjusted by client
     let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
     let autoCommitTimerDelayMs = 3000; // Default: 3 seconds delay before timer-commit
@@ -309,23 +312,30 @@ app.prepare().then(() => {
             audioChunkCount = 0;
             console.log('Buffer reset after transcription completion');
             
+            // Apply force line break at period processing if enabled
+            let processedTranscript = message.transcript;
+            if (forceLineBreakAtPeriod && processedTranscript) {
+              processedTranscript = processedTranscript.replace(/。/g, '。\n');
+              console.log('📝 Applied force line break at period');
+            }
+
             // Send the actual transcription to client
             clientWs.send(JSON.stringify({
               type: 'transcription',
-              text: message.transcript,
+              text: processedTranscript,
               item_id: message.item_id
             }));
 
             // Note: dummy_audio_completed is now sent from sendDummyAudioData when all chunks are sent
 
             // Send text to Hocuspocus document if session is active
-            console.log(`[Debug] currentSessionId: "${currentSessionId}", message.transcript: "${message.transcript}"`);
-            if (currentSessionId && message.transcript) {
-              sendTextToHocuspocusDocument(currentSessionId, message.transcript);
+            console.log(`[Debug] currentSessionId: "${currentSessionId}", processedTranscript: "${processedTranscript}"`);
+            if (currentSessionId && processedTranscript) {
+              sendTextToHocuspocusDocument(currentSessionId, processedTranscript);
               // Clear pending text after transcription is complete
               clearPendingText(currentSessionId);
             } else {
-              console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${message.transcript ? 'HAS_CONTENT' : 'EMPTY'}`);
+              console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${processedTranscript ? 'HAS_CONTENT' : 'EMPTY'}`);
             }
             break;
             
@@ -740,6 +750,14 @@ app.prepare().then(() => {
                   error: `Invalid rewrite model. Use: ${validRewriteModels.join(', ')}`
                 }));
               }
+            }
+            break;
+
+          case 'set_force_line_break':
+            // Update force line break at period setting
+            if (message.enabled !== undefined) {
+              forceLineBreakAtPeriod = message.enabled;
+              console.log('📝 Force line break at period:', forceLineBreakAtPeriod ? 'enabled' : 'disabled');
             }
             break;
 
