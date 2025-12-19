@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unused-vars */
 // --- yjs-locker.js（サーバ起動の最初で読み込む） ---
 const path = require('path');
 const Module = require('module');

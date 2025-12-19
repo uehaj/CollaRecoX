@@ -156,6 +156,7 @@ export default function RealtimeClient() {
   const [batchMultiplier, setBatchMultiplier] = useState<number>(8); // 一括送信する際のバッチ数（デフォルト:8=約1365ms間隔）
   const accumulatedAudioRef = useRef<Int16Array[]>([]); // 蓄積用バッファ
   const [skipSilentChunks, setSkipSilentChunks] = useState<boolean>(false); // 無音チャンクをスキップするかどうか（デフォルト:無効=高精度）
+  const [forceLineBreakAtPeriod, setForceLineBreakAtPeriod] = useState<boolean>(true); // 句点で強制改行（デフォルト: 有効）
   const [recordingElapsedTime, setRecordingElapsedTime] = useState<number>(0);
   const recordingStartTimeRef = useRef<number>(0);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -320,6 +321,13 @@ export default function RealtimeClient() {
       }));
       console.log('[WebSocket] ⏱️ Sent commit threshold:', commitThresholdMs, 'ms (buffer:', audioBufferSize, 'samples × batch:', batchMultiplier, ')');
 
+      // Send force line break at period setting
+      ws.send(JSON.stringify({
+        type: 'set_force_line_break',
+        enabled: forceLineBreakAtPeriod
+      }));
+      console.log('[WebSocket] 📝 Sent force line break at period:', forceLineBreakAtPeriod);
+
         // Promiseを解決して接続完了を通知
         resolve();
       };
@@ -336,6 +344,7 @@ export default function RealtimeClient() {
             
           case 'transcription':
             console.log('[Transcription] 📝 Received text:', message.text);
+            // Server already applies force line break processing
             setText(prev => prev + message.text + ' ');
             // Clear pending text only if it matches the completed item
             if (pendingItemIdRef.current === message.item_id || !message.item_id) {
@@ -467,7 +476,7 @@ export default function RealtimeClient() {
         }
       };
     }); // Promise終了
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod]);
 
   const disconnectWebSocket = useCallback(() => {
     // 自動切断タイマーをクリア
@@ -553,6 +562,24 @@ export default function RealtimeClient() {
 
     setSettingsUpdateMessage('AI再編モデルを更新しました');
     setTimeout(() => setSettingsUpdateMessage(''), 3000);
+
+    return true;
+  }, []);
+
+  // 句点で強制改行設定をサーバーに送信する関数
+  const sendForceLineBreakToServer = useCallback((enabled: boolean) => {
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
+      console.log('[Force Line Break] ⚠️ WebSocket not connected, settings will be applied on next connection');
+      return false;
+    }
+
+    const message = {
+      type: 'set_force_line_break',
+      enabled: enabled
+    };
+
+    websocketRef.current.send(JSON.stringify(message));
+    console.log('[Force Line Break] 📝 Sent force line break setting to server:', enabled);
 
     return true;
   }, []);
@@ -1457,6 +1484,26 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   GPT-4o Transcribe (高精度)
                 </option>
               </select>
+            </div>
+
+            {/* 句点で強制改行 */}
+            <div className="mb-6">
+              <label className="flex items-center">
+                <input
+                  type="checkbox"
+                  checked={forceLineBreakAtPeriod}
+                  onChange={(e) => {
+                    const newValue = e.target.checked;
+                    setForceLineBreakAtPeriod(newValue);
+                    // 接続中なら即座にサーバーに送信
+                    if (isConnected) {
+                      sendForceLineBreakToServer(newValue);
+                    }
+                  }}
+                  className="mr-2 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                />
+                <span className="text-sm text-gray-700">句点で強制改行（。の後に改行を追加）</span>
+              </label>
             </div>
 
             {/* Transcription Prompt Settings */}
