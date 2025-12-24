@@ -9,6 +9,8 @@ import TurndownService from 'turndown';
 import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
 import * as Diff from 'diff';
+import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
+import ShortcutHelpModal from './ShortcutHelpModal';
 
 // Custom UserUnderline Mark - shows colored underline for user edits
 const UserUnderline = Mark.create({
@@ -132,6 +134,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Force Commit state
   const [isForceCommitPending, setIsForceCommitPending] = useState(false);
+
+  // Keyboard Shortcuts state
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
 
   // AI Rewrite - 定義済みテンプレート
   const promptTemplates = [
@@ -751,6 +756,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setTimeout(() => setIsForceCommitPending(false), 1000);
   };
 
+  // Keyboard Shortcuts - キーボードショートカットを有効化
+  useKeyboardShortcuts({
+    onRewrite: handleRewrite,
+    onMarkdownEdit: handleMarkdownEdit,
+    onForceCommit: handleForceCommit,
+    onToggleHistory: () => setShowHistory(!showHistory),
+    onShowHelp: () => setShowShortcutHelp(true),
+  });
+
   // Early return during SSR - render nothing until mounted on client
   if (!mounted) {
     return (
@@ -1291,6 +1305,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
           </div>
         </div>
       )}
+
+      {/* Keyboard Shortcuts Help Modal */}
+      <ShortcutHelpModal
+        isOpen={showShortcutHelp}
+        onClose={() => setShowShortcutHelp(false)}
+      />
     </div>
   );
 }
