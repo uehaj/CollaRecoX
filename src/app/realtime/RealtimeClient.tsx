@@ -7,6 +7,7 @@ type YDocType = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HocuspocusProviderType = any;
 import { getAllRecordings, type AudioRecording } from '@/lib/indexedDB';
+import packageJson from '../../../package.json';
 
 interface PromptPreset {
   id: string;
@@ -1432,6 +1433,9 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               <p className="text-sm text-gray-600 mt-1">OpenAI Realtime APIを使用した音声認識</p>
             </div>
             <div className="flex items-center space-x-3">
+              <div className="text-xs text-gray-400">
+                v{packageJson.version}
+              </div>
               <a
                 href="/dummy-recorder"
                 className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
