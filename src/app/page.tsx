@@ -1,4 +1,5 @@
 import Link from "next/link";
+import packageJson from '../../package.json';
 
 export default function Home() {
   return (
@@ -94,6 +95,9 @@ export default function Home() {
         <p>
           Next.jsとOpenAI APIで構築。
           APIキーは<code className="bg-gray-100 px-1 rounded">.env.local</code>で設定してください。
+        </p>
+        <p className="mt-2 text-xs text-gray-400">
+          Version {packageJson.version}
         </p>
       </footer>
     </div>
