@@ -253,7 +253,7 @@ export default function RealtimeClient() {
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const wsUrl = `${protocol}//${host}/api/realtime-ws`;
+      const wsUrl = `${protocol}//${host}/collarecox/api/realtime-ws`;
       console.log('[WebSocket] 🔗 Connecting to:', wsUrl);
       console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
       const ws = new WebSocket(wsUrl);
@@ -1443,7 +1443,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 録音データ作成
               </a>
               <a
-                href="/manual.html"
+                href="/collarecox/manual.html"
                 className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
                 target="_blank"
                 rel="noopener noreferrer"

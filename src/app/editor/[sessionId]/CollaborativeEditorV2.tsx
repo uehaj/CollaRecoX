@@ -257,7 +257,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // Use the current hostname and port, automatically detecting protocol
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
+      const websocketUrl = `${protocol}//${host}/collarecox/api/yjs-ws`;
       const roomName = `transcribe-editor-v2-${sessionId}`;
 
       console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
