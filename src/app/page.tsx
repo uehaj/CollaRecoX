@@ -1,4 +1,5 @@
 import Link from "next/link";
+import packageJson from '../../package.json';
 
 export default function Home() {
   return (
@@ -35,7 +36,7 @@ export default function Home() {
             </p>
             <div className="mt-4">
               <a
-                href="/manual.html"
+                href="/collarecox/manual.html"
                 className="text-blue-600 hover:text-blue-800 underline text-sm"
                 target="_blank"
                 rel="noopener noreferrer"
@@ -94,6 +95,9 @@ export default function Home() {
         <p>
           Next.jsとOpenAI APIで構築。
           APIキーは<code className="bg-gray-100 px-1 rounded">.env.local</code>で設定してください。
+        </p>
+        <p className="mt-2 text-xs text-gray-400">
+          Version {packageJson.version}
         </p>
       </footer>
     </div>
