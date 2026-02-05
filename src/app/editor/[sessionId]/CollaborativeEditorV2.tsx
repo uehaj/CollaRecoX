@@ -9,6 +9,8 @@ import TurndownService from 'turndown';
 import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
 import * as Diff from 'diff';
+import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
+import ShortcutHelpModal from './ShortcutHelpModal';
 
 // Custom UserUnderline Mark - shows colored underline for user edits
 const UserUnderline = Mark.create({
@@ -133,6 +135,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   // Force Commit state
   const [isForceCommitPending, setIsForceCommitPending] = useState(false);
 
+  // Keyboard Shortcuts state
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+
   // AI Rewrite - 定義済みテンプレート
   const promptTemplates = [
     { label: '見出し追加', prompt: 'パラグラフごとに内容に応じた見出しを追加する' },
@@ -252,7 +257,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // Use the current hostname and port, automatically detecting protocol
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
+      const websocketUrl = `${protocol}//${host}/collarecox/api/yjs-ws`;
       const roomName = `transcribe-editor-v2-${sessionId}`;
 
       console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
@@ -750,6 +755,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     // 1秒後にボタンを再有効化（デバウンス）
     setTimeout(() => setIsForceCommitPending(false), 1000);
   };
+
+  // Keyboard Shortcuts - キーボードショートカットを有効化
+  useKeyboardShortcuts({
+    onRewrite: handleRewrite,
+    onMarkdownEdit: handleMarkdownEdit,
+    onForceCommit: handleForceCommit,
+    onToggleHistory: () => setShowHistory(!showHistory),
+    onShowHelp: () => setShowShortcutHelp(true),
+  });
 
   // Early return during SSR - render nothing until mounted on client
   if (!mounted) {
@@ -1291,6 +1305,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
           </div>
         </div>
       )}
+
+      {/* Keyboard Shortcuts Help Modal */}
+      <ShortcutHelpModal
+        isOpen={showShortcutHelp}
+        onClose={() => setShowShortcutHelp(false)}
+      />
     </div>
   );
 }

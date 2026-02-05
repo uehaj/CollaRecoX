@@ -11,6 +11,8 @@ if (typeof require !== 'undefined') {
 }
 
 const nextConfig: NextConfig = {
+  basePath: '/collarecox',
+
   // Disable React StrictMode in development to reduce duplicate component mounting
   reactStrictMode: false,
 
