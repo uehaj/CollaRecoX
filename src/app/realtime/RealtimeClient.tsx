@@ -7,6 +7,7 @@ type YDocType = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HocuspocusProviderType = any;
 import { getAllRecordings, type AudioRecording } from '@/lib/indexedDB';
+import packageJson from '../../../package.json';
 
 interface PromptPreset {
   id: string;
@@ -252,7 +253,7 @@ export default function RealtimeClient() {
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const wsUrl = `${protocol}//${host}/api/realtime-ws`;
+      const wsUrl = `${protocol}//${host}/collarecox/api/realtime-ws`;
       console.log('[WebSocket] 🔗 Connecting to:', wsUrl);
       console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
       const ws = new WebSocket(wsUrl);
@@ -1432,6 +1433,9 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               <p className="text-sm text-gray-600 mt-1">OpenAI Realtime APIを使用した音声認識</p>
             </div>
             <div className="flex items-center space-x-3">
+              <div className="text-xs text-gray-400">
+                v{packageJson.version}
+              </div>
               <a
                 href="/dummy-recorder"
                 className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
@@ -1439,7 +1443,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 録音データ作成
               </a>
               <a
-                href="/manual.html"
+                href="/collarecox/manual.html"
                 className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
                 target="_blank"
                 rel="noopener noreferrer"
