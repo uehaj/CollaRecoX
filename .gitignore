@@ -89,3 +89,4 @@ transcribe@*
 
 # PID files
 *.pid
+workdir/
