@@ -53,11 +53,13 @@ app.prepare().then(() => {
   console.log('Next.js app prepared successfully');
 
   const server = createServer(async (req, res) => {
+    console.log('🔵 [HTTP] Request received:', req.method, req.url);
     try {
       const parsedUrl = parse(req.url, true);
+      console.log('🔵 [HTTP] Parsed URL:', parsedUrl.pathname);
 
-      // /api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
-      if (parsedUrl.pathname === '/api/yjs-sessions') {
+      // /collarecox/api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
+      if (parsedUrl.pathname === '/collarecox/api/yjs-sessions') {
         const sessions = Array.from(hocuspocus.documents.keys()).map(roomName => {
           const sessionId = roomName.replace('transcribe-editor-v2-', '');
           const doc = hocuspocus.documents.get(roomName);
@@ -76,7 +78,9 @@ app.prepare().then(() => {
       }
 
       // Next.js へ
+      console.log('🔵 [HTTP] Calling Next.js handle()...');
       await handle(req, res, parsedUrl);
+      console.log('🔵 [HTTP] Next.js handle() completed');
     } catch (err) {
       console.error('Error occurred handling', req.url, err);
       res.statusCode = 500;
@@ -97,8 +101,8 @@ app.prepare().then(() => {
     const { pathname } = parse(request.url);
     console.log(`[WebSocket] Parsed pathname: ${pathname}`);
     
-    if (pathname.startsWith('/api/yjs-ws')) {
-      console.log('[WebSocket] Processing /api/yjs-ws upgrade request');
+    if (pathname.startsWith('/collarecox/api/yjs-ws')) {
+      console.log('[WebSocket] Processing /collarecox/api/yjs-ws upgrade request');
       try {
         yjsWss.handleUpgrade(request, socket, head, (ws) => {
           console.log('[WebSocket] ✅ WebSocket upgrade successful, passing to Hocuspocus');
@@ -115,8 +119,8 @@ app.prepare().then(() => {
         console.error('[WebSocket] ❌ WebSocket upgrade error:', upgradeError);
         socket.destroy();
       }
-    } else if (pathname === '/api/realtime-ws') {
-      console.log('[WebSocket] Processing /api/realtime-ws upgrade request');
+    } else if (pathname === '/collarecox/api/realtime-ws') {
+      console.log('[WebSocket] Processing /collarecox/api/realtime-ws upgrade request');
       console.log('[WebSocket] Socket readable:', socket.readable);
       console.log('[WebSocket] Socket writable:', socket.writable);
       console.log('[WebSocket] Head length:', head.length);
@@ -1705,9 +1709,9 @@ app.prepare().then(() => {
 
   server.listen(port, hostname, () => {
     const displayHost = hostname === '0.0.0.0' ? 'localhost' : hostname;
-    console.log(`🚀 Server ready at http://${displayHost}:${port}`);
-    console.log(`📡 Hocuspocus WebSocket ready at ws://${displayHost}:${port}/api/yjs-ws`);
-    console.log(`🎤 Realtime Audio WebSocket ready at ws://${displayHost}:${port}/api/realtime-ws`);
-    console.log(`🌐 Next.js UI available at http://${displayHost}:${port}`);
+    console.log(`🚀 Server ready at http://${displayHost}:${port}/collarecox`);
+    console.log(`📡 Hocuspocus WebSocket ready at ws://${displayHost}:${port}/collarecox/api/yjs-ws`);
+    console.log(`🎤 Realtime Audio WebSocket ready at ws://${displayHost}:${port}/collarecox/api/realtime-ws`);
+    console.log(`🌐 Next.js UI available at http://${displayHost}:${port}/collarecox`);
   });
 });
