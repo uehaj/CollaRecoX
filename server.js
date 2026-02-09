@@ -136,7 +136,7 @@ app.prepare().then(() => {
         console.error('[WebSocket] ❌ Realtime WebSocket upgrade error:', upgradeError);
         socket.destroy();
       }
-    } else if (pathname === '/_next/webpack-hmr') {
+    } else if (pathname === '/_next/webpack-hmr' || pathname === '/collarecox/_next/webpack-hmr') {
       console.log('[WebSocket] Processing HMR WebSocket upgrade request');
       // Let Next.js handle HMR WebSocket
       if (handle.upgrade) {
