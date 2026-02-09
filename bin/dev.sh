@@ -5,6 +5,10 @@
 
 set -e
 
+# Ensure Volta is in PATH (for cron and non-interactive shells)
+export VOLTA_HOME="${HOME}/.volta"
+export PATH="${VOLTA_HOME}/bin:${PATH}"
+
 # Default values
 ENABLE_LOG=false
 LOG_DIR="logs"
