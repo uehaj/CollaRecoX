@@ -1,63 +1,54 @@
 "use client";
 
 import React, { useEffect, useState, useRef } from 'react';
-import { EditorContent, useEditor, Mark } from '@tiptap/react';
+import { EditorContent, useEditor, Mark, Extension } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
 import Link from '@tiptap/extension-link';
 import TurndownService from 'turndown';
 import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
+import { Plugin, PluginKey } from '@tiptap/pm/state';
+import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
+import { getBasePath } from '@/lib/basePath';
 import ShortcutHelpModal from './ShortcutHelpModal';
 
-// Custom UserUnderline Mark - shows colored underline for user edits
+// Custom UserUnderline Mark - スキーマ互換のため残すが、視覚効果はなし
+// 下線表示はProseMirror Decorationで管理する（Yjsとの干渉回避）
 const UserUnderline = Mark.create({
   name: 'userUnderline',
+  inclusive: false,
 
   addAttributes() {
     return {
-      color: {
-        default: null,
-        parseHTML: element => element.getAttribute('data-color'),
-        renderHTML: attributes => {
-          if (!attributes.color) {
-            return {};
-          }
-          return {
-            'data-color': attributes.color,
-            style: `text-decoration: underline; text-decoration-color: ${attributes.color}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
-          };
-        },
-      },
-      userId: {
-        default: null,
-        parseHTML: element => element.getAttribute('data-user-id'),
-        renderHTML: attributes => {
-          if (!attributes.userId) {
-            return {};
-          }
-          return {
-            'data-user-id': attributes.userId,
-          };
-        },
-      },
+      color: { default: null },
+      userId: { default: null },
     };
   },
 
   parseHTML() {
-    return [
-      {
-        tag: 'span[data-user-underline]',
-      },
-    ];
+    return [{ tag: 'span[data-user-underline]' }];
   },
 
-  renderHTML({ HTMLAttributes }) {
-    return ['span', { ...HTMLAttributes, 'data-user-underline': '' }, 0];
+  renderHTML() {
+    // 視覚効果なし - Decorationが下線表示を担当
+    return ['span', {}, 0];
   },
 });
+
+// 2つの文字列の差分テキストを先頭一致で抽出（変更履歴プレビュー用）
+// base=短い方、changed=長い方、diffLength=長さの差
+const extractDiffPreview = (base: string, changed: string, diffLength: number): string => {
+  let start = 0;
+  while (start < base.length && changed[start] === base[start]) start++;
+  const extracted = changed.slice(start, start + diffLength);
+  return extracted.length > 30 ? extracted.slice(0, 30) + '...' : extracted;
+};
+
+// 編集追跡Decoration用PluginKey
+const editTrackKey = new PluginKey('editTrack');
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -257,7 +248,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // Use the current hostname and port, automatically detecting protocol
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const websocketUrl = `${protocol}//${host}/collarecox/api/yjs-ws`;
+      const websocketUrl = `${protocol}//${host}${getBasePath()}/api/yjs-ws`;
       const roomName = `transcribe-editor-v2-${sessionId}`;
 
       console.log('[Collaborative Editor V2] 🔗 Connecting to:', websocketUrl, 'Room:', roomName);
@@ -333,8 +324,62 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       Highlight.configure({
         multicolor: true,
       }),
-      // Add UserUnderline extension for tracking user edits
+      // UserUnderline - スキーマ互換のため残す（視覚効果なし）
       UserUnderline,
+      // 編集追跡: ProseMirror Decorationで下線を表示（Yjsドキュメントを汚さない）
+      Extension.create({
+        name: 'editTracker',
+        addProseMirrorPlugins() {
+          return [
+            new Plugin({
+              key: editTrackKey,
+              state: {
+                init: () => DecorationSet.empty,
+                apply(tr, decorationSet, _oldState, newState) {
+                  // ドキュメント変更なし → そのまま
+                  if (!tr.docChanged) return decorationSet;
+
+                  // 既存のDecorationを位置マッピング
+                  decorationSet = decorationSet.map(tr.mapping, tr.doc);
+
+                  // 下線表示がOFFなら新しいDecorationを追加しない（mapping済みで返す）
+                  if (!highlightEditsRef.current) return decorationSet;
+
+                  // リモート変更（Yjs同期）かローカル変更かを判定
+                  const isRemote = tr.getMeta('addToHistory') === false;
+                  // 下線色: ローカル=自分の色、リモート=青
+                  const underlineColor = isRemote ? '#3b82f6' : userInfoRef.current.color;
+
+                  // 変更範囲を検出しDecorationを追加
+                  const newDecos: Decoration[] = [];
+                  tr.steps.forEach((_step, i) => {
+                    const map = tr.mapping.maps[i];
+                    map.forEach((_oldStart: number, _oldEnd: number, newStart: number, newEnd: number) => {
+                      if (newEnd > newStart && newEnd <= newState.doc.content.size) {
+                        newDecos.push(Decoration.inline(newStart, newEnd, {
+                          style: `text-decoration: underline; text-decoration-color: ${underlineColor}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
+                        }));
+                      }
+                    });
+                  });
+
+                  if (newDecos.length > 0) {
+                    decorationSet = decorationSet.add(tr.doc, newDecos);
+                  }
+                  return decorationSet;
+                },
+              },
+              props: {
+                decorations(state) {
+                  // 下線表示がOFFなら何も描画しない
+                  if (!highlightEditsRef.current) return DecorationSet.empty;
+                  return editTrackKey.getState(state);
+                },
+              },
+            }),
+          ];
+        },
+      }),
       // Add Link extension for handling links
       Link.configure({
         openOnClick: true,
@@ -366,24 +411,26 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       attributes: {
         class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none min-h-[500px] p-4',
       },
-      // Auto-apply userUnderline mark when typing (if edit tracking is enabled)
-      handleTextInput: (view, from, to, text) => {
-        if (!highlightEditsRef.current) return false;
-
-        const { state } = view;
-        const userUnderlineMark = state.schema.marks.userUnderline;
-        if (!userUnderlineMark) return false;
-
-        const mark = userUnderlineMark.create({
-          color: userInfoRef.current.color,
-          userId: userIdRef.current,
-        });
-
-        const tr = state.tr.insertText(text, from, to);
-        tr.addMark(from, from + text.length, mark);
-        view.dispatch(tr);
-        return true; // Handled
-      },
+      // handleTextInput は使わない - 編集追跡はDecoration Pluginが担当
+    },
+    onCreate: ({ editor }) => {
+      // Yjs同期後に古いuserUnderlineマークをクリーンアップ
+      // （以前のバグで広範囲に適用されたマークがYjsドキュメントに残っている）
+      setTimeout(() => {
+        try {
+          const { state } = editor;
+          const markType = state.schema.marks.userUnderline;
+          if (markType) {
+            const tr = state.tr.removeMark(0, state.doc.content.size, markType);
+            if (tr.docChanged) {
+              editor.view.dispatch(tr);
+              console.log('[EditTracker] 🧹 Cleaned up old userUnderline marks');
+            }
+          }
+        } catch (e) {
+          console.warn('[EditTracker] ⚠️ Mark cleanup failed:', e);
+        }
+      }, 3000); // Yjs同期完了を待つ
     },
     onUpdate: ({ editor }) => {
       const currentContent = editor.getText();
@@ -396,13 +443,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
         if (currentContent.length > previousContent.length) {
           action = 'insert';
-          // Find the difference (simplified)
           const diffLength = currentContent.length - previousContent.length;
-          content = `+${diffLength}文字`;
+          const preview = extractDiffPreview(previousContent, currentContent, diffLength);
+          content = preview ? `"${preview}" (+${diffLength}文字)` : `+${diffLength}文字`;
         } else if (currentContent.length < previousContent.length) {
           action = 'delete';
           const diffLength = previousContent.length - currentContent.length;
-          content = `-${diffLength}文字`;
+          const preview = extractDiffPreview(currentContent, previousContent, diffLength);
+          content = preview ? `"${preview}" (-${diffLength}文字)` : `-${diffLength}文字`;
         } else {
           content = '内容を変更';
         }
@@ -655,7 +703,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
     setIsRewriting(true);
     try {
-      const response = await fetch('/api/rewrite', {
+      const response = await fetch(`${getBasePath()}/api/rewrite`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
@@ -790,6 +838,18 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   return (
     <div className="space-y-4">
+      {/* 校正者マニュアルバナー */}
+      <div className="bg-indigo-600 text-white rounded-lg px-4 py-2 flex items-center justify-between">
+        <span className="text-sm font-medium">初めての方へ: 校正の操作方法はマニュアルをご確認ください</span>
+        <a
+          href={`${getBasePath()}/editor-manual.html`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="bg-white text-indigo-600 px-3 py-1 rounded text-sm font-medium hover:bg-indigo-50 transition-colors flex-shrink-0"
+        >
+          校正者マニュアルを開く
+        </a>
+      </div>
       {/* Sticky Header - Connection Status + Toolbar */}
       <div className="sticky top-0 z-10 bg-gray-50 space-y-2 pb-2">
         {/* Connection Status */}
@@ -965,18 +1025,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               Markdown編集
             </button>
-            <button
-              onClick={handleForceCommit}
-              disabled={!isTranscribing || isForceCommitPending}
-              title="現在の認識バッファを強制的に確定します"
-              className={`px-3 py-1 text-sm rounded transition-colors ${
-                !isTranscribing || isForceCommitPending
-                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                  : 'bg-orange-500 text-white hover:bg-orange-600'
-              }`}
-            >
-              {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
-            </button>
           </div>
         </div>
       </div>
@@ -988,6 +1036,21 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         <div className="flex-1">
           <div className={`bg-white rounded-lg shadow-sm border min-h-[600px] editor-font-${fontSize}`}>
             <EditorContent editor={editor} />
+            {/* 手動認識確定ボタン - エディター最下段・右寄せ */}
+            <div className="px-4 py-2 border-t border-gray-100 flex justify-end">
+              <button
+                onClick={handleForceCommit}
+                disabled={!isTranscribing || isForceCommitPending}
+                title="現在の認識バッファを強制的に確定します"
+                className={`px-3 py-1 text-sm rounded transition-colors ${
+                  !isTranscribing || isForceCommitPending
+                    ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                    : 'bg-orange-500 text-white hover:bg-orange-600'
+                }`}
+              >
+                {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
+              </button>
+            </div>
             {pendingText && (
               <div className="px-4 pb-4">
                 <p className="text-gray-400 italic">
@@ -1024,21 +1087,27 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 ) : (
                   changeHistory.map((entry) => (
                     <div key={entry.id} className="border-l-2 pl-3 py-1" style={{ borderColor: entry.userColor }}>
-                      <div className="flex items-center space-x-2">
-                        <div
-                          className="w-2 h-2 rounded-full"
-                          style={{ backgroundColor: entry.userColor }}
-                        ></div>
-                        <span className="text-sm font-medium">{entry.userName}</span>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                          <div
+                            className="w-2 h-2 rounded-full"
+                            style={{ backgroundColor: entry.userColor }}
+                          ></div>
+                          <span className="text-xs font-medium text-gray-500">{entry.userName}</span>
+                        </div>
+                        <span className="text-xs text-gray-400">
+                          {entry.timestamp.toLocaleTimeString('ja-JP')}
+                        </span>
                       </div>
-                      <div className="text-sm text-gray-600">
-                        <span className={`${entry.action === 'insert' ? 'text-green-600' : entry.action === 'delete' ? 'text-red-600' : 'text-blue-600'}`}>
+                      <div className="text-sm mt-0.5">
+                        <span className={`text-xs font-medium px-1 py-0.5 rounded ${
+                          entry.action === 'insert' ? 'bg-green-100 text-green-700' :
+                          entry.action === 'delete' ? 'bg-red-100 text-red-700' :
+                          'bg-blue-100 text-blue-700'
+                        }`}>
                           {entry.action === 'insert' ? '追加' : entry.action === 'delete' ? '削除' : '変更'}
                         </span>
-                        : {entry.content}
-                      </div>
-                      <div className="text-xs text-gray-400">
-                        {entry.timestamp.toLocaleTimeString('ja-JP')}
+                        <span className="ml-1.5 text-gray-700 text-sm break-all">{entry.content}</span>
                       </div>
                     </div>
                   ))
