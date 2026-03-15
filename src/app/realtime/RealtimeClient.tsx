@@ -136,6 +136,8 @@ export default function RealtimeClient() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [audioSource, setAudioSource] = useState<'microphone' | 'tab-capture'>('tab-capture');
+  const tabCaptureStreamRef = useRef<MediaStream | null>(null);
   const [selectedPromptPreset, setSelectedPromptPreset] = useState<string>('none');
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const [promptMode, setPromptMode] = useState<'preset' | 'custom'>('preset');
@@ -600,31 +602,59 @@ export default function RealtimeClient() {
   // Audio streaming functions
   const startAudioStream = useCallback(async () => {
     try {
-      console.log('[Audio] 🎵 Starting audio stream...');
-      
-      if (!navigator?.mediaDevices?.getUserMedia) {
-        throw new Error('getUserMedia not supported in this browser');
-      }
+      console.log('[Audio] 🎵 Starting audio stream... source:', audioSource);
 
-      const audioConstraints: MediaStreamConstraints['audio'] = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false,
-        // Don't force specific sample rate, let browser choose optimal rate
-      };
+      let stream: MediaStream;
 
-      // Use selected device if available
-      if (selectedDeviceId) {
-        console.log('[Audio] 🎤 Using selected device:', selectedDeviceId);
-        (audioConstraints as MediaTrackConstraints).deviceId = { exact: selectedDeviceId };
+      if (audioSource === 'tab-capture') {
+        // タブ音声キャプチャモード: getDisplayMedia
+        if (!navigator?.mediaDevices?.getDisplayMedia) {
+          throw new Error('getDisplayMedia not supported in this browser');
+        }
+        console.log('[Audio] 🖥️ Requesting tab audio capture...');
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+        // 映像トラックは不要なので停止
+        displayStream.getVideoTracks().forEach((t) => t.stop());
+        const audioTracks = displayStream.getAudioTracks();
+        if (audioTracks.length === 0) {
+          throw new Error('音声トラックが取得できませんでした。タブ共有時に「タブの音声も共有」を有効にしてください。');
+        }
+        console.log('[Audio] 🖥️ Tab audio track obtained:', audioTracks[0].label);
+        stream = new MediaStream(audioTracks);
+        tabCaptureStreamRef.current = displayStream;
+        // タブ共有停止時の自動停止（recordingStateRefで制御）
+        audioTracks[0].addEventListener('ended', () => {
+          console.log('[Audio] 🖥️ Tab audio track ended (user stopped sharing)');
+          recordingStateRef.current = false;
+          setIsRecording(false);
+        });
       } else {
-        console.warn('[Audio] ⚠️ No specific device selected, using default');
-      }
+        // マイクモード: getUserMedia
+        if (!navigator?.mediaDevices?.getUserMedia) {
+          throw new Error('getUserMedia not supported in this browser');
+        }
 
-      console.log('[Audio] 📋 Audio constraints:', audioConstraints);
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints
-      });
+        const audioConstraints: MediaStreamConstraints['audio'] = {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        };
+
+        if (selectedDeviceId) {
+          console.log('[Audio] 🎤 Using selected device:', selectedDeviceId);
+          (audioConstraints as MediaTrackConstraints).deviceId = { exact: selectedDeviceId };
+        } else {
+          console.warn('[Audio] ⚠️ No specific device selected, using default');
+        }
+
+        console.log('[Audio] 📋 Audio constraints:', audioConstraints);
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: audioConstraints
+        });
+      }
       console.log('[Audio] ✅ Media stream obtained');
 
       // Enhanced AudioContext compatibility check
@@ -869,7 +899,7 @@ export default function RealtimeClient() {
       console.error('[Audio] ❌ Error starting audio stream:', err);
       setError(err instanceof Error ? err.message : 'Failed to start audio stream');
     }
-  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks]);
+  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks, audioSource]);
 
   const stopAudioStream = useCallback(() => {
     console.log('[Audio] 🛑 Stopping audio stream...');
@@ -902,6 +932,12 @@ export default function RealtimeClient() {
       console.log('[Audio] 🔧 Closing AudioContext');
       audioContextRef.current.close();
       audioContextRef.current = null;
+    }
+
+    // タブキャプチャストリームの停止
+    if (tabCaptureStreamRef.current) {
+      tabCaptureStreamRef.current.getTracks().forEach(t => t.stop());
+      tabCaptureStreamRef.current = null;
     }
 
     // Don't commit on stop - let the server handle remaining buffer automatically
@@ -2122,7 +2158,46 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 音声入力からの文字起こし
               </h4>
 
+              {/* Audio Source Selection */}
+              <div className="px-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  音声ソース:
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAudioSource('microphone')}
+                    disabled={isRecording}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                      audioSource === 'microphone'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    <span>🎤</span> マイク
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAudioSource('tab-capture')}
+                    disabled={isRecording}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                      audioSource === 'tab-capture'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    <span>🖥️</span> タブ音声キャプチャ
+                  </button>
+                </div>
+                {audioSource === 'tab-capture' && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    開始時にタブ選択ダイアログが表示されます。「タブの音声も共有」を有効にしてください。
+                  </p>
+                )}
+              </div>
+
               {/* Audio Input Device Selection */}
+              {audioSource === 'microphone' && (
               <div className="px-4">
                 <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
                   音声入力デバイス:
@@ -2157,6 +2232,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   </p>
                 </div>
               </div>
+              )}
 
               {/* Audio Processing Settings */}
               <div className="px-4 pt-3 border-t border-gray-200">
