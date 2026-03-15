@@ -19,9 +19,9 @@ const hostname = '0.0.0.0';
 let port = 8888;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
 if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
-  port = parseInt(process.argv[portArgIndex + 1]) || 8888;
+  port = parseInt(process.argv[portArgIndex + 1], 10) || 8888;
 } else if (process.env.PORT) {
-  port = parseInt(process.env.PORT) || 8888;
+  port = parseInt(process.env.PORT, 10) || 8888;
 }
 console.log('Using port:', port);
 
@@ -94,6 +94,12 @@ app.prepare().then(() => {
   
   // Add comprehensive upgrade debugging
   server.on('upgrade', (request, socket, head) => {
+    // Guard against mid-upgrade disconnections
+    socket.on('error', (err) => {
+      console.error('[WebSocket] Upgrade socket error:', err.message);
+      socket.destroy();
+    });
+
     console.log(`[WebSocket] 🔄 UPGRADE EVENT TRIGGERED!`);
     console.log(`[WebSocket] Request URL: ${request.url}`);
     console.log(`[WebSocket] Request headers:`, request.headers);
@@ -1714,4 +1720,19 @@ app.prepare().then(() => {
     console.log(`🎤 Realtime Audio WebSocket ready at ws://${displayHost}:${port}/collarecox/api/realtime-ws`);
     console.log(`🌐 Next.js UI available at http://${displayHost}:${port}/collarecox`);
   });
+
+  // Graceful shutdown: close WebSocket servers and HTTP server
+  const shutdown = (signal) => {
+    console.log(`\n${signal} received, shutting down gracefully...`);
+    realtimeWss.close(() => console.log('Realtime WebSocket server closed'));
+    yjsWss.close(() => console.log('YJS WebSocket server closed'));
+    server.close(() => {
+      console.log('HTTP server closed');
+      process.exit(0);
+    });
+    // Force exit after 5 seconds if graceful shutdown stalls
+    setTimeout(() => process.exit(1), 5000);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 });

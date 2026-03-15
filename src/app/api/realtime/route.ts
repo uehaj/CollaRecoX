@@ -1,11 +1,12 @@
 import { NextRequest } from "next/server";
+import { buildWsUrlFromHost } from "@/lib/wsUrl";
 
 export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const model = searchParams.get("model") || "gpt-4o-realtime-preview";
-  
+
   // Validate model
   const validModels = ["gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"];
   if (!validModels.includes(model)) {
@@ -15,12 +16,13 @@ export async function GET(req: NextRequest) {
     );
   }
 
+  const host = req.headers.get('host') || 'localhost:8888';
   return new Response(
-    JSON.stringify({ 
+    JSON.stringify({
       message: "WebSocket endpoint is handled by custom server at /api/realtime-ws",
       model: model,
-      websocket_url: `ws://localhost:5001/api/realtime-ws?model=${model}`
-    }), 
+      websocket_url: buildWsUrlFromHost(host, '/api/realtime-ws', { model })
+    }),
     {
       status: 200,
       headers: { "Content-Type": "application/json" }
