@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { getBasePath } from '@/lib/basePath';
 import packageJson from '../../package.json';
 
 export default function Home() {
@@ -36,7 +37,7 @@ export default function Home() {
             </p>
             <div className="mt-4">
               <a
-                href="/collarecox/manual.html"
+                href={`${getBasePath()}/manual.html`}
                 className="text-blue-600 hover:text-blue-800 underline text-sm"
                 target="_blank"
                 rel="noopener noreferrer"
