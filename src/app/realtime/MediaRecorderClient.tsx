@@ -91,7 +91,7 @@ export default function MediaRecorderClient() {
       return;
     }
 
-    const wsUrl = buildWsUrl('/api/realtime-ws', { model });
+    const wsUrl = buildWsUrl("/api/realtime-ws", { model });
     console.log('[WebSocket] Connecting to:', wsUrl);
     const ws = new WebSocket(wsUrl);
     websocketRef.current = ws;
