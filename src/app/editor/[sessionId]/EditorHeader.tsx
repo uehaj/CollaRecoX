@@ -1,5 +1,7 @@
 "use client";
 
+import packageJson from '../../../../package.json';
+
 interface EditorHeaderProps {
   sessionId: string;
 }
@@ -14,6 +16,9 @@ export function EditorHeader({ sessionId }: EditorHeaderProps) {
             <p className="text-sm text-gray-600 mt-1">Session ID: {sessionId}</p>
           </div>
           <div className="flex items-center space-x-4">
+            <div className="text-xs text-gray-400">
+              v{packageJson.version}
+            </div>
             <div className="text-sm text-gray-500">
               このURLを共有して他の人を招待
             </div>

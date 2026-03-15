@@ -27,7 +27,7 @@ export function useKeyboardShortcuts(options: UseKeyboardShortcutsOptions): void
    */
   const shortcuts: KeyboardShortcut[] = useMemo(() => [
     {
-      key: 'r',
+      key: 'e',
       ctrl: true,
       shift: true,
       description: 'AI再編を開く',

@@ -10,7 +10,11 @@
     "next-dev": "next dev",
     "lint": "next lint",
     "server": "node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
-    "server:prod": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -p 5001"
+    "server:prod": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
+    "version:patch": "npm version patch -m 'chore: bump version to %s'",
+    "version:minor": "npm version minor -m 'chore: bump version to %s'",
+    "version:major": "npm version major -m 'chore: bump version to %s'",
+    "postversion": "git push && git push --tags"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",

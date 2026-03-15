@@ -7,6 +7,7 @@ type YDocType = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HocuspocusProviderType = any;
 import { getAllRecordings, type AudioRecording } from '@/lib/indexedDB';
+import { getBasePath } from '@/lib/basePath';
 import packageJson from '../../../package.json';
 
 interface PromptPreset {
@@ -253,7 +254,7 @@ export default function RealtimeClient() {
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const wsUrl = `${protocol}//${host}/collarecox/api/realtime-ws`;
+      const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws`;
       console.log('[WebSocket] 🔗 Connecting to:', wsUrl);
       console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
       const ws = new WebSocket(wsUrl);
@@ -1036,7 +1037,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
   const createOrOpenEditingSession = useCallback(() => {
     const sessionId = generateSessionId();
-    const editorUrl = `${window.location.origin}/editor/${sessionId}`;
+    const editorUrl = `${window.location.origin}${getBasePath()}/editor/${sessionId}`;
     
     console.log('[Session] 🚀 Opening editing session:', sessionId);
     console.log('[Session] 📍 Editor URL:', editorUrl);
@@ -1058,7 +1059,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
   const fetchSessions = useCallback(async () => {
     setIsLoadingSessions(true);
     try {
-      const res = await fetch('/api/yjs-sessions');
+      const res = await fetch(`${getBasePath()}/api/yjs-sessions`);
       const data = await res.json();
       setActiveSessions(data.sessions || []);
     } catch (error) {
@@ -1232,7 +1233,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       // Create provider
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const websocketUrl = `${protocol}//${host}/api/yjs-ws`;
+      const websocketUrl = `${protocol}//${host}${getBasePath()}/api/yjs-ws`;
       const roomName = `transcribe-editor-v2-${currentSessionId}`;
 
       const provider = new HocuspocusProvider({
@@ -1443,7 +1444,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 録音データ作成
               </a>
               <a
-                href="/collarecox/manual.html"
+                href={`${getBasePath()}/manual.html`}
                 className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
                 target="_blank"
                 rel="noopener noreferrer"
@@ -2065,7 +2066,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   </div>
                   <button
                     onClick={() => {
-                      const editorUrl = `${window.location.origin}/editor/${currentSessionId}`;
+                      const editorUrl = `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`;
                       navigator.clipboard.writeText(editorUrl);
                       // Optional: Show feedback (could add a toast notification here)
                       const button = document.activeElement as HTMLButtonElement;
@@ -2081,7 +2082,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   </button>
                 </div>
                 <div className="mt-2 text-xs text-blue-600 font-mono">
-                  {typeof window !== 'undefined' && `${window.location.origin}/editor/${currentSessionId}`}
+                  {typeof window !== 'undefined' && `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`}
                 </div>
               </div>
             </div>
