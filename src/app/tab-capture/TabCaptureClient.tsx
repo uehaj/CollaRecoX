@@ -53,6 +53,7 @@ export default function TabCaptureClient() {
   const streamRef = useRef<MediaStream | null>(null);
   const recordingRef = useRef(false);
   const accBufRef = useRef<Int16Array[]>([]);
+  const commitTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const [isCapturing, setIsCapturing] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -217,6 +218,15 @@ export default function TabCaptureClient() {
         await ctx.resume();
       }
 
+      // 定期的にaudio_commitを送信（連続音声でVADが発火しない問題の対処）
+      const commitInterval = 5000;
+      commitTimerRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN && recordingRef.current) {
+          ws.send(JSON.stringify({ type: "audio_commit" }));
+          console.log("[TabCapture] Periodic audio_commit sent");
+        }
+      }, commitInterval);
+
       setIsCapturing(true);
       setStatus("キャプチャ中");
       console.log("[TabCapture] Capture started, sampleRate:", ctx.sampleRate);
@@ -236,6 +246,12 @@ export default function TabCaptureClient() {
   // --- Stop ---
   const stopCapture = useCallback(() => {
     recordingRef.current = false;
+
+    // 定期コミットタイマーをクリア
+    if (commitTimerRef.current) {
+      clearInterval(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
 
     // 残りバッファをフラッシュ
     if (accBufRef.current.length > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
