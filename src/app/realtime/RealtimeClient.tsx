@@ -165,6 +165,7 @@ export default function RealtimeClient() {
   const recordingStartTimeRef = useRef<number>(0);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const autoDisconnectTimerRef = useRef<NodeJS.Timeout | null>(null); // 自動切断タイマー
+  const tabCaptureCommitTimerRef = useRef<NodeJS.Timeout | null>(null); // タブキャプチャ用定期コミットタイマー
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [autoDisconnectDelay, setAutoDisconnectDelay] = useState<number>(30); // 自動切断までの秒数（デフォルト30秒）- Story-2でUI設定を追加予定
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
@@ -886,7 +887,19 @@ export default function RealtimeClient() {
 
       setIsRecording(true);
       console.log('[Audio] ✅ Audio streaming started successfully');
-      
+
+      // タブキャプチャモード: 定期的にaudio_commitを送信してVAD無音検出を補助
+      if (audioSource === 'tab-capture') {
+        const commitInterval = 5000; // 5秒ごとにコミット
+        console.log(`[Audio] 🖥️ Tab capture mode: auto-commit every ${commitInterval}ms`);
+        tabCaptureCommitTimerRef.current = setInterval(() => {
+          if (websocketRef.current?.readyState === WebSocket.OPEN && recordingStateRef.current) {
+            websocketRef.current.send(JSON.stringify({ type: 'audio_commit' }));
+            console.log('[Audio] 🖥️ Tab capture: periodic audio_commit sent');
+          }
+        }, commitInterval);
+      }
+
       // Test audio processing after a short delay
       setTimeout(() => {
         console.log('[Audio] 🧪 Testing audio processing after 2 seconds...');
@@ -909,6 +922,12 @@ export default function RealtimeClient() {
 
     // Clear accumulated audio buffer
     accumulatedAudioRef.current = [];
+
+    // タブキャプチャ用定期コミットタイマーをクリア
+    if (tabCaptureCommitTimerRef.current) {
+      clearInterval(tabCaptureCommitTimerRef.current);
+      tabCaptureCommitTimerRef.current = null;
+    }
 
     // Stop recording timer
     if (recordingTimerRef.current) {

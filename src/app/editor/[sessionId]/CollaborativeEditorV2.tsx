@@ -38,6 +38,15 @@ const UserUnderline = Mark.create({
   },
 });
 
+// 2つの文字列の差分テキストを先頭一致で抽出（変更履歴プレビュー用）
+// base=短い方、changed=長い方、diffLength=長さの差
+const extractDiffPreview = (base: string, changed: string, diffLength: number): string => {
+  let start = 0;
+  while (start < base.length && changed[start] === base[start]) start++;
+  const extracted = changed.slice(start, start + diffLength);
+  return extracted.length > 30 ? extracted.slice(0, 30) + '...' : extracted;
+};
+
 // 編集追跡Decoration用PluginKey
 const editTrackKey = new PluginKey('editTrack');
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
@@ -327,17 +336,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               state: {
                 init: () => DecorationSet.empty,
                 apply(tr, decorationSet, _oldState, newState) {
-                  // 既存のDecorationを位置マッピング
-                  decorationSet = decorationSet.map(tr.mapping, tr.doc);
-
                   // ドキュメント変更なし → そのまま
                   if (!tr.docChanged) return decorationSet;
 
-                  // Yjs同期トランザクション（リモート変更）はスキップ
-                  if (tr.getMeta('addToHistory') === false) return decorationSet;
+                  // 既存のDecorationを位置マッピング
+                  decorationSet = decorationSet.map(tr.mapping, tr.doc);
 
-                  // 下線表示がOFFなら新しいDecorationを追加しない
+                  // 下線表示がOFFなら新しいDecorationを追加しない（mapping済みで返す）
                   if (!highlightEditsRef.current) return decorationSet;
+
+                  // リモート変更（Yjs同期）かローカル変更かを判定
+                  const isRemote = tr.getMeta('addToHistory') === false;
+                  // 下線色: ローカル=自分の色、リモート=青
+                  const underlineColor = isRemote ? '#3b82f6' : userInfoRef.current.color;
 
                   // 変更範囲を検出しDecorationを追加
                   const newDecos: Decoration[] = [];
@@ -346,7 +357,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     map.forEach((_oldStart: number, _oldEnd: number, newStart: number, newEnd: number) => {
                       if (newEnd > newStart && newEnd <= newState.doc.content.size) {
                         newDecos.push(Decoration.inline(newStart, newEnd, {
-                          style: `text-decoration: underline; text-decoration-color: ${userInfoRef.current.color}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
+                          style: `text-decoration: underline; text-decoration-color: ${underlineColor}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
                         }));
                       }
                     });
@@ -432,13 +443,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
         if (currentContent.length > previousContent.length) {
           action = 'insert';
-          // Find the difference (simplified)
           const diffLength = currentContent.length - previousContent.length;
-          content = `+${diffLength}文字`;
+          const preview = extractDiffPreview(previousContent, currentContent, diffLength);
+          content = preview ? `"${preview}" (+${diffLength}文字)` : `+${diffLength}文字`;
         } else if (currentContent.length < previousContent.length) {
           action = 'delete';
           const diffLength = previousContent.length - currentContent.length;
-          content = `-${diffLength}文字`;
+          const preview = extractDiffPreview(currentContent, previousContent, diffLength);
+          content = preview ? `"${preview}" (-${diffLength}文字)` : `-${diffLength}文字`;
         } else {
           content = '内容を変更';
         }
@@ -1075,21 +1087,27 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 ) : (
                   changeHistory.map((entry) => (
                     <div key={entry.id} className="border-l-2 pl-3 py-1" style={{ borderColor: entry.userColor }}>
-                      <div className="flex items-center space-x-2">
-                        <div
-                          className="w-2 h-2 rounded-full"
-                          style={{ backgroundColor: entry.userColor }}
-                        ></div>
-                        <span className="text-sm font-medium">{entry.userName}</span>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                          <div
+                            className="w-2 h-2 rounded-full"
+                            style={{ backgroundColor: entry.userColor }}
+                          ></div>
+                          <span className="text-xs font-medium text-gray-500">{entry.userName}</span>
+                        </div>
+                        <span className="text-xs text-gray-400">
+                          {entry.timestamp.toLocaleTimeString('ja-JP')}
+                        </span>
                       </div>
-                      <div className="text-sm text-gray-600">
-                        <span className={`${entry.action === 'insert' ? 'text-green-600' : entry.action === 'delete' ? 'text-red-600' : 'text-blue-600'}`}>
+                      <div className="text-sm mt-0.5">
+                        <span className={`text-xs font-medium px-1 py-0.5 rounded ${
+                          entry.action === 'insert' ? 'bg-green-100 text-green-700' :
+                          entry.action === 'delete' ? 'bg-red-100 text-red-700' :
+                          'bg-blue-100 text-blue-700'
+                        }`}>
                           {entry.action === 'insert' ? '追加' : entry.action === 'delete' ? '削除' : '変更'}
                         </span>
-                        : {entry.content}
-                      </div>
-                      <div className="text-xs text-gray-400">
-                        {entry.timestamp.toLocaleTimeString('ja-JP')}
+                        <span className="ml-1.5 text-gray-700 text-sm break-all">{entry.content}</span>
                       </div>
                     </div>
                   ))
