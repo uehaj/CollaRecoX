@@ -128,6 +128,29 @@ npm run start
 | `/editor/[sessionId]` | Collaborative editing session |
 | `/recorder` | Batch audio processing mode |
 
+## Version Management
+
+This project uses semantic versioning. To bump the version:
+
+```bash
+# Patch version (0.1.0 → 0.1.1) - Bug fixes
+npm run version:patch
+
+# Minor version (0.1.0 → 0.2.0) - New features (backward compatible)
+npm run version:minor
+
+# Major version (0.1.0 → 1.0.0) - Breaking changes
+npm run version:major
+```
+
+These commands will:
+1. Update the version in `package.json`
+2. Create a git commit with message "chore: bump version to X.X.X"
+3. Create a git tag (e.g., `v0.1.1`)
+4. Automatically push the commit and tags to the remote repository
+
+**Current version**: See `package.json`
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.

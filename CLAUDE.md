@@ -269,5 +269,37 @@ load_contextしたときに即座にタスク開始はしないこと。
 - コミットするまえにビルドして
 - APIを勝手に増やすことは禁止
 - MCPはいっさいつかわないこと
-- bin/dev.shについてCLAUDE.mdに追記
+
 - 一時的なテストコードはworkdir配下に作成すること
+## nclcリモートホストでのサーバー起動・再起動
+
+nclcホストでサーバーを起動・再起動する場合は、必ず `bin/dev.sh` を使用してください。
+`node server.js` を直接実行すると、`.env.local` の環境変数が読み込まれず起動に失敗します。
+
+```bash
+# nclcでのサーバー起動（推奨）
+ssh nclc "cd ~/work/collarecox && bin/start.sh -f"    # プロダクションモード（推奨）
+ssh nclc "cd ~/work/collarecox && bin/dev.sh -f"     # 開発モード
+
+# ログ出力を有効にして起動
+ssh nclc "cd ~/work/collarecox && bin/dev.sh -f -l"
+
+# バックグラウンドで起動する場合
+ssh nclc "cd ~/work/collarecox && nohup bin/dev.sh -f -l > /dev/null 2>&1 < /dev/null &"
+```
+
+**注意:**
+- `-f` オプションを付けると、ポート8888を使用中の既存プロセスを自動killしてから起動します
+- `node server.js` を直接実行しないでください（環境変数 `OPENAI_API_KEY` が読み込まれません）
+
+## nohupによるバックグラウンド起動（重要）
+
+`bin/start.sh` や `bin/dev.sh` はフォアグラウンドで動作するため、SSH経由で実行するとSSHセッション切断時にプロセスが不安定になる（CPU高負荷で応答不能になる）。
+リモートからサーバーを起動する場合は、必ず以下のようにnohupでバックグラウンド起動すること。
+
+```bash
+# プロダクションモードでnohup起動（推奨）
+ssh nclc 'kill -9 $(lsof -ti:8888) 2>/dev/null; sleep 2; cd ~/work/collarecox && source <(grep -v "^#" .env.local | grep -v "^$" | sed "s/^/export /") && export NODE_TLS_REJECT_UNAUTHORIZED=0 && export NODE_ENV=production && nohup node server.js -h 0.0.0.0 -p 8888 > server.log 2>&1 < /dev/null &'
+```
+
+**注意:** `bin/start.sh -f` をSSH経由で直接実行すると、SSHタイムアウト時にプロセスが応答不能になる場合がある。

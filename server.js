@@ -1080,60 +1080,75 @@ app.prepare().then(() => {
   async function sendTextToHocuspocusDocument(sessionId, text) {
     try {
       console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${text}"`);
-      
+
       const roomName = `transcribe-editor-v2-${sessionId}`;
-      
+
       // Access existing document from server's documents collection
       const document = hocuspocus.documents.get(roomName);
-      
+
       if (document) {
         // Use session-specific field name to match client
         const fieldName = `content-${sessionId}`;
-        
+
         // TipTap Collaboration uses XmlFragment, not Text
         const fragment = document.getXmlFragment(fieldName);
-        
-        // Add text to existing paragraph or create new one if needed
+
+        // テキストを改行で分割し、各行を個別のパラグラフとして挿入する
+        // (\n をリテラル文字としてXmlTextに入れると段落構造が壊れるため)
+        const lines = text.split('\n').filter(line => line.trim() !== '');
+        if (lines.length === 0) return;
+
+        const Y = require('yjs');
         const hasContent = fragment.length > 0;
-        
+
         if (hasContent) {
-          // Get the last element in the fragment
+          // 1行目: 既存の最後のパラグラフに追加
           const lastElement = fragment.get(fragment.length - 1);
-          
+
           if (lastElement && lastElement.nodeName === 'paragraph') {
-            // Add text to the existing last paragraph
             const existingTextNode = lastElement.get(0);
-            if (existingTextNode && existingTextNode instanceof (require('yjs')).XmlText) {
-              // Append text with space to existing text node
-              existingTextNode.insert(existingTextNode.length, ` ${text}`);
-              console.log(`[Hocuspocus Integration] ✅ Text appended to existing paragraph in '${fieldName}'`);
+            if (existingTextNode && existingTextNode instanceof Y.XmlText) {
+              existingTextNode.insert(existingTextNode.length, ` ${lines[0]}`);
             } else {
-              // Create new text node in existing paragraph
-              const newTextNode = new (require('yjs')).XmlText();
-              newTextNode.insert(0, ` ${text}`);
+              const newTextNode = new Y.XmlText();
+              newTextNode.insert(0, ` ${lines[0]}`);
               lastElement.insert(lastElement.length, [newTextNode]);
-              console.log(`[Hocuspocus Integration] ✅ Text added as new text node in existing paragraph '${fieldName}'`);
             }
+            console.log(`[Hocuspocus Integration] ✅ First line appended to existing paragraph in '${fieldName}'`);
           } else {
-            // Last element is not a paragraph, create new paragraph
-            const newParagraph = new (require('yjs')).XmlElement('paragraph');
-            const newTextNode = new (require('yjs')).XmlText();
-            newTextNode.insert(0, ` ${text}`);
+            // 最後の要素がパラグラフでない場合、新規パラグラフ作成
+            const newParagraph = new Y.XmlElement('paragraph');
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, ` ${lines[0]}`);
             newParagraph.insert(0, [newTextNode]);
             fragment.insert(fragment.length, [newParagraph]);
-            console.log(`[Hocuspocus Integration] ✅ Text added as new paragraph to '${fieldName}'`);
+            console.log(`[Hocuspocus Integration] ✅ First line added as new paragraph to '${fieldName}'`);
+          }
+
+          // 2行目以降: 新規パラグラフとして挿入
+          for (let i = 1; i < lines.length; i++) {
+            const newParagraph = new Y.XmlElement('paragraph');
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, lines[i]);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+          }
+          if (lines.length > 1) {
+            console.log(`[Hocuspocus Integration] ✅ ${lines.length - 1} additional paragraphs created in '${fieldName}'`);
           }
         } else {
-          // No content yet, create first content paragraph
-          const newParagraph = new (require('yjs')).XmlElement('paragraph');
-          const newTextNode = new (require('yjs')).XmlText();
-          newTextNode.insert(0, text);
-          newParagraph.insert(0, [newTextNode]);
-          fragment.insert(0, [newParagraph]);
-          console.log(`[Hocuspocus Integration] ✅ Text added as first content to '${fieldName}'`);
+          // コンテンツなし: 各行を個別のパラグラフとして作成
+          for (const line of lines) {
+            const newParagraph = new Y.XmlElement('paragraph');
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, line);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+          }
+          console.log(`[Hocuspocus Integration] ✅ ${lines.length} paragraphs added as first content to '${fieldName}'`);
         }
-        
-        console.log(`[Hocuspocus Integration] ✅ Text added as paragraph to XmlFragment '${fieldName}' in document: ${roomName}`);
+
+        console.log(`[Hocuspocus Integration] ✅ Text added to XmlFragment '${fieldName}' in document: ${roomName} (${lines.length} lines)`);
       } else {
         console.log(`[Hocuspocus Integration] ⚠️ Document not found, creating via direct connection: ${roomName}`);
 
@@ -1145,14 +1160,18 @@ app.prepare().then(() => {
           const fieldName = `content-${sessionId}`;
           const fragment = directDoc.getXmlFragment(fieldName);
 
-          // Create initial content
-          const newParagraph = new (require('yjs')).XmlElement('paragraph');
-          const newTextNode = new (require('yjs')).XmlText();
-          newTextNode.insert(0, text);
-          newParagraph.insert(0, [newTextNode]);
-          fragment.insert(fragment.length, [newParagraph]);
+          // Create initial content - 改行で分割してパラグラフごとに挿入
+          const Y = require('yjs');
+          const dcLines = text.split('\n').filter(line => line.trim() !== '');
+          for (const line of (dcLines.length > 0 ? dcLines : [text])) {
+            const newParagraph = new Y.XmlElement('paragraph');
+            const newTextNode = new Y.XmlText();
+            newTextNode.insert(0, line);
+            newParagraph.insert(0, [newTextNode]);
+            fragment.insert(fragment.length, [newParagraph]);
+          }
 
-          console.log(`[Hocuspocus Integration] ✅ Document created and text added via direct connection: ${roomName}`);
+          console.log(`[Hocuspocus Integration] ✅ Document created and text added via direct connection: ${roomName} (${dcLines.length} lines)`);
 
           // Keep the connection alive for a short time to ensure sync
           setTimeout(() => {
