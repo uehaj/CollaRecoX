@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect } from "react";
+import { buildWsUrl } from "@/lib/wsUrl";
 
 type RealtimeModel = "gpt-4o-realtime-preview" | "gpt-4o-mini-realtime-preview";
 
@@ -90,7 +91,7 @@ export default function MediaRecorderClient() {
       return;
     }
 
-    const wsUrl = `wss://genai.dgi.ntt-tx.co.jp:8000/api/realtime-ws?model=${model}`;
+    const wsUrl = buildWsUrl('/api/realtime-ws', { model });
     console.log('[WebSocket] Connecting to:', wsUrl);
     const ws = new WebSocket(wsUrl);
     websocketRef.current = ws;

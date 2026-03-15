@@ -4,13 +4,13 @@
   "private": true,
   "license": "MIT",
   "scripts": {
-    "dev": "node server.js -h 0.0.0.0 -p 8888",
+    "dev": "node --localstorage-file=/tmp/node-localstorage server.js -h 0.0.0.0 -p 8888",
     "build": "next build",
-    "start": "NODE_ENV=production node server.js -h 0.0.0.0",
+    "start": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -h 0.0.0.0",
     "next-dev": "next dev",
     "lint": "next lint",
-    "server": "node server.js -p 5001",
-    "server:prod": "NODE_ENV=production node server.js -p 5001"
+    "server": "node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
+    "server:prod": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -p 5001"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
