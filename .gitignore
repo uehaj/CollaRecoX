@@ -90,3 +90,6 @@ transcribe@*
 # PID files
 *.pid
 workdir/
+
+# Claude Code
+.claude/
