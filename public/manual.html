@@ -236,6 +236,7 @@
         <li><a href="#pages">ページ一覧</a></li>
         <li><a href="#overview">概要</a></li>
         <li><a href="#quickstart">クイックスタート</a></li>
+        <li><a href="#audio-source">音声ソース選択</a></li>
         <li><a href="#microphone">マイク入力</a></li>
         <li><a href="#dummy-audio">録音データからの文字起こし</a></li>
         <li><a href="#parameters">パラメータ設定</a></li>
@@ -272,6 +273,11 @@
           <td>共同編集画面</td>
           <td><a href="/editor/demo">/editor/{sessionId}</a></td>
           <td>文字起こし結果を複数人で同時編集。セッションIDでルームを共有</td>
+        </tr>
+        <tr>
+          <td>タブ音声キャプチャテスト</td>
+          <td><a href="/tab-capture">/tab-capture</a></td>
+          <td>ブラウザタブの音声をキャプチャして文字起こしするテストページ</td>
         </tr>
         <tr>
           <td>マニュアル</td>
@@ -412,6 +418,43 @@
       <div class="tip">
         共同校正セッションを作成していた場合、文字起こし結果が自動的に共同編集画面に送信されます。複数人で同時に校正作業を行えます。
       </div>
+    </section>
+
+    <section id="audio-source">
+      <h2>音声ソースの選択</h2>
+      <p>
+        文字起こし実行画面では、音声の入力元として「タブ音声キャプチャ」と「マイク」の2種類を選択できます。
+        デフォルトは「タブ音声キャプチャ」です。
+      </p>
+
+      <h3>タブ音声キャプチャ（デフォルト）</h3>
+      <p>
+        ブラウザの <code>getDisplayMedia()</code> APIを使用して、別のブラウザタブで再生されている音声を直接キャプチャします。
+        VB-Cable等の仮想音声デバイスなしで、Webアプリ（YouTube、Teams Web版など）の音声を文字起こしできます。
+      </p>
+      <ol style="margin-left: 20px;">
+        <li>音声ソースで「タブ音声キャプチャ」（紫色ボタン）が選択されていることを確認</li>
+        <li><span class="button-example green">音声入力で文字起こし</span> ボタンをクリック</li>
+        <li>表示されるダイアログで、音声を再生中のタブを選択</li>
+        <li>「タブの音声も共有」にチェックを入れて共有</li>
+        <li>選択したタブで再生されている音声がリアルタイムで文字起こしされます</li>
+      </ol>
+
+      <div class="tip">
+        タブ音声キャプチャでは、連続的な音声に対応するため5秒ごとに自動的に認識結果を確定します。
+        マイク入力と異なり、無音区間がなくても定期的に文字起こし結果が表示されます。
+      </div>
+
+      <div class="warning">
+        タブ音声キャプチャはブラウザのセキュリティ機能により、ユーザーの操作（ボタンクリック）が必要です。
+        また、共有ダイアログで「タブの音声も共有」にチェックを入れないと音声が取得できません。
+      </div>
+
+      <h3>マイク入力</h3>
+      <p>
+        従来どおりPCのマイクから音声を取得します。マイクボタン（青色）をクリックして切り替えてください。
+        マイク選択時はデバイス選択プルダウンが表示されます。
+      </p>
     </section>
 
     <section id="microphone">
@@ -742,9 +785,23 @@
 
       <h4 style="margin-top: 25px; color: #555;">編集ハイライト</h4>
       <p>
-        他のユーザーが編集した箇所は、そのユーザーの色で下線表示されます。
+        編集した箇所は色付き下線で表示されます。
+        自分の編集は自分のカーソル色で、リモートユーザーの編集は青色の下線で表示されます。
         誰がどの部分を編集したかが一目でわかります。
         ツールバーのチェックボックスでON/OFFを切り替えられます。
+      </p>
+
+      <h4 style="margin-top: 25px; color: #555;">変更履歴</h4>
+      <p>
+        画面右側のサイドバーに変更履歴が表示されます。各変更には以下の情報が含まれます。
+      </p>
+      <ul style="margin-left: 20px; margin-bottom: 15px;">
+        <li><strong>ユーザー名</strong>と<strong>タイムスタンプ</strong></li>
+        <li><strong>アクションバッジ</strong>: <span style="background:#dcfce7;color:#15803d;padding:2px 6px;border-radius:4px;font-size:0.9em;">追加</span>（緑）、<span style="background:#fee2e2;color:#b91c1c;padding:2px 6px;border-radius:4px;font-size:0.9em;">削除</span>（赤）、<span style="background:#dbeafe;color:#1d4ed8;padding:2px 6px;border-radius:4px;font-size:0.9em;">変更</span>（青）</li>
+        <li><strong>テキストプレビュー</strong>: 追加・削除されたテキストの内容（30文字まで）と文字数</li>
+      </ul>
+      <p>
+        例: <code>追加 "会議の議題は..." (+15文字)</code>、<code>削除 "不要なテキスト" (-7文字)</code>
       </p>
     </section>
 

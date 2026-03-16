@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CollaRecoX ページ遷移フロー図</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', sans-serif;
+    background: #f0f2f5;
+    padding: 30px;
+  }
+  h1 {
+    text-align: center;
+    color: #1a1a2e;
+    margin-bottom: 10px;
+    font-size: 1.6em;
+  }
+  .subtitle {
+    text-align: center;
+    color: #666;
+    margin-bottom: 30px;
+    font-size: 0.9em;
+  }
+  svg {
+    display: block;
+    margin: 0 auto;
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    max-width: 100%;
+    height: auto;
+  }
+</style>
+</head>
+<body>
+<h1>CollaRecoX ページ遷移フロー図</h1>
+<p class="subtitle">2026-03-16 作成 / 全6ページの遷移関係</p>
+
+<svg width="1100" height="720" viewBox="0 0 1100 720">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#888"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#16a34a"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#ea580c"/>
+    </marker>
+    <marker id="arrow-navy" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#1e3a5f"/>
+    </marker>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity="0.15"/>
+    </filter>
+  </defs>
+
+  <!-- ページカード -->
+
+  <!-- トップページ / -->
+  <g transform="translate(440, 30)" filter="url(#shadow)">
+    <rect width="200" height="80" rx="10" fill="#3b82f6"/>
+    <text x="100" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">トップページ</text>
+    <text x="100" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/</text>
+    <text x="100" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">概要・ナビゲーション</text>
+  </g>
+
+  <!-- /realtime -->
+  <g transform="translate(170, 200)" filter="url(#shadow)">
+    <rect width="220" height="80" rx="10" fill="#16a34a"/>
+    <text x="110" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">文字起こし実行</text>
+    <text x="110" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/realtime</text>
+    <text x="110" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">音声入力 / 録音データ / セッション管理</text>
+  </g>
+
+  <!-- /dummy-recorder -->
+  <g transform="translate(680, 200)" filter="url(#shadow)">
+    <rect width="220" height="80" rx="10" fill="#ea580c"/>
+    <text x="110" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">録音データ作成</text>
+    <text x="110" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/dummy-recorder</text>
+    <text x="110" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">テスト用録音データの作成・管理</text>
+  </g>
+
+  <!-- /editor/{sessionId} -->
+  <g transform="translate(60, 410)" filter="url(#shadow)">
+    <rect width="220" height="80" rx="10" fill="#7c3aed"/>
+    <text x="110" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">共同編集画面</text>
+    <text x="110" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/editor/{sessionId}</text>
+    <text x="110" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">リアルタイム共同校正</text>
+  </g>
+
+  <!-- /tab-capture -->
+  <g transform="translate(420, 410)" filter="url(#shadow)">
+    <rect width="200" height="80" rx="10" fill="#6b7280"/>
+    <text x="100" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">タブ音声キャプチャ</text>
+    <text x="100" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/tab-capture</text>
+    <text x="100" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">テストページ（独立）</text>
+  </g>
+
+  <!-- /manual.html -->
+  <g transform="translate(740, 410)" filter="url(#shadow)">
+    <rect width="200" height="80" rx="10" fill="#1e3a5f"/>
+    <text x="100" y="30" text-anchor="middle" fill="white" font-weight="bold" font-size="15">マニュアル</text>
+    <text x="100" y="50" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-size="12">/manual.html</text>
+    <text x="100" y="68" text-anchor="middle" fill="rgba(255,255,255,0.7)" font-size="10">操作ガイド（静的HTML）</text>
+  </g>
+
+  <!-- 遷移矢印 -->
+
+  <!-- トップ → /realtime -->
+  <line x1="480" y1="110" x2="330" y2="200" stroke="#3b82f6" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <text x="380" y="148" fill="#3b82f6" font-size="10" transform="rotate(-22, 380, 148)">文字起こしの実行 →</text>
+
+  <!-- トップ → /dummy-recorder -->
+  <line x1="600" y1="110" x2="740" y2="200" stroke="#3b82f6" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <text x="690" y="148" fill="#3b82f6" font-size="10" transform="rotate(22, 690, 148)">録音データ作成 →</text>
+
+  <!-- トップ → /manual.html -->
+  <line x1="590" y1="110" x2="830" y2="408" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-blue)"/>
+  <text x="730" y="265" fill="#3b82f6" font-size="9" transform="rotate(42, 730, 265)">マニュアルを見る</text>
+
+  <!-- /realtime ↔ /dummy-recorder (双方向) -->
+  <line x1="390" y1="230" x2="678" y2="230" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <text x="530" y="222" text-anchor="middle" fill="#16a34a" font-size="10">録音データ作成</text>
+  <line x1="680" y1="250" x2="392" y2="250" stroke="#ea580c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="530" y="268" text-anchor="middle" fill="#ea580c" font-size="10">リアルタイム文字起こし</text>
+
+  <!-- /realtime → /editor/{sessionId} -->
+  <line x1="230" y1="280" x2="180" y2="408" stroke="#16a34a" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+  <text x="155" y="345" fill="#16a34a" font-size="10">共同校正セッションを開く</text>
+  <text x="155" y="360" fill="#16a34a" font-size="9" font-style="italic">（新しいタブで開く）</text>
+
+  <!-- /realtime → /manual.html -->
+  <line x1="365" y1="280" x2="790" y2="408" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-green)"/>
+  <text x="580" y="338" fill="#16a34a" font-size="9" transform="rotate(16, 580, 338)">マニュアル</text>
+
+  <!-- /dummy-recorder → /manual.html -->
+  <line x1="840" y1="280" x2="840" y2="408" stroke="#ea580c" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-orange)"/>
+  <text x="852" y="348" fill="#ea580c" font-size="9">マニュアル</text>
+
+  <!-- /editor → /manual.html -->
+  <line x1="280" y1="450" x2="738" y2="450" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-purple)"/>
+  <text x="500" y="442" text-anchor="middle" fill="#7c3aed" font-size="9">校正者マニュアルを開く</text>
+
+  <!-- /manual.html → トップ -->
+  <line x1="880" y1="408" x2="610" y2="112" stroke="#1e3a5f" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow-navy)"/>
+  <text x="770" y="248" fill="#1e3a5f" font-size="9" transform="rotate(-45, 770, 248)">← システムトップに戻る</text>
+
+  <!-- 注記 -->
+  <text x="840" y="510" text-anchor="middle" fill="#1e3a5f" font-size="9">※ ページ一覧から</text>
+  <text x="840" y="525" text-anchor="middle" fill="#1e3a5f" font-size="9">全ページへリンクあり</text>
+
+  <text x="520" y="510" text-anchor="middle" fill="#6b7280" font-size="9">※ 他ページへのリンクなし</text>
+  <text x="520" y="525" text-anchor="middle" fill="#6b7280" font-size="9">（テスト専用の独立ページ）</text>
+
+  <!-- 凡例 -->
+  <text x="550" y="590" text-anchor="middle" fill="#333" font-size="13" font-weight="bold">遷移の種類</text>
+  <line x1="120" y1="620" x2="220" y2="620" stroke="#888" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="230" y="624" fill="#555" font-size="11">メインナビゲーション</text>
+  <line x1="450" y1="620" x2="550" y2="620" stroke="#888" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrow)"/>
+  <text x="560" y="624" fill="#555" font-size="11">サブナビゲーション（マニュアル等）</text>
+
+  <rect x="120" y="648" width="14" height="14" rx="3" fill="#3b82f6"/>
+  <text x="140" y="660" fill="#555" font-size="11">トップページ</text>
+  <rect x="260" y="648" width="14" height="14" rx="3" fill="#16a34a"/>
+  <text x="280" y="660" fill="#555" font-size="11">文字起こし実行</text>
+  <rect x="420" y="648" width="14" height="14" rx="3" fill="#ea580c"/>
+  <text x="440" y="660" fill="#555" font-size="11">録音データ作成</text>
+  <rect x="580" y="648" width="14" height="14" rx="3" fill="#7c3aed"/>
+  <text x="600" y="660" fill="#555" font-size="11">共同編集</text>
+  <rect x="700" y="648" width="14" height="14" rx="3" fill="#6b7280"/>
+  <text x="720" y="660" fill="#555" font-size="11">テスト</text>
+  <rect x="790" y="648" width="14" height="14" rx="3" fill="#1e3a5f"/>
+  <text x="810" y="660" fill="#555" font-size="11">マニュアル</text>
+
+  <text x="550" y="700" text-anchor="middle" fill="#999" font-size="10">CollaRecoX v0.1.0 - ページ遷移フロー図 (2026-03-16)</text>
+</svg>
+
+</body>
+</html>

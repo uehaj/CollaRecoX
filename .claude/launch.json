@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "collarecox",
+      "runtimeExecutable": "bin/dev.sh",
+      "runtimeArgs": ["-f"],
+      "port": 8888
+    }
+  ]
+}
