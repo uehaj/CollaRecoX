@@ -93,3 +93,4 @@ workdir/
 
 # Claude Code
 .claude/
+!.claude/skills/
