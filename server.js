@@ -228,47 +228,42 @@ app.prepare().then(() => {
     let forceCommitObserver = null; // Store observer function for cleanup
     let forceCommitStatusMap = null; // Store statusMap reference for cleanup
 
-    // Use Realtime API in transcription-only mode (cost-effective)
-    // Connect with mini model, but configure for ASR-only processing
-    const realtimeModel = 'gpt-4o-mini-realtime-preview';
+    // Use Realtime API GA transcription session (no realtime model billed)
+    const openaiUrl = 'wss://api.openai.com/v1/realtime?intent=transcription';
+    console.log('Connecting to OpenAI Realtime API (transcription session):', openaiUrl);
 
-    // Connect to OpenAI Realtime API (will be configured for transcription-only)
-    const openaiUrl = `wss://api.openai.com/v1/realtime?model=${realtimeModel}`;
-    console.log('Connecting to OpenAI Realtime API (transcription-only mode):', openaiUrl);
-    
     // Create proxy agent if HTTPS_PROXY is set
     const proxyAgent = process.env.HTTPS_PROXY ? new HttpsProxyAgent(process.env.HTTPS_PROXY) : undefined;
-    
+
     const openaiWs = new WebSocket(openaiUrl, {
       headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       agent: proxyAgent
     });
 
-    // Function to create session configuration for transcription-only mode
-    // Optimized to minimize Realtime model usage and maximize transcription accuracy
+    // Function to create session configuration (GA transcription session shape)
     const createSessionConfig = (prompt = '', asrModel = 'gpt-4o-transcribe') => ({
       type: 'session.update',
       session: {
-        modalities: ['text'],  // Only text output (no audio responses)
-        instructions: 'Transcription only mode.',  // Minimal instructions
-        input_audio_format: 'pcm16',
-        input_audio_transcription: {
-          model: asrModel,  // Use dedicated ASR model (gpt-4o-transcribe)
-          language: 'ja',   // Explicitly specify Japanese to prevent other language detection
-          ...(prompt ? { prompt: prompt } : {})
-        },
-        // Conditionally enable/disable VAD based on vadEnabled flag
-        turn_detection: vadEnabled ? {
-          type: 'server_vad',
-          threshold: vadThreshold,
-          prefix_padding_ms: vadPrefixPadding,
-          silence_duration_ms: vadSilenceDuration
-        } : null,  // null = disable VAD
-        temperature: 0.6,  // Minimum allowed value for Realtime API
-        max_response_output_tokens: 1  // Minimize response generation
+        type: 'transcription',
+        audio: {
+          input: {
+            format: { type: 'audio/pcm', rate: 24000 },
+            transcription: {
+              model: asrModel,  // Use dedicated ASR model (gpt-4o-transcribe)
+              language: 'ja',   // Explicitly specify Japanese to prevent other language detection
+              ...(prompt ? { prompt: prompt } : {})
+            },
+            // Conditionally enable/disable VAD based on vadEnabled flag
+            turn_detection: vadEnabled ? {
+              type: 'server_vad',
+              threshold: vadThreshold,
+              prefix_padding_ms: vadPrefixPadding,
+              silence_duration_ms: vadSilenceDuration
+            } : null  // null = disable VAD
+          }
+        }
       }
     });
 
@@ -408,7 +403,8 @@ app.prepare().then(() => {
 
             clientWs.send(JSON.stringify({
               type: 'speech_started',
-              audio_start_ms: message.audio_start_ms
+              audio_start_ms: message.audio_start_ms,
+              item_id: message.item_id
             }));
             // Update transcription status in Hocuspocus document
             if (currentSessionId) {
@@ -426,6 +422,7 @@ app.prepare().then(() => {
             clientWs.send(JSON.stringify({
               type: 'speech_stopped',
               audio_end_ms: message.audio_end_ms,
+              item_id: message.item_id,
               marker: speechBreakDetection ? speechBreakMarker : null,
               silence_gap_ms: silenceGapMs,
               silence_threshold_ms: paragraphBreakThreshold
@@ -818,7 +815,10 @@ app.prepare().then(() => {
             if (maxSample < 100) {
               // Silent chunk - accumulate silence duration
               accumulatedSilenceDuration += sampleDurationMs;
-              console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample}, accumulated silence=${accumulatedSilenceDuration.toFixed(0)}ms`);
+              // 低遅延設定（約43ms間隔）ではチャンク毎のログがI/O負荷になるため間引く
+              if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
+                console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample}, accumulated silence=${accumulatedSilenceDuration.toFixed(0)}ms`);
+              }
             } else {
               // Voice detected - reset accumulated silence
               if (accumulatedSilenceDuration > 0) {
@@ -833,7 +833,9 @@ app.prepare().then(() => {
             audioBufferDuration += chunkDurationMs;
             lastAudioTimestamp = Date.now();
             
-            console.log(`Audio chunk ${audioChunkCount}: buffer=${audioBufferDuration}ms, size=${message.audio.length} chars, max sample=${maxSample}`);
+            if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
+              console.log(`Audio chunk ${audioChunkCount}: buffer=${audioBufferDuration}ms, size=${message.audio.length} chars, max sample=${maxSample}`);
+            }
             
             // Log first few samples for debugging
             if (audioChunkCount <= 3) {
@@ -849,7 +851,9 @@ app.prepare().then(() => {
             // Check WebSocket state before sending
             if (openaiWs.readyState === 1) { // WebSocket.OPEN
               openaiWs.send(JSON.stringify(audioEvent));
-              console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+              if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
+                console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
+              }
             } else {
               console.log(`⚠️ OpenAI WebSocket not ready (state: ${openaiWs.readyState}), skipping audio chunk`);
             }
