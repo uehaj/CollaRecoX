@@ -15,6 +15,11 @@ if (!process.env.OPENAI_API_KEY) {
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
 
+// ログ出力用サニタイズ: 制御文字（ANSIエスケープ等）を除去し上限長で切り詰める
+// （クライアント由来テキストによるログインジェクション・ログ肥大の防止）
+const sanitizeForLog = (value, maxLength = 100) =>
+  String(value).replace(/[\x00-\x1f\x7f]/g, '?').slice(0, maxLength);
+
 // Port
 let port = 8888;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
@@ -201,6 +206,7 @@ app.prepare().then(() => {
     // VAD parameters - controls when OpenAI detects speech end (Server VAD mode only)
     // vadSilenceDuration: OpenAI's VAD will fire speech_stopped after this much silence
     let vadEnabled = true; // VAD enabled/disabled (default: true)
+    let localPendingCount = 0; // local_pending受信数（ログ間引き用）
     let vadThreshold = 0.2;
     let vadSilenceDuration = 600; // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間（推奨: 500-700ms）
     let vadPrefixPadding = 300;
@@ -592,7 +598,14 @@ app.prepare().then(() => {
           case 'set_session_id':
             // Set current session ID for Hocuspocus integration
             if (message.sessionId) {
-              currentSessionId = message.sessionId;
+              // 検証: 制御文字を含まない100文字以内の文字列のみ受け付ける
+              // （ログインジェクション・異常に長いYjsルーム名の防止）
+              const sidCandidate = String(message.sessionId);
+              if (sidCandidate.length > 100 || /[\x00-\x1f\x7f]/.test(sidCandidate)) {
+                console.warn('⚠️ Invalid session ID format rejected');
+                break;
+              }
+              currentSessionId = sidCandidate;
               console.log(`📋 Set current session ID: ${currentSessionId}`);
               console.log(`[Debug] Session ID successfully stored for Hocuspocus integration`);
 
@@ -940,6 +953,43 @@ app.prepare().then(() => {
             }
             break;
             
+          case 'local_transcription': {
+            // クライアント主認識（オンデバイス認識）モードの確定テキストを共有ドキュメントへ転送する
+            // OpenAIは関与しない（音声は送信されない）
+            if (!message.text) break;
+            // 検証: 文字列かつ上限長以内（巨大ペイロードのYjs書き込み・全クライアント配信を防止）
+            if (typeof message.text !== 'string' || message.text.length > 2000) {
+              console.warn('[LocalASR] ⚠️ local_transcription rejected: text too long or invalid');
+              break;
+            }
+            let localText = message.text;
+            if (forceLineBreakAtPeriod) {
+              localText = localText.replace(/。/g, '。\n');
+            }
+            if (currentSessionId) {
+              console.log(`[LocalASR] 📝 Local transcription → Hocuspocus(${currentSessionId}): "${sanitizeForLog(message.text)}"${message.continuation ? ' (継続)' : ''}`);
+              // continuation=true は発話途中からの部分確定なので、区切りスペースを入れない
+              sendTextToHocuspocusDocument(currentSessionId, localText, message.continuation !== true);
+              // 確定したので未確定（pending）表示をクリア
+              clearPendingText(currentSessionId);
+            } else {
+              console.log('[LocalASR] ⚠️ No session ID set, local transcription not forwarded');
+            }
+            break;
+          }
+
+          case 'local_pending':
+            // クライアント主認識モードの認識途中テキスト（毎回全文置き換え）を校正画面へ反映する
+            localPendingCount++;
+            if (localPendingCount <= 3 || localPendingCount % 20 === 0) {
+              console.log(`[LocalASR] 🔤 local_pending #${localPendingCount} (session=${currentSessionId || 'NONE'}): "${sanitizeForLog(message.text || '', 40)}"`);
+            }
+            if (currentSessionId && typeof message.text === 'string') {
+              // 表示用なので上限長で切り詰める（巨大ペイロードの全クライアント配信を防止）
+              setPendingText(currentSessionId, message.text.slice(0, 500));
+            }
+            break;
+
           case 'audio_commit':
             // Only commit if we have enough audio and not already processing
             if (audioBufferDuration >= 100 && !responseInProgress) {
@@ -1081,9 +1131,10 @@ app.prepare().then(() => {
   });
 
   // Function to send text to Hocuspocus document
-  async function sendTextToHocuspocusDocument(sessionId, text) {
+  // leadingSpace=false: 発話途中からの継続テキスト（部分確定）のため、区切りスペースを入れずに連結する
+  async function sendTextToHocuspocusDocument(sessionId, text, leadingSpace = true) {
     try {
-      console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${text}"`);
+      console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${sanitizeForLog(text)}"`);
 
       const roomName = `transcribe-editor-v2-${sessionId}`;
 
@@ -1103,6 +1154,12 @@ app.prepare().then(() => {
         if (lines.length === 0) return;
 
         const Y = require('yjs');
+
+        // 音声追記であることを編集側が判別できるよう、本文追記とspeechAppendSeqの更新を
+        // 同一Yjsトランザクションにまとめる（編集側はこれを下線・変更履歴の対象から除外する）
+        document.transact(() => {
+        const statusMap = document.getMap(`status-${sessionId}`);
+        statusMap.set('speechAppendSeq', (statusMap.get('speechAppendSeq') || 0) + 1);
         const hasContent = fragment.length > 0;
 
         if (hasContent) {
@@ -1111,11 +1168,12 @@ app.prepare().then(() => {
 
           if (lastElement && lastElement.nodeName === 'paragraph') {
             const existingTextNode = lastElement.get(0);
+            const firstLine = `${leadingSpace ? ' ' : ''}${lines[0]}`;
             if (existingTextNode && existingTextNode instanceof Y.XmlText) {
-              existingTextNode.insert(existingTextNode.length, ` ${lines[0]}`);
+              existingTextNode.insert(existingTextNode.length, firstLine);
             } else {
               const newTextNode = new Y.XmlText();
-              newTextNode.insert(0, ` ${lines[0]}`);
+              newTextNode.insert(0, firstLine);
               lastElement.insert(lastElement.length, [newTextNode]);
             }
             console.log(`[Hocuspocus Integration] ✅ First line appended to existing paragraph in '${fieldName}'`);
@@ -1123,7 +1181,7 @@ app.prepare().then(() => {
             // 最後の要素がパラグラフでない場合、新規パラグラフ作成
             const newParagraph = new Y.XmlElement('paragraph');
             const newTextNode = new Y.XmlText();
-            newTextNode.insert(0, ` ${lines[0]}`);
+            newTextNode.insert(0, `${leadingSpace ? ' ' : ''}${lines[0]}`);
             newParagraph.insert(0, [newTextNode]);
             fragment.insert(fragment.length, [newParagraph]);
             console.log(`[Hocuspocus Integration] ✅ First line added as new paragraph to '${fieldName}'`);
@@ -1151,6 +1209,7 @@ app.prepare().then(() => {
           }
           console.log(`[Hocuspocus Integration] ✅ ${lines.length} paragraphs added as first content to '${fieldName}'`);
         }
+        }); // document.transact（音声追記の単一トランザクション化）
 
         console.log(`[Hocuspocus Integration] ✅ Text added to XmlFragment '${fieldName}' in document: ${roomName} (${lines.length} lines)`);
       } else {
@@ -1238,6 +1297,26 @@ app.prepare().then(() => {
       }
     } catch (error) {
       console.error(`[Hocuspocus Integration] ❌ Error updating pending text:`, error);
+    }
+  }
+
+  // クライアント主認識（オンデバイス認識）のinterim用: pending textを全文置き換えで更新する
+  // OpenAI deltaの累積方式（updatePendingText）と異なり、Web Speechのinterimは
+  // 毎回その時点の認識仮説の全文が届き、仮説は後続音声で修正（バックトラック）されうる
+  function setPendingText(sessionId, text) {
+    try {
+      if (!sessionId) return;
+      // 同じ内容なら書き込まない（無駄なYjsブロードキャストの抑制）
+      if (pendingTextBySession.get(sessionId) === text) return;
+      pendingTextBySession.set(sessionId, text);
+      const roomName = `transcribe-editor-v2-${sessionId}`;
+      const document = hocuspocus.documents.get(roomName);
+      if (document) {
+        const statusMap = document.getMap(`status-${sessionId}`);
+        statusMap.set('pendingText', text);
+      }
+    } catch (error) {
+      console.error(`[Hocuspocus Integration] ❌ Error setting pending text:`, error);
     }
   }
 

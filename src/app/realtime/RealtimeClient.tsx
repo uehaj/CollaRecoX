@@ -134,6 +134,49 @@ const averageLatencyMs = (records: LatencyRecord[], pick: (r: LatencyRecord) => 
   return `${(values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(0)}ms`;
 };
 
+// ===== ローカルドラフト認識（ChromeオンデバイスWeb Speech API） =====
+// Chrome 139+のオンデバイス認識（processLocally）とChrome 135+のMediaStreamTrack入力
+// （start(track)）を併用し、話している最中から粗いドラフトを表示する。
+// 実験的APIでlib.domに型がないため、必要最小限の型を自前で宣言する。
+
+interface LocalSpeechRecognitionEvent {
+  resultIndex: number;
+  results: {
+    length: number;
+    [index: number]: { isFinal: boolean; 0: { transcript: string }; length: number };
+  };
+}
+
+interface LocalSpeechRecognition {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  processLocally?: boolean;
+  onresult: ((event: LocalSpeechRecognitionEvent) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  start: (track?: MediaStreamTrack) => void;
+  stop: () => void;
+  abort: () => void;
+}
+
+interface LocalSpeechRecognitionStatic {
+  new (): LocalSpeechRecognition;
+  available?: (options: { langs: string[]; processLocally?: boolean }) => Promise<string>;
+  install?: (options: { langs: string[]; processLocally?: boolean }) => Promise<boolean>;
+}
+
+const getSpeechRecognitionCtor = (): LocalSpeechRecognitionStatic | null => {
+  if (typeof window === 'undefined') return null;
+  const w = window as unknown as {
+    SpeechRecognition?: LocalSpeechRecognitionStatic;
+    webkitSpeechRecognition?: LocalSpeechRecognitionStatic;
+  };
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+};
+
+type LocalAsrStatus = 'checking' | 'available' | 'downloadable' | 'downloading' | 'unavailable' | 'unsupported';
+
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -157,11 +200,19 @@ export default function RealtimeClient() {
   }, [text]);
 
   // Initialize session ID on component mount
+  // リロードのたびにセッションIDが変わると校正画面とのペアリングが切れるため、
+  // localStorageに永続化して同じセッションを使い続ける
   useEffect(() => {
     if (!currentSessionId) {
-      const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      setCurrentSessionId(newSessionId);
-      console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+      const stored = typeof window !== 'undefined' ? window.localStorage.getItem('collarecox-realtime-session-id') : null;
+      if (stored) {
+        setCurrentSessionId(stored);
+        console.log('[Session] 🆔 Restored session ID from localStorage:', stored);
+      } else {
+        const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        setCurrentSessionId(newSessionId);
+        console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+      }
     }
   }, []); // Empty dependency array - runs only once on mount
 
@@ -187,6 +238,13 @@ export default function RealtimeClient() {
   const [paragraphBreakThreshold, setParagraphBreakThreshold] = useState<number>(2500); // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入（推奨: 2000-2500ms）
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
+
+  // セッションIDの変更を永続化（手動切り替え・新規生成も含めてリロード後に復元される）
+  useEffect(() => {
+    if (currentSessionId && typeof window !== 'undefined') {
+      window.localStorage.setItem('collarecox-realtime-session-id', currentSessionId);
+    }
+  }, [currentSessionId]);
   const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
   const [dummyAudioProgress, setDummyAudioProgress] = useState<{ currentSeconds: number; totalSeconds: number } | null>(null);
   const [localStorageRecordings, setLocalStorageRecordings] = useState<AudioRecording[]>([]);
@@ -220,6 +278,24 @@ export default function RealtimeClient() {
   const lastChunkVoicedRef = useRef<boolean>(false); // 直前チャンクが有音だったか（立ち上がり検出用）
   const utteranceMapRef = useRef<Map<string, LatencyRecord>>(new Map()); // item_id → 測定中の発話記録
   const [latencyRecords, setLatencyRecords] = useState<LatencyRecord[]>([]); // 確定した測定記録（UI表示用）
+
+  // ===== ローカル認識（オンデバイス）用の状態 =====
+  const [recognitionEngine, setRecognitionEngine] = useState<'local' | 'openai'>('local'); // 主認識エンジン（local=オンデバイス認識のみ・OpenAIへ音声を送らない）
+  const primaryStreamRef = useRef<MediaStream | null>(null); // ローカル主認識モードで取得したストリーム（停止用）
+  const [localDraftEnabled, setLocalDraftEnabled] = useState<boolean>(true); // OpenAIモード時のドラフト表示ON/OFF
+  const [localAsrStatus, setLocalAsrStatus] = useState<LocalAsrStatus>('checking'); // ja-JPオンデバイス認識の利用可否
+  const localRecognitionRef = useRef<LocalSpeechRecognition | null>(null);
+  const localAsrRestartTimerRef = useRef<NodeJS.Timeout | null>(null); // 自動再起動用タイマー
+  const [localForceFinalizeSec, setLocalForceFinalizeSec] = useState<number>(5); // 強制確定間隔（秒、0=なし）
+  const interimStartedAtRef = useRef<number | null>(null); // 現在の未確定部分が始まった時刻（部分確定の判定用）
+  const forceFinalizeTimerRef = useRef<NodeJS.Timeout | null>(null); // 部分確定の監視タイマー
+  const committedStrRef = useRef<string>(''); // 現在の発話のうち部分確定（コミット）済みの前置文字列
+  const interimFullRef = useRef<string>(''); // 現在のinterim仮説の全文
+  const lastPendingSentAtRef = useRef<number>(0); // local_pending送信のスロットリング用
+  const draftFinalsRef = useRef<Array<{ text: string; finalizedAt: number }>>([]); // 未置換のローカル確定分
+  const draftInterimRef = useRef<string>(''); // 認識途中のテキスト
+  const draftSuppressUntilRef = useRef<number>(0); // OpenAI確定直後に届くローカル確定を抑制する期限
+  const [draftText, setDraftText] = useState<string>(''); // 表示用（確定分+interim）
 
   // Get current prompt for transcription
   const getCurrentPrompt = useCallback((): string => {
@@ -282,6 +358,235 @@ export default function RealtimeClient() {
     }
     return record;
   }, []);
+
+  // ===== ローカルドラフト認識 =====
+
+  // マウント時にja-JPオンデバイス認識の利用可否を確認
+  useEffect(() => {
+    const ctor = getSpeechRecognitionCtor();
+    if (!ctor || typeof ctor.available !== 'function') {
+      setLocalAsrStatus('unsupported');
+      return;
+    }
+    ctor.available({ langs: ['ja-JP'], processLocally: true })
+      .then((result) => {
+        console.log('[LocalDraft] ja-JPオンデバイス認識の状態:', result);
+        if (result === 'available' || result === 'downloadable' || result === 'downloading') {
+          setLocalAsrStatus(result);
+        } else {
+          setLocalAsrStatus('unavailable');
+        }
+      })
+      .catch((err) => {
+        console.warn('[LocalDraft] 利用可否チェック失敗:', err);
+        setLocalAsrStatus('unsupported');
+      });
+  }, []);
+
+  // 言語パック（約60MB）のインストール
+  const installLocalAsr = useCallback(async () => {
+    const ctor = getSpeechRecognitionCtor();
+    if (!ctor || typeof ctor.install !== 'function') return;
+    setLocalAsrStatus('downloading');
+    try {
+      const ok = await ctor.install({ langs: ['ja-JP'], processLocally: true });
+      console.log('[LocalDraft] 言語パックインストール結果:', ok);
+      setLocalAsrStatus(ok ? 'available' : 'unavailable');
+    } catch (err) {
+      console.warn('[LocalDraft] 言語パックインストール失敗:', err);
+      setLocalAsrStatus('unavailable');
+    }
+  }, []);
+
+  // ドラフト表示テキストを再構築（未置換のローカル確定分 + 認識途中分）
+  const updateDraftText = useCallback(() => {
+    const finals = draftFinalsRef.current.map((s) => s.text).join('');
+    setDraftText(finals + draftInterimRef.current);
+  }, []);
+
+  // ローカルドラフト認識を停止してドラフトをクリア
+  const stopLocalDraftRecognition = useCallback(() => {
+    if (localAsrRestartTimerRef.current) {
+      clearTimeout(localAsrRestartTimerRef.current);
+      localAsrRestartTimerRef.current = null;
+    }
+    if (forceFinalizeTimerRef.current) {
+      clearInterval(forceFinalizeTimerRef.current);
+      forceFinalizeTimerRef.current = null;
+    }
+    interimStartedAtRef.current = null;
+    committedStrRef.current = '';
+    interimFullRef.current = '';
+    const rec = localRecognitionRef.current;
+    localRecognitionRef.current = null; // 先にnull化してonendの自動再起動を抑止する
+    if (rec) {
+      try { rec.abort(); } catch { /* already stopped */ }
+      console.log('[LocalDraft] 🛑 ローカル認識を停止');
+    }
+    draftFinalsRef.current = [];
+    draftInterimRef.current = '';
+    setDraftText('');
+    // 校正画面の未確定テキスト表示もクリアする
+    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: '' }));
+    }
+  }, []);
+
+  // ローカル認識を起動（録音開始時に音声ストリームを直接入力する）
+  // primary=true: 主認識モード。確定テキストを本文に直接追加し、共有ドキュメントへ転送する
+  // primary=false: ドラフトモード。薄色表示し、OpenAI確定テキストで置き換える
+  const startLocalDraftRecognition = useCallback((stream: MediaStream, primary: boolean) => {
+    const ctor = getSpeechRecognitionCtor();
+    const track = stream.getAudioTracks()[0];
+    if (!ctor || !track) return;
+
+    // 確定テキストを本文と共有ドキュメントへ反映する
+    // continuation=true: 発話の途中からの継続（区切りスペースを入れない）
+    // closeUtterance=true: 発話の締め（末尾にスペースを付ける）
+    const commitChunk = (chunk: string, continuation: boolean, closeUtterance: boolean) => {
+      if (!chunk) return;
+      const processed = forceLineBreakAtPeriod ? chunk.replace(/。/g, '。\n') : chunk;
+      setText(prev => prev + processed + (closeUtterance ? ' ' : ''));
+      if (websocketRef.current?.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({ type: 'local_transcription', text: chunk, continuation }));
+      }
+    };
+
+    const launch = () => {
+      try {
+        const rec = new ctor();
+        rec.lang = 'ja-JP';
+        rec.processLocally = true; // オンデバイス認識を強制（外部送信なし）
+        rec.continuous = true;
+        rec.interimResults = true;
+
+        rec.onresult = (event) => {
+          let interim = '';
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+            const transcript = result[0]?.transcript || '';
+            if (result.isFinal) {
+              if (primary) {
+                // 主認識モード: 部分確定済みの前置を除いた残りを本文に確定し、共有ドキュメントへ転送する
+                const committed = committedStrRef.current;
+                const remainder = transcript.length > committed.length ? transcript.slice(committed.length) : '';
+                commitChunk(remainder, committed.length > 0, true);
+                console.log(`[LocalASR] ✅ 確定: ${transcript}`);
+                committedStrRef.current = '';
+                interimFullRef.current = '';
+                interimStartedAtRef.current = null;
+              } else if (performance.now() < draftSuppressUntilRef.current) {
+                // OpenAI確定の直後に届いたローカル確定は、置き換え済み発話分とみなして破棄
+                console.log(`[LocalDraft] （置き換え済みとして破棄）: ${transcript}`);
+              } else {
+                draftFinalsRef.current.push({ text: transcript, finalizedAt: performance.now() });
+                console.log(`[LocalDraft] ローカル確定: ${transcript}`);
+              }
+            } else {
+              interim += transcript;
+            }
+          }
+          // 部分確定（コミット）済みの前置を除いた未確定部分（tail）だけを表示・配信する
+          let tail = interim;
+          if (primary && committedStrRef.current) {
+            const committed = committedStrRef.current;
+            if (interim.startsWith(committed)) {
+              tail = interim.slice(committed.length);
+            } else {
+              // 仮説がコミット済み前置と食い違った場合:
+              // 大半が一致していればコミット済み領域へのバックトラックとみなして位置基準で末尾を取り、
+              // ほぼ別物なら新しい発話の開始（前の発話が確定なしで消えた）とみなしてコミット状態をリセット
+              let common = 0;
+              const limit = Math.min(interim.length, committed.length);
+              while (common < limit && interim[common] === committed[common]) common++;
+              if (common < committed.length / 2) {
+                committedStrRef.current = '';
+                tail = interim;
+              } else {
+                tail = interim.length > committed.length ? interim.slice(committed.length) : '';
+              }
+            }
+          }
+          interimFullRef.current = interim;
+          draftInterimRef.current = tail;
+          updateDraftText();
+          // 部分確定の判定用に、未確定部分の開始時刻を記録する
+          if (tail) {
+            if (interimStartedAtRef.current === null) {
+              interimStartedAtRef.current = performance.now();
+            }
+          } else {
+            interimStartedAtRef.current = null;
+          }
+          // 主認識モード: 未確定テキストも共有ドキュメント（校正画面）へ随時配信する
+          // interimは毎回その時点の仮説全文が届くため、置き換え型のlocal_pendingで送る。
+          // interimの発火は高頻度なため200msでスロットリングする（クリア（空文字）は即時送信）
+          if (primary && websocketRef.current?.readyState === WebSocket.OPEN) {
+            const nowMs = performance.now();
+            if (tail === '' || nowMs - lastPendingSentAtRef.current > 200) {
+              websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: tail }));
+              lastPendingSentAtRef.current = nowMs;
+            }
+          }
+        };
+
+        rec.onerror = (event) => {
+          console.warn('[LocalDraft] 認識エラー:', event.error);
+        };
+
+        rec.onend = () => {
+          // Web Speechは無音等で勝手に停止するため、録音継続中は自動再起動する
+          if (recordingStateRef.current && localRecognitionRef.current === rec) {
+            localAsrRestartTimerRef.current = setTimeout(() => {
+              if (recordingStateRef.current && localRecognitionRef.current === rec) {
+                try {
+                  rec.start(track);
+                  console.log('[LocalDraft] 🔄 ローカル認識を自動再起動');
+                } catch (err) {
+                  console.warn('[LocalDraft] 自動再起動失敗:', err);
+                }
+              }
+            }, 250);
+          }
+        };
+
+        rec.start(track); // MediaStreamTrack入力（Chrome 135+）。タブ音声を直接認識できる
+        localRecognitionRef.current = rec;
+        console.log(`[LocalASR] 🎙️ ローカル認識を開始（${primary ? '主認識' : 'ドラフト'}モード・オンデバイス・ja-JP）`);
+      } catch (err) {
+        console.warn('[LocalASR] 起動失敗:', err);
+      }
+    };
+    launch();
+
+    // 部分確定の監視: 連続音声ではWeb Speechの確定（final）が話の切れ目まで出ないため、
+    // 未確定（interim）が一定時間続いたら、バックトラックで変わりやすい末尾を残して
+    // 安定した前半部分を自前で確定する。認識は止めないので音声の欠落は発生しない。
+    // （stop()による強制確定はオンデバイス認識では仮説を破棄してしまうため使えない）
+    if (primary && localForceFinalizeSec > 0) {
+      const TAIL_GUARD_CHARS = 12; // 揺れやすい末尾は確定しない
+      const MIN_COMMIT_CHARS = 4;  // 細切れ確定を避ける最小文字数
+      forceFinalizeTimerRef.current = setInterval(() => {
+        if (!recordingStateRef.current) return;
+        const startedAt = interimStartedAtRef.current;
+        if (startedAt === null || performance.now() - startedAt < localForceFinalizeSec * 1000) return;
+        const full = interimFullRef.current;
+        const committed = committedStrRef.current;
+        const tail = full.startsWith(committed) ? full.slice(committed.length) : '';
+        if (tail.length < TAIL_GUARD_CHARS + MIN_COMMIT_CHARS) return;
+        const chunk = tail.slice(0, tail.length - TAIL_GUARD_CHARS);
+        console.log(`[LocalASR] ⏱️ 部分確定（${localForceFinalizeSec}秒間隔）: "${chunk}"`);
+        commitChunk(chunk, committed.length > 0, false);
+        committedStrRef.current = committed + chunk;
+        draftInterimRef.current = full.slice(committedStrRef.current.length);
+        updateDraftText();
+        if (websocketRef.current?.readyState === WebSocket.OPEN) {
+          websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: draftInterimRef.current }));
+        }
+        interimStartedAtRef.current = performance.now();
+      }, 500);
+    }
+  }, [updateDraftText, forceLineBreakAtPeriod, localForceFinalizeSec]);
 
   // Get available audio input devices
   const getAudioDevices = useCallback(async () => {
@@ -459,6 +764,15 @@ export default function RealtimeClient() {
                   setLatencyRecords(prev => prev.map(r => (r.itemId === record.itemId ? { ...record } : r)));
                 }));
               }
+              // ローカルドラフトの置き換え: 確定到着時点までのローカル確定分とinterimを破棄し、
+              // 直後500msに遅れて届くローカル確定も同一発話分とみなして抑制する。
+              // （v1の単純方式: ローカル確定とOpenAI確定の到着順が前後する競合は完全には防げない）
+              if (draftFinalsRef.current.length > 0 || draftInterimRef.current) {
+                draftFinalsRef.current = [];
+                draftInterimRef.current = '';
+                draftSuppressUntilRef.current = performance.now() + 500;
+                updateDraftText();
+              }
             }
             // Server already applies force line break processing
             setText(prev => prev + message.text + ' ');
@@ -626,7 +940,7 @@ export default function RealtimeClient() {
         }
       };
     }); // Promise終了
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord, updateDraftText]);
 
   const disconnectWebSocket = useCallback(() => {
     // 自動切断タイマーをクリア
@@ -748,7 +1062,13 @@ export default function RealtimeClient() {
   // Audio streaming functions
   const startAudioStream = useCallback(async () => {
     try {
-      console.log('[Audio] 🎵 Starting audio stream... source:', audioSource);
+      console.log('[Audio] 🎵 Starting audio stream... source:', audioSource, 'engine:', recognitionEngine);
+
+      // ローカル主認識モードはオンデバイス認識が利用可能であることが前提
+      if (recognitionEngine === 'local' && localAsrStatus !== 'available') {
+        setError('オンデバイス認識が利用できません。「インストール」で言語パックを導入するか、認識エンジンをOpenAIに切り替えてください。');
+        return;
+      }
 
       let stream: MediaStream;
 
@@ -802,6 +1122,22 @@ export default function RealtimeClient() {
         });
       }
       console.log('[Audio] ✅ Media stream obtained');
+
+      // ローカル主認識モード: AudioContext/OpenAIへの音声送信は不要。
+      // オンデバイス認識にストリームを直接入力して文字起こしする（APIコストなし）
+      if (recognitionEngine === 'local') {
+        primaryStreamRef.current = stream;
+        recordingStateRef.current = true;
+        recordingStartTimeRef.current = Date.now();
+        setRecordingElapsedTime(0);
+        recordingTimerRef.current = setInterval(() => {
+          setRecordingElapsedTime((Date.now() - recordingStartTimeRef.current) / 1000);
+        }, 100);
+        setIsRecording(true);
+        startLocalDraftRecognition(stream, true);
+        console.log('[Audio] ✅ ローカル主認識モードで開始（OpenAIへの音声送信なし）');
+        return;
+      }
 
       // Enhanced AudioContext compatibility check
       const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -1081,6 +1417,11 @@ export default function RealtimeClient() {
       setIsRecording(true);
       console.log('[Audio] ✅ Audio streaming started successfully');
 
+      // OpenAIモード: ローカルドラフト認識を並行起動（オンデバイス認識が利用可能な場合のみ）
+      if (localDraftEnabled && localAsrStatus === 'available') {
+        startLocalDraftRecognition(stream, false);
+      }
+
       // タブキャプチャモード: 定期的にaudio_commitを送信してVAD無音検出を補助
       if (audioSource === 'tab-capture') {
         const commitInterval = 5000; // 5秒ごとにコミット
@@ -1105,7 +1446,7 @@ export default function RealtimeClient() {
       console.error('[Audio] ❌ Error starting audio stream:', err);
       setError(err instanceof Error ? err.message : 'Failed to start audio stream');
     }
-  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks, audioSource]);
+  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks, audioSource, recognitionEngine, localDraftEnabled, localAsrStatus, startLocalDraftRecognition]);
 
   const stopAudioStream = useCallback(() => {
     console.log('[Audio] 🛑 Stopping audio stream...');
@@ -1113,8 +1454,12 @@ export default function RealtimeClient() {
     // Stop recording state immediately
     recordingStateRef.current = false;
 
+    // ローカルドラフト認識を停止
+    stopLocalDraftRecognition();
+
     // Clear accumulated audio buffer
     accumulatedAudioRef.current = [];
+    accumulatedMetaRef.current = [];
 
     // タブキャプチャ用定期コミットタイマーをクリア
     if (tabCaptureCommitTimerRef.current) {
@@ -1152,6 +1497,12 @@ export default function RealtimeClient() {
       tabCaptureStreamRef.current = null;
     }
 
+    // ローカル主認識モードのストリーム停止
+    if (primaryStreamRef.current) {
+      primaryStreamRef.current.getTracks().forEach(t => t.stop());
+      primaryStreamRef.current = null;
+    }
+
     // Don't commit on stop - let the server handle remaining buffer automatically
     // The server will commit when it has enough audio or on timer
     console.log('[Audio] 📤 Stopping - server will handle remaining buffer');
@@ -1160,7 +1511,7 @@ export default function RealtimeClient() {
     setIsSpeaking(false);
     setPendingText(''); // Clear pending text when stopping
     console.log('[Audio] ✅ Audio stream stopped successfully');
-  }, []);
+  }, [stopLocalDraftRecognition]);
 
   // Function to send status messages to collaborative document
   // Note: Simplified to console.log only to avoid SSR issues with Yjs dynamic import
@@ -2406,6 +2757,95 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                     開始時にタブ選択ダイアログが表示されます。「タブの音声も共有」を有効にしてください。
                   </p>
                 )}
+
+                {/* 認識エンジン選択 */}
+                <div className="mt-3 p-2 bg-gray-50 rounded-md border border-gray-200">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    認識エンジン:
+                  </label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setRecognitionEngine('local')}
+                      disabled={isRecording}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                        recognitionEngine === 'local'
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    >
+                      <span>⚡</span> オンデバイス（無料・低遅延）
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRecognitionEngine('openai')}
+                      disabled={isRecording}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
+                        recognitionEngine === 'openai'
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    >
+                      <span>☁️</span> OpenAI transcribe（高精度）
+                    </button>
+                  </div>
+                  <div className="mt-1 text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+                    {localAsrStatus === 'checking' && <span>オンデバイス認識の対応状況を確認中...</span>}
+                    {localAsrStatus === 'unsupported' && <span>オンデバイス認識はこのブラウザで非対応です（Chrome 139以降が必要）。OpenAIエンジンを使用してください</span>}
+                    {localAsrStatus === 'unavailable' && <span>日本語のオンデバイス認識は利用できません。OpenAIエンジンを使用してください</span>}
+                    {localAsrStatus === 'downloadable' && (
+                      <>
+                        <span>言語パック（約60MB）が未インストール</span>
+                        <button
+                          onClick={installLocalAsr}
+                          disabled={isRecording}
+                          className="px-2 py-0.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          インストール
+                        </button>
+                      </>
+                    )}
+                    {localAsrStatus === 'downloading' && <span>言語パックをインストール中...（数分かかる場合があります）</span>}
+                    {localAsrStatus === 'available' && recognitionEngine === 'local' && (
+                      <span className="text-green-600">
+                        ✓ Chromeオンデバイス認識で文字起こしします（音声の外部送信なし・APIコストなし）。認識途中のテキストは薄色で表示されます
+                      </span>
+                    )}
+                  </div>
+                  {recognitionEngine === 'local' && localAsrStatus === 'available' && (
+                    <div className="mt-2 flex items-center gap-2 text-xs text-gray-700 flex-wrap">
+                      <label htmlFor="force-finalize-select" className="font-medium">部分確定間隔:</label>
+                      <select
+                        id="force-finalize-select"
+                        value={localForceFinalizeSec}
+                        onChange={(e) => setLocalForceFinalizeSec(parseInt(e.target.value))}
+                        disabled={isRecording}
+                        className="px-2 py-0.5 border border-gray-300 rounded text-xs disabled:bg-gray-100"
+                      >
+                        <option value="3">3秒</option>
+                        <option value="5">5秒</option>
+                        <option value="8">8秒</option>
+                        <option value="10">10秒</option>
+                        <option value="0">なし（自然な区切りのみ）</option>
+                      </select>
+                      <span className="text-gray-500">
+                        話が続いていても、この間隔で安定した前半部分を順次確定します（揺れやすい末尾は未確定のまま残ります）
+                      </span>
+                    </div>
+                  )}
+                  {recognitionEngine === 'openai' && (
+                    <label className="mt-2 flex items-center gap-2 text-xs font-medium text-gray-700">
+                      <input
+                        type="checkbox"
+                        checked={localDraftEnabled}
+                        onChange={(e) => setLocalDraftEnabled(e.target.checked)}
+                        disabled={isRecording || localAsrStatus !== 'available'}
+                        className="rounded"
+                      />
+                      ⚡ ローカルドラフト表示（話している最中の薄色暫定表示。確定テキストで置き換え）
+                    </label>
+                  )}
+                </div>
               </div>
 
               {/* Audio Input Device Selection */}
@@ -2725,9 +3165,13 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
             </div>
           </div>
           <div className="min-h-[200px] p-4 border border-gray-300 rounded-md bg-gray-50">
-            {text ? (
+            {(text || (isRecording && draftText)) ? (
               <p className="text-gray-900 whitespace-pre-wrap leading-relaxed">
                 {text}
+                {/* ローカルドラフト（オンデバイス認識の暫定テキスト。確定テキスト到着で置き換わる） */}
+                {isRecording && draftText && (
+                  <span className="text-gray-400">{draftText}</span>
+                )}
               </p>
             ) : (
               <p className="text-gray-500 italic">
