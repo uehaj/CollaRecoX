@@ -49,6 +49,11 @@ const extractDiffPreview = (base: string, changed: string, diffLength: number): 
 
 // 編集追跡Decoration用PluginKey
 const editTrackKey = new PluginKey('editTrack');
+
+// 認識中（pending）テキストのインライン表示用PluginKey
+// 確定テキストの直後にグレーで表示し、認識仮説の更新（バックトラック）をその場で反映する。
+// Decorationなので共有ドキュメント本体・編集履歴には一切影響しない
+const pendingTextKey = new PluginKey('pendingTextInline');
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -314,6 +319,30 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   }, [mounted, sessionId, modulesLoaded]);
 
   // Create editor with collaboration and cursor sharing (only when modules are loaded)
+  // ===== 音声追記の判定 =====
+  // サーバは確定テキストの本文追記と同一Yjsトランザクションで status-map の
+  // speechAppendSeq を進める。リモート変更の処理時にseqが前回見た値から進んでいれば、
+  // その変更は音声認識からの自動追記と確定でき、下線・変更履歴の対象から除外する。
+  // （下線用と履歴用は処理タイミングが別のため、最後に見たseqを個別に持つ）
+  const speechSeqUnderlineRef = useRef<number>(-1);
+  const speechSeqHistoryRef = useRef<number>(-1);
+
+  // 認識中（pending）インライン表示のspan要素（使い回してちらつきを防ぐ）
+  const pendingSpanRef = useRef<HTMLSpanElement | null>(null);
+  const consumeSpeechAppendSeq = (lastSeenRef: { current: number }): boolean => {
+    try {
+      const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq') as number | undefined;
+      if (typeof seq !== 'number') return false;
+      if (seq !== lastSeenRef.current) {
+        lastSeenRef.current = seq;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const editor = useEditor({
     immediatelyRender: false, // SSR compatibility
     extensions: [
@@ -347,6 +376,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
                   // リモート変更（Yjs同期）かローカル変更かを判定
                   const isRemote = tr.getMeta('addToHistory') === false;
+
+                  // 音声認識からの自動追記は「変更」として扱わない（下線を付けない）
+                  if (isRemote && consumeSpeechAppendSeq(speechSeqUnderlineRef)) return decorationSet;
                   // 下線色: ローカル=自分の色、リモート=青
                   const underlineColor = isRemote ? '#3b82f6' : userInfoRef.current.color;
 
@@ -374,6 +406,50 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   // 下線表示がOFFなら何も描画しない
                   if (!highlightEditsRef.current) return DecorationSet.empty;
                   return editTrackKey.getState(state);
+                },
+              },
+            }),
+          ];
+        },
+      }),
+      // 認識中（pending）テキストを確定テキストの直後にインライン表示するDecoration
+      Extension.create({
+        name: 'pendingTextInline',
+        addProseMirrorPlugins() {
+          return [
+            new Plugin({
+              key: pendingTextKey,
+              state: {
+                init: () => '',
+                apply(tr, prev) {
+                  const meta = tr.getMeta(pendingTextKey);
+                  return meta !== undefined ? (meta as string) : prev;
+                },
+              },
+              props: {
+                decorations(state) {
+                  const text = pendingTextKey.getState(state) as string;
+                  if (!text) return DecorationSet.empty;
+                  const doc = state.doc;
+                  // 最終ブロックが段落等のテキストブロックなら、その末尾の内側（=確定テキストの直後）に置く
+                  let pos = doc.content.size;
+                  if (doc.lastChild && doc.lastChild.isTextblock) {
+                    pos = doc.content.size - 1;
+                  }
+                  // キーを固定し、span要素を使い回す。テキストの更新はuseEffect側で
+                  // 同じ要素のtextContentを直接書き換える（キーにテキストを含めると
+                  // 追記のたびにウィジェットDOMが再生成され、表示がちらつくため）
+                  const widget = Decoration.widget(pos, () => {
+                    if (!pendingSpanRef.current) {
+                      const span = document.createElement('span');
+                      span.setAttribute('data-pending-inline', 'true');
+                      span.style.color = '#9ca3af';
+                      pendingSpanRef.current = span;
+                    }
+                    pendingSpanRef.current.textContent = ' ' + text;
+                    return pendingSpanRef.current;
+                  }, { side: 1, key: 'pending-inline' });
+                  return DecorationSet.create(doc, [widget]);
                 },
               },
             }),
@@ -432,8 +508,16 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         }
       }, 3000); // Yjs同期完了を待つ
     },
-    onUpdate: ({ editor }) => {
+    onUpdate: ({ editor, transaction }) => {
       const currentContent = editor.getText();
+
+      // 音声認識からの自動追記は変更履歴に残さない
+      // （比較基準だけ進めて、次の人の編集の差分計算に音声分が混ざらないようにする）
+      if (transaction.getMeta('addToHistory') === false && consumeSpeechAppendSeq(speechSeqHistoryRef)) {
+        lastContentRef.current = currentContent;
+        return;
+      }
+
       const previousContent = lastContentRef.current;
 
       if (currentContent !== previousContent) {
@@ -550,6 +634,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       console.error('[Collaborative Editor V2] ❌ Error setting up status listener:', error);
     }
   }, [sessionId, provider]);
+
+  // 認識中（pending）テキストの変化をDecorationに反映する
+  // （メタ情報付きの空トランザクションを発行してdecorationsを再計算させる）
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try {
+      // ウィジェットのDOM要素は使い回しているため、テキストは直接書き換える（ちらつき防止）。
+      // Decorationのキーが固定でもこの書き換えで表示は即時更新される
+      if (pendingSpanRef.current) {
+        pendingSpanRef.current.textContent = pendingText ? ' ' + pendingText : '';
+      }
+      editor.view.dispatch(editor.state.tr.setMeta(pendingTextKey, pendingText));
+    } catch (error) {
+      console.warn('[Collaborative Editor V2] ⚠️ Error updating pending decoration:', error);
+    }
+  }, [editor, pendingText]);
 
   // User registration in Yjs - register/unregister user in the shared users map
   useEffect(() => {
@@ -1051,13 +1151,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
               </button>
             </div>
-            {pendingText && (
-              <div className="px-4 pb-4">
-                <p className="text-gray-400 italic">
-                  <span className="animate-pulse">認識中: </span>{pendingText}
-                </p>
-              </div>
-            )}
+            {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration）に変更 */}
             {isTranscribing && !pendingText && (
               <div className="px-4 pb-4">
                 <p className="text-gray-400 italic animate-pulse">
