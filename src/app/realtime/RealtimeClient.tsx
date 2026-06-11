@@ -67,6 +67,7 @@ interface StatusMessage {
   message?: string;
   audio_start_ms?: number;
   audio_end_ms?: number;
+  item_id?: string;
   marker?: string | null;
   silence_gap_ms?: number;
   silence_threshold_ms?: number;
@@ -97,6 +98,41 @@ interface ParagraphBreakMessage {
 }
 
 type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage | DummyAudioProgressMessage | TranscriptionDeltaMessage | ParagraphBreakMessage;
+
+// ===== 遅延測定（タブ音声キャプチャ → 文字起こし表示） =====
+// 測定方式: 送信した音声のバッファ位置(ms)とキャプチャ時刻(performance.now)を元帳に記録し、
+// OpenAIのspeech_startedが返すaudio_start_ms（バッファ上の発話開始位置）から
+// 発話開始のキャプチャ時刻を逆引きする。クライアント完結なのでサーバとのクロック同期は不要。
+
+// 送信済み音声チャンクのバッファ位置範囲とキャプチャ時刻
+interface SentAudioLedgerEntry {
+  startMs: number;    // OpenAIバッファ上の開始位置（送信音声の累積ms）
+  endMs: number;      // 同 終了位置
+  capturedAt: number; // チャンク末尾のキャプチャ時刻（performance.now）
+}
+
+// 発話（音声区間）ごとの遅延測定記録
+interface LatencyRecord {
+  itemId: string;
+  basis: 'vad' | 'local'; // 発話開始時刻の根拠: OpenAI VAD位置の逆引き / クライアント側の有音立ち上がり検出
+  speechCapturedAt: number;       // 発話開始音声のキャプチャ時刻
+  speechEndCapturedAt?: number;   // 発話終了音声のキャプチャ時刻
+  vadDetectMs?: number;           // 発話開始 → speech_started受信
+  firstDeltaMs?: number;          // 発話開始 → 初回transcription_delta受信
+  completedMs?: number;           // 発話開始 → 確定テキスト受信
+  completedFromSpeechEndMs?: number; // 発話終了 → 確定テキスト受信
+  renderMs?: number;              // 発話開始 → 確定テキスト描画完了
+  text?: string;                  // 確定テキスト（先頭のみ）
+}
+
+const formatLatencyMs = (value: number | undefined): string =>
+  typeof value === 'number' ? `${value.toFixed(0)}ms` : '-';
+
+const averageLatencyMs = (records: LatencyRecord[], pick: (r: LatencyRecord) => number | undefined): string => {
+  const values = records.map(pick).filter((v): v is number => typeof v === 'number');
+  if (values.length === 0) return '-';
+  return `${(values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(0)}ms`;
+};
 
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
@@ -156,8 +192,8 @@ export default function RealtimeClient() {
   const [localStorageRecordings, setLocalStorageRecordings] = useState<AudioRecording[]>([]);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
   const [dummySendInterval, setDummySendInterval] = useState<number>(50); // Dummy audio send interval in ms
-  const [audioBufferSize, setAudioBufferSize] = useState<number>(8192); // ScriptProcessor buffer size (256, 512, 1024, 2048, 4096, 8192, 16384)
-  const [batchMultiplier, setBatchMultiplier] = useState<number>(8); // 一括送信する際のバッチ数（デフォルト:8=約1365ms間隔）
+  const [audioBufferSize, setAudioBufferSize] = useState<number>(2048); // ScriptProcessor buffer size (256, 512, 1024, 2048, 4096, 8192, 16384) 2048=約43ms（低遅延）
+  const [batchMultiplier, setBatchMultiplier] = useState<number>(1); // 一括送信する際のバッチ数（1=即時送信が最も低遅延。8だと約1365msの送信待ち遅延が発生する）
   const accumulatedAudioRef = useRef<Int16Array[]>([]); // 蓄積用バッファ
   const [skipSilentChunks, setSkipSilentChunks] = useState<boolean>(false); // 無音チャンクをスキップするかどうか（デフォルト:無効=高精度）
   const [forceLineBreakAtPeriod, setForceLineBreakAtPeriod] = useState<boolean>(true); // 句点で強制改行（デフォルト: 有効）
@@ -175,6 +211,15 @@ export default function RealtimeClient() {
   const [settingsUpdateMessage, setSettingsUpdateMessage] = useState<string>(''); // 設定更新のフィードバックメッセージ
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
   const [rewriteModel, setRewriteModel] = useState<string>('gpt-4.1-mini'); // AI再編モデル
+
+  // ===== 遅延測定用の状態 =====
+  const sentAudioLedgerRef = useRef<SentAudioLedgerEntry[]>([]); // 送信済み音声の位置元帳
+  const sentAudioTotalMsRef = useRef<number>(0); // 送信済み音声の累積ms（OpenAIバッファ位置と一致）
+  const accumulatedMetaRef = useRef<Array<{ samples: number; capturedAt: number }>>([]); // 蓄積中チャンクのキャプチャ時刻
+  const voiceOnsetQueueRef = useRef<Array<{ positionMs: number; capturedAt: number }>>([]); // 無音→有音の立ち上がり候補（VADイベントが来ない経路のフォールバック）
+  const lastChunkVoicedRef = useRef<boolean>(false); // 直前チャンクが有音だったか（立ち上がり検出用）
+  const utteranceMapRef = useRef<Map<string, LatencyRecord>>(new Map()); // item_id → 測定中の発話記録
+  const [latencyRecords, setLatencyRecords] = useState<LatencyRecord[]>([]); // 確定した測定記録（UI表示用）
 
   // Get current prompt for transcription
   const getCurrentPrompt = useCallback((): string => {
@@ -208,6 +253,34 @@ export default function RealtimeClient() {
       binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
+  }, []);
+
+  // 遅延測定: バッファ位置(ms)から該当音声のキャプチャ時刻を元帳から逆引きする。
+  // チャンク末尾のキャプチャ時刻から位置差分を引いて線形補間する
+  const captureTimeAtPosition = useCallback((positionMs: number): number | null => {
+    const ledger = sentAudioLedgerRef.current;
+    for (let i = ledger.length - 1; i >= 0; i--) {
+      const entry = ledger[i];
+      if (positionMs >= entry.startMs && positionMs <= entry.endMs) {
+        return entry.capturedAt - (entry.endMs - positionMs);
+      }
+    }
+    return null; // 元帳範囲外（ダミー音声併用などで位置がズレた場合は測定しない）
+  }, []);
+
+  // 遅延測定: item_idに対応する発話記録を取得。VADイベントが来ていない経路
+  // （タブキャプチャの定期コミット等）はローカル有音立ち上がりを発話開始として代用する
+  const resolveUtteranceRecord = useCallback((itemId: string | undefined): LatencyRecord | undefined => {
+    if (!itemId) return undefined;
+    let record = utteranceMapRef.current.get(itemId);
+    if (!record) {
+      const onset = voiceOnsetQueueRef.current.shift();
+      if (onset) {
+        record = { itemId, basis: 'local', speechCapturedAt: onset.capturedAt };
+        utteranceMapRef.current.set(itemId, record);
+      }
+    }
+    return record;
   }, []);
 
   // Get available audio input devices
@@ -268,6 +341,15 @@ export default function RealtimeClient() {
         setIsConnected(true);
         setIsConnecting(false);
         setError(null);
+
+        // 遅延測定の状態をリセット
+        // OpenAIセッションはWS接続ごとに作られるため、バッファ位置の基準もここで揃える
+        sentAudioLedgerRef.current = [];
+        sentAudioTotalMsRef.current = 0;
+        accumulatedMetaRef.current = [];
+        voiceOnsetQueueRef.current = [];
+        utteranceMapRef.current.clear();
+        lastChunkVoicedRef.current = false;
       
       // Send session ID to server if available
       if (currentSessionId) {
@@ -349,6 +431,35 @@ export default function RealtimeClient() {
             
           case 'transcription':
             console.log('[Transcription] 📝 Received text:', message.text);
+            // 遅延測定: 確定テキスト受信と描画完了の時刻を記録
+            {
+              const record = resolveUtteranceRecord(message.item_id);
+              if (record) {
+                const receivedAt = performance.now();
+                record.completedMs = receivedAt - record.speechCapturedAt;
+                if (record.speechEndCapturedAt !== undefined) {
+                  record.completedFromSpeechEndMs = receivedAt - record.speechEndCapturedAt;
+                }
+                record.text = (message.text || '').slice(0, 30);
+                // まず受信時点の記録をパネルに反映し、描画完了時刻は後から追記する
+                // （タブ非表示中はrequestAnimationFrameが止まるため2段階更新にする）
+                utteranceMapRef.current.delete(record.itemId);
+                setLatencyRecords(prev => [...prev.slice(-19), { ...record }]);
+                // 2フレーム後 = setTextの結果が描画された後の時刻でrenderMsを確定する
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                  record.renderMs = performance.now() - record.speechCapturedAt;
+                  console.log(
+                    `[Latency] ✅ item=${record.itemId} basis=${record.basis} | ` +
+                    `VAD検出=${formatLatencyMs(record.vadDetectMs)} ` +
+                    `初回テキスト=${formatLatencyMs(record.firstDeltaMs)} ` +
+                    `確定=${formatLatencyMs(record.completedMs)} ` +
+                    `発話終了→確定=${formatLatencyMs(record.completedFromSpeechEndMs)} ` +
+                    `描画完了=${formatLatencyMs(record.renderMs)}`
+                  );
+                  setLatencyRecords(prev => prev.map(r => (r.itemId === record.itemId ? { ...record } : r)));
+                }));
+              }
+            }
             // Server already applies force line break processing
             setText(prev => prev + message.text + ' ');
             // Clear pending text only if it matches the completed item
@@ -361,6 +472,14 @@ export default function RealtimeClient() {
           case 'transcription_delta':
             // Accumulate partial transcription for "recognition in progress" display
             console.log('[Transcription Delta] 🔄 Partial text:', message.delta);
+            // 遅延測定: 発話ごとの初回delta受信時刻を記録
+            {
+              const record = resolveUtteranceRecord(message.item_id);
+              if (record && record.firstDeltaMs === undefined) {
+                record.firstDeltaMs = performance.now() - record.speechCapturedAt;
+                console.log(`[Latency] 🔄 発話開始→初回テキスト: ${formatLatencyMs(record.firstDeltaMs)} (item=${record.itemId}, basis=${record.basis})`);
+              }
+            }
             // Track the item_id for this pending transcription
             if (message.item_id && pendingItemIdRef.current !== message.item_id) {
               // New item started, reset pending text
@@ -403,6 +522,23 @@ export default function RealtimeClient() {
           case 'speech_started':
             setIsSpeaking(true);
             console.log('[Speech Detection] 🎤 Speech started');
+            // 遅延測定: audio_start_ms（バッファ上の発話開始位置）からキャプチャ時刻を逆引き
+            if (typeof message.audio_start_ms === 'number' && message.item_id) {
+              const receivedAt = performance.now();
+              const capturedAt = captureTimeAtPosition(message.audio_start_ms);
+              if (capturedAt !== null) {
+                utteranceMapRef.current.set(message.item_id, {
+                  itemId: message.item_id,
+                  basis: 'vad',
+                  speechCapturedAt: capturedAt,
+                  vadDetectMs: receivedAt - capturedAt,
+                });
+                console.log(`[Latency] 🎤 発話開始→VAD検出: ${formatLatencyMs(receivedAt - capturedAt)} (item=${message.item_id}, audio_start_ms=${message.audio_start_ms})`);
+                // この発話に属するローカル立ち上がり候補は消費済みとして破棄
+                const startMs = message.audio_start_ms;
+                voiceOnsetQueueRef.current = voiceOnsetQueueRef.current.filter(o => o.positionMs > startMs);
+              }
+            }
             break;
             
           case 'speech_stopped':
@@ -410,6 +546,15 @@ export default function RealtimeClient() {
             const silenceGapMs = message.silence_gap_ms || 0;
             const silenceThresholdMs = message.silence_threshold_ms || vadSilenceDuration;
             console.log(`[Speech Detection] 🔇 Speech stopped (silence: ${silenceGapMs}ms, threshold: ${silenceThresholdMs}ms)`);
+
+            // 遅延測定: 発話終了位置（audio_end_ms）のキャプチャ時刻を記録
+            if (typeof message.audio_end_ms === 'number' && message.item_id) {
+              const record = utteranceMapRef.current.get(message.item_id);
+              const endCapturedAt = captureTimeAtPosition(message.audio_end_ms);
+              if (record && endCapturedAt !== null) {
+                record.speechEndCapturedAt = endCapturedAt;
+              }
+            }
 
             // Insert marker if speech break detection is enabled (for local display)
             // Only insert if actual silence gap exceeds threshold
@@ -481,7 +626,7 @@ export default function RealtimeClient() {
         }
       };
     }); // Promise終了
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord]);
 
   const disconnectWebSocket = useCallback(() => {
     // 自動切断タイマーをクリア
@@ -778,6 +923,32 @@ export default function RealtimeClient() {
         // Check for actual audio content before sending
         const maxPcmValue = Math.max(...Array.from(pcm16).map(Math.abs));
 
+        // 遅延測定: 無音→有音の立ち上がりをローカル発話開始候補として記録
+        // （VADイベントが来ない経路＝タブキャプチャの定期コミット等のフォールバック基準）
+        const captureNow = performance.now();
+        const chunkDurationMs = (pcm16.length / 24000) * 1000;
+        const isVoicedChunk = maxPcmValue >= 100;
+        if (isVoicedChunk && !lastChunkVoicedRef.current) {
+          // チャンク内で最初に閾値を超えたサンプル位置まで補間して立ち上がり時刻を求める
+          let firstVoicedIndex = 0;
+          for (let i = 0; i < pcm16.length; i++) {
+            if (Math.abs(pcm16[i]) >= 100) {
+              firstVoicedIndex = i;
+              break;
+            }
+          }
+          const onsetOffsetMs = (firstVoicedIndex / 24000) * 1000;
+          const pendingMs = accumulatedMetaRef.current.reduce((sum, m) => sum + (m.samples / 24000) * 1000, 0);
+          voiceOnsetQueueRef.current.push({
+            positionMs: sentAudioTotalMsRef.current + pendingMs + onsetOffsetMs,
+            capturedAt: captureNow - (chunkDurationMs - onsetOffsetMs),
+          });
+          if (voiceOnsetQueueRef.current.length > 50) {
+            voiceOnsetQueueRef.current.shift();
+          }
+        }
+        lastChunkVoicedRef.current = isVoicedChunk;
+
         // Skip silent audio chunks if enabled (threshold: 100 for 16-bit PCM)
         if (skipSilentChunks && maxPcmValue < 100) {
           skipCount++;
@@ -793,6 +964,8 @@ export default function RealtimeClient() {
 
         // Batch accumulation logic
         accumulatedAudioRef.current.push(pcm16);
+        // 遅延測定: 蓄積チャンクのキャプチャ時刻を音声データと対で記録
+        accumulatedMetaRef.current.push({ samples: pcm16.length, capturedAt: captureNow });
 
         // Check if we have accumulated enough batches
         if (accumulatedAudioRef.current.length >= batchMultiplier) {
@@ -807,6 +980,26 @@ export default function RealtimeClient() {
 
           // Clear accumulated buffer
           accumulatedAudioRef.current = [];
+
+          // 遅延測定: 送信する音声のバッファ位置範囲とキャプチャ時刻を元帳に記録
+          {
+            let ledgerPositionMs = sentAudioTotalMsRef.current;
+            for (const meta of accumulatedMetaRef.current) {
+              const metaDurationMs = (meta.samples / 24000) * 1000;
+              sentAudioLedgerRef.current.push({
+                startMs: ledgerPositionMs,
+                endMs: ledgerPositionMs + metaDurationMs,
+                capturedAt: meta.capturedAt,
+              });
+              ledgerPositionMs += metaDurationMs;
+            }
+            sentAudioTotalMsRef.current = ledgerPositionMs;
+            accumulatedMetaRef.current = [];
+            // 元帳の肥大化防止（直近分のみ保持）
+            if (sentAudioLedgerRef.current.length > 3000) {
+              sentAudioLedgerRef.current.splice(0, sentAudioLedgerRef.current.length - 2000);
+            }
+          }
 
           // Convert merged audio to base64
           const mergedBase64Audio = arrayBufferToBase64(mergedPcm16.buffer as ArrayBuffer);
@@ -1882,17 +2075,17 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               </div>
               <button
                 onClick={() => {
-                  setVadThreshold(0.2);
-                  setVadSilenceDuration(3000);
+                  setVadThreshold(0.5);
+                  setVadSilenceDuration(600);
                   setVadPrefixPadding(300);
                   setSkipSilentChunks(false);
-                  setAudioBufferSize(4096);
+                  setAudioBufferSize(2048);
                   setBatchMultiplier(1);
                   // 接続中なら全パラメータを送信
                   if (isConnected) {
                     sendVadParamsToServer({
-                      threshold: 0.2,
-                      silence_duration_ms: 3000,
+                      threshold: 0.5,
+                      silence_duration_ms: 600,
                       prefix_padding_ms: 300
                     });
                   }
@@ -2562,6 +2755,66 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
             </div>
           )}
         </div>
+
+        {/* 遅延測定パネル */}
+        {latencyRecords.length > 0 && (
+          <div className="bg-white p-6 rounded-lg shadow-md">
+            <div className="flex justify-between items-center mb-3">
+              <h3 className="text-lg font-medium text-gray-900">
+                ⏱️ 遅延測定（音声キャプチャ → 文字起こし表示）
+              </h3>
+              <button
+                onClick={() => setLatencyRecords([])}
+                className="px-3 py-1 rounded-md text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors"
+              >
+                クリア
+              </button>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-gray-700">
+                <thead>
+                  <tr className="border-b border-gray-300 text-xs text-gray-500">
+                    <th className="py-1 pr-3 text-left">#</th>
+                    <th className="py-1 pr-3 text-left">基準</th>
+                    <th className="py-1 pr-3 text-right">VAD検出</th>
+                    <th className="py-1 pr-3 text-right">初回テキスト</th>
+                    <th className="py-1 pr-3 text-right">確定テキスト</th>
+                    <th className="py-1 pr-3 text-right">発話終了→確定</th>
+                    <th className="py-1 pr-3 text-right">描画完了</th>
+                    <th className="py-1 text-left">テキスト</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...latencyRecords].reverse().map((record, index) => (
+                    <tr key={`${record.itemId}-${index}`} className="border-b border-gray-100">
+                      <td className="py-1 pr-3 text-gray-400">{latencyRecords.length - index}</td>
+                      <td className="py-1 pr-3">{record.basis === 'vad' ? 'VAD' : 'ローカル'}</td>
+                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.vadDetectMs)}</td>
+                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.firstDeltaMs)}</td>
+                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.completedMs)}</td>
+                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.completedFromSpeechEndMs)}</td>
+                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.renderMs)}</td>
+                      <td className="py-1 text-gray-500 truncate max-w-[200px]">{record.text}</td>
+                    </tr>
+                  ))}
+                  <tr className="font-medium bg-gray-50">
+                    <td className="py-1 pr-3" colSpan={2}>平均（{latencyRecords.length}件）</td>
+                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.vadDetectMs)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.firstDeltaMs)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.completedMs)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.completedFromSpeechEndMs)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.renderMs)}</td>
+                    <td className="py-1"></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-3 text-xs text-gray-500">
+              「発話開始」はタブ音声がブラウザに取り込まれた時刻（キャプチャ時刻）基準。動画の実再生とのズレはOSのキャプチャ遅延（数十ms程度）のみ。<br/>
+              基準=VAD: OpenAIのspeech_started位置（audio_start_ms）から逆引き ／ 基準=ローカル: クライアント側の無音→有音立ち上がり検出（VADイベントが来ない経路のフォールバック）
+            </p>
+          </div>
+        )}
 
         {/* Instructions */}
         <div className="bg-blue-50 p-6 rounded-lg border border-blue-200">
