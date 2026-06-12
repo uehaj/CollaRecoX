@@ -9,6 +9,7 @@ import {
   deleteAllRecordings,
   type AudioRecording
 } from '@/lib/indexedDB';
+import { getBasePath } from '@/lib/basePath';
 
 // 録音時間制限のデフォルト値
 const DEFAULT_TIME_LIMIT_MINUTES = 3; // デフォルト3分
@@ -526,7 +527,7 @@ export default function DummyRecorderPage() {
                 リアルタイム文字起こし
               </Link>
               <a
-                href="/manual.html"
+                href={`${getBasePath()}/manual.html`}
                 className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700 transition-colors"
                 target="_blank"
                 rel="noopener noreferrer"
