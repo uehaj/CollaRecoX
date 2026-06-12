@@ -1137,7 +1137,15 @@ export default function RealtimeClient() {
 
       // ローカル主認識モードはオンデバイス認識が利用可能であることが前提
       if (recognitionEngine === 'local' && localAsrStatus !== 'available') {
-        setError('オンデバイス認識が利用できません。「インストール」で言語パックを導入するか、認識エンジンをOpenAIに切り替えてください。');
+        // 状態に応じて、インストールボタンの場所まで具体的に案内する
+        if (localAsrStatus === 'downloadable') {
+          setError('オンデバイス認識には日本語の言語パックが必要です。この画面左下「音声入力からの文字起こし」セクション内の「認識エンジン」欄（⚡オンデバイス／☁️OpenAIの切替ボタンのすぐ下）にある青い「インストール」ボタンを押して言語パック（約60MB）を導入してください。または「認識エンジン」を「OpenAI transcribe」に切り替えてください。');
+        } else if (localAsrStatus === 'downloading') {
+          setError('言語パックをインストール中です（数分かかる場合があります）。完了までお待ちください。急ぐ場合は「認識エンジン」を「OpenAI transcribe」に切り替えてください。');
+        } else {
+          // unsupported / unavailable / checking
+          setError('このブラウザではオンデバイス認識が利用できません（Chrome 139以降が必要）。「音声入力からの文字起こし」セクションの「認識エンジン」欄で「☁️OpenAI transcribe」に切り替えてください。');
+        }
         return;
       }
 
