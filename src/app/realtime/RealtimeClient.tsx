@@ -97,7 +97,14 @@ interface ParagraphBreakMessage {
   marker: string;
 }
 
-type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage | DummyAudioProgressMessage | TranscriptionDeltaMessage | ParagraphBreakMessage;
+interface AutoProofreadMessage {
+  type: 'auto_proofread_started' | 'auto_proofread_completed' | 'auto_proofread_error';
+  paragraphs?: number;
+  chars?: number;
+  error?: string;
+}
+
+type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage | DummyAudioProgressMessage | TranscriptionDeltaMessage | ParagraphBreakMessage | AutoProofreadMessage;
 
 // ===== 遅延測定（タブ音声キャプチャ → 文字起こし表示） =====
 // 測定方式: 送信した音声のバッファ位置(ms)とキャプチャ時刻(performance.now)を元帳に記録し、
@@ -191,6 +198,8 @@ export default function RealtimeClient() {
 
   const [text, setText] = useState("");
   const textRef = useRef<string>(""); // Keep latest text value for logging
+  const transcriptScrollRef = useRef<HTMLDivElement | null>(null); // 文字起こし結果のスクロールボックス
+  const transcriptAtBottomRef = useRef<boolean>(true); // ユーザーが最下部付近にいるか（自動追従の判定用）
   const [pendingText, setPendingText] = useState(""); // Recognition in progress text
   const pendingItemIdRef = useRef<string | null>(null); // Track current pending item_id
 
@@ -201,17 +210,29 @@ export default function RealtimeClient() {
 
   // Initialize session ID on component mount
   // リロードのたびにセッションIDが変わると校正画面とのペアリングが切れるため、
-  // localStorageに永続化して同じセッションを使い続ける
+  // 優先順位: URLの?session=パラメータ → localStorage → 新規生成 で復元する。
+  // セッション変更時はURLとlocalStorageの両方に反映される（下の永続化effect）ので、
+  // リロード・ブックマーク・URL共有のいずれでも同じ配信セッションを継続できる
   useEffect(() => {
-    if (!currentSessionId) {
-      const stored = typeof window !== 'undefined' ? window.localStorage.getItem('collarecox-realtime-session-id') : null;
-      if (stored) {
-        setCurrentSessionId(stored);
-        console.log('[Session] 🆔 Restored session ID from localStorage:', stored);
+    if (!currentSessionId && typeof window !== 'undefined') {
+      const fromUrl = new URLSearchParams(window.location.search).get('session');
+      // サーバ側の検証と同条件（制御文字なし・100文字以内）のみ受け付ける
+      const isValidSessionId = (id: string | null): id is string =>
+        !!id && id.length <= 100 && !/[\x00-\x1f\x7f]/.test(id);
+
+      if (isValidSessionId(fromUrl)) {
+        setCurrentSessionId(fromUrl);
+        console.log('[Session] 🆔 Restored session ID from URL:', fromUrl);
       } else {
-        const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        setCurrentSessionId(newSessionId);
-        console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+        const stored = window.localStorage.getItem('collarecox-realtime-session-id');
+        if (isValidSessionId(stored)) {
+          setCurrentSessionId(stored);
+          console.log('[Session] 🆔 Restored session ID from localStorage:', stored);
+        } else {
+          const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          setCurrentSessionId(newSessionId);
+          console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+        }
       }
     }
   }, []); // Empty dependency array - runs only once on mount
@@ -240,9 +261,19 @@ export default function RealtimeClient() {
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
 
   // セッションIDの変更を永続化（手動切り替え・新規生成も含めてリロード後に復元される）
+  // localStorageに加えてURLの?session=にも反映し、リロード・ブックマークに耐える
   useEffect(() => {
     if (currentSessionId && typeof window !== 'undefined') {
       window.localStorage.setItem('collarecox-realtime-session-id', currentSessionId);
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.get('session') !== currentSessionId) {
+          url.searchParams.set('session', currentSessionId);
+          window.history.replaceState(null, '', url.toString());
+        }
+      } catch (err) {
+        console.warn('[Session] ⚠️ Failed to update URL with session ID:', err);
+      }
     }
   }, [currentSessionId]);
   const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
@@ -269,6 +300,8 @@ export default function RealtimeClient() {
   const [settingsUpdateMessage, setSettingsUpdateMessage] = useState<string>(''); // 設定更新のフィードバックメッセージ
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
   const [rewriteModel, setRewriteModel] = useState<string>('gpt-4.1-mini'); // AI再編モデル
+  const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
+  const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
 
   // ===== 遅延測定用の状態 =====
   const sentAudioLedgerRef = useRef<SentAudioLedgerEntry[]>([]); // 送信済み音声の位置元帳
@@ -289,13 +322,26 @@ export default function RealtimeClient() {
   const [localForceFinalizeSec, setLocalForceFinalizeSec] = useState<number>(5); // 強制確定間隔（秒、0=なし）
   const interimStartedAtRef = useRef<number | null>(null); // 現在の未確定部分が始まった時刻（部分確定の判定用）
   const forceFinalizeTimerRef = useRef<NodeJS.Timeout | null>(null); // 部分確定の監視タイマー
-  const committedStrRef = useRef<string>(''); // 現在の発話のうち部分確定（コミット）済みの前置文字列
-  const interimFullRef = useRef<string>(''); // 現在のinterim仮説の全文
+  // 部分確定の管理: 認識結果インデックス（results[i]）ごとに「その結果のうち何文字目まで
+  // コミット済みか」を持つ。文字列前置の照合やリセットを行わないため、セグメント切り替わりや
+  // バックトラックが起きても同じテキストを二度コミットすることが構造的にない
+  const committedByResultRef = useRef<Map<number, number>>(new Map());
+  const lastInterimResultRef = useRef<{ index: number; transcript: string } | null>(null); // 最新の未確定結果
   const lastPendingSentAtRef = useRef<number>(0); // local_pending送信のスロットリング用
   const draftFinalsRef = useRef<Array<{ text: string; finalizedAt: number }>>([]); // 未置換のローカル確定分
   const draftInterimRef = useRef<string>(''); // 認識途中のテキスト
   const draftSuppressUntilRef = useRef<number>(0); // OpenAI確定直後に届くローカル確定を抑制する期限
   const [draftText, setDraftText] = useState<string>(''); // 表示用（確定分+interim）
+
+  // 文字起こし結果の自動追従スクロール
+  // ユーザーが最下部付近にいるときだけ、新しいテキストに合わせて最下部へスクロールする
+  // （上へスクロールして読み返している間は追従しない）
+  useEffect(() => {
+    const el = transcriptScrollRef.current;
+    if (el && transcriptAtBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [text, pendingText, draftText]);
 
   // Get current prompt for transcription
   const getCurrentPrompt = useCallback((): string => {
@@ -415,8 +461,8 @@ export default function RealtimeClient() {
       forceFinalizeTimerRef.current = null;
     }
     interimStartedAtRef.current = null;
-    committedStrRef.current = '';
-    interimFullRef.current = '';
+    committedByResultRef.current = new Map();
+    lastInterimResultRef.current = null;
     const rec = localRecognitionRef.current;
     localRecognitionRef.current = null; // 先にnull化してonendの自動再起動を抑止する
     if (rec) {
@@ -440,6 +486,22 @@ export default function RealtimeClient() {
     const track = stream.getAudioTracks()[0];
     if (!ctor || !track) return;
 
+    // 多重起動ガード: 既存の認識インスタンスが残っていれば必ず停止する
+    // （複数の認識が同時に動くと同じ音声が重複コミットされる）
+    if (localRecognitionRef.current) {
+      const prev = localRecognitionRef.current;
+      localRecognitionRef.current = null;
+      try { prev.abort(); } catch { /* already stopped */ }
+      console.warn('[LocalASR] ⚠️ 既存のローカル認識を停止してから起動します');
+    }
+    if (forceFinalizeTimerRef.current) {
+      clearInterval(forceFinalizeTimerRef.current);
+      forceFinalizeTimerRef.current = null;
+    }
+    committedByResultRef.current = new Map();
+    lastInterimResultRef.current = null;
+    interimStartedAtRef.current = null;
+
     // 確定テキストを本文と共有ドキュメントへ反映する
     // continuation=true: 発話の途中からの継続（区切りスペースを入れない）
     // closeUtterance=true: 発話の締め（末尾にスペースを付ける）
@@ -461,20 +523,22 @@ export default function RealtimeClient() {
         rec.interimResults = true;
 
         rec.onresult = (event) => {
-          let interim = '';
+          let displayTail = '';
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const result = event.results[i];
             const transcript = result[0]?.transcript || '';
             if (result.isFinal) {
               if (primary) {
-                // 主認識モード: 部分確定済みの前置を除いた残りを本文に確定し、共有ドキュメントへ転送する
-                const committed = committedStrRef.current;
-                const remainder = transcript.length > committed.length ? transcript.slice(committed.length) : '';
-                commitChunk(remainder, committed.length > 0, true);
-                console.log(`[LocalASR] ✅ 確定: ${transcript}`);
-                committedStrRef.current = '';
-                interimFullRef.current = '';
-                interimStartedAtRef.current = null;
+                // 結果インデックスごとのコミット済み文字数を参照し、未コミットの残りだけを確定する。
+                // 文字列照合やリセットを行わないため、同じテキストの重複コミットは構造的に起きない
+                const done = committedByResultRef.current.get(i) || 0;
+                const remainder = transcript.length > done ? transcript.slice(done) : '';
+                commitChunk(remainder, done > 0, true);
+                committedByResultRef.current.set(i, transcript.length);
+                if (lastInterimResultRef.current?.index === i) {
+                  lastInterimResultRef.current = null;
+                }
+                console.log(`[LocalASR] ✅ 確定(result#${i}): ${transcript}`);
               } else if (performance.now() < draftSuppressUntilRef.current) {
                 // OpenAI確定の直後に届いたローカル確定は、置き換え済み発話分とみなして破棄
                 console.log(`[LocalDraft] （置き換え済みとして破棄）: ${transcript}`);
@@ -483,35 +547,18 @@ export default function RealtimeClient() {
                 console.log(`[LocalDraft] ローカル確定: ${transcript}`);
               }
             } else {
-              interim += transcript;
-            }
-          }
-          // 部分確定（コミット）済みの前置を除いた未確定部分（tail）だけを表示・配信する
-          let tail = interim;
-          if (primary && committedStrRef.current) {
-            const committed = committedStrRef.current;
-            if (interim.startsWith(committed)) {
-              tail = interim.slice(committed.length);
-            } else {
-              // 仮説がコミット済み前置と食い違った場合:
-              // 大半が一致していればコミット済み領域へのバックトラックとみなして位置基準で末尾を取り、
-              // ほぼ別物なら新しい発話の開始（前の発話が確定なしで消えた）とみなしてコミット状態をリセット
-              let common = 0;
-              const limit = Math.min(interim.length, committed.length);
-              while (common < limit && interim[common] === committed[common]) common++;
-              if (common < committed.length / 2) {
-                committedStrRef.current = '';
-                tail = interim;
-              } else {
-                tail = interim.length > committed.length ? interim.slice(committed.length) : '';
+              // 未確定: コミット済み分を除いた残りだけを表示・配信の対象にする
+              const done = committedByResultRef.current.get(i) || 0;
+              if (transcript.length > done) {
+                displayTail += transcript.slice(done);
               }
+              lastInterimResultRef.current = { index: i, transcript };
             }
           }
-          interimFullRef.current = interim;
-          draftInterimRef.current = tail;
+          draftInterimRef.current = displayTail;
           updateDraftText();
           // 部分確定の判定用に、未確定部分の開始時刻を記録する
-          if (tail) {
+          if (displayTail) {
             if (interimStartedAtRef.current === null) {
               interimStartedAtRef.current = performance.now();
             }
@@ -519,12 +566,11 @@ export default function RealtimeClient() {
             interimStartedAtRef.current = null;
           }
           // 主認識モード: 未確定テキストも共有ドキュメント（校正画面）へ随時配信する
-          // interimは毎回その時点の仮説全文が届くため、置き換え型のlocal_pendingで送る。
           // interimの発火は高頻度なため200msでスロットリングする（クリア（空文字）は即時送信）
           if (primary && websocketRef.current?.readyState === WebSocket.OPEN) {
             const nowMs = performance.now();
-            if (tail === '' || nowMs - lastPendingSentAtRef.current > 200) {
-              websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: tail }));
+            if (displayTail === '' || nowMs - lastPendingSentAtRef.current > 200) {
+              websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: displayTail }));
               lastPendingSentAtRef.current = nowMs;
             }
           }
@@ -540,6 +586,10 @@ export default function RealtimeClient() {
             localAsrRestartTimerRef.current = setTimeout(() => {
               if (recordingStateRef.current && localRecognitionRef.current === rec) {
                 try {
+                  // 再起動で認識結果リスト（results）が新規になるため、コミット管理もリセットする
+                  committedByResultRef.current = new Map();
+                  lastInterimResultRef.current = null;
+                  interimStartedAtRef.current = null;
                   rec.start(track);
                   console.log('[LocalDraft] 🔄 ローカル認識を自動再起動');
                 } catch (err) {
@@ -570,15 +620,16 @@ export default function RealtimeClient() {
         if (!recordingStateRef.current) return;
         const startedAt = interimStartedAtRef.current;
         if (startedAt === null || performance.now() - startedAt < localForceFinalizeSec * 1000) return;
-        const full = interimFullRef.current;
-        const committed = committedStrRef.current;
-        const tail = full.startsWith(committed) ? full.slice(committed.length) : '';
+        const last = lastInterimResultRef.current;
+        if (!last) return;
+        const done = committedByResultRef.current.get(last.index) || 0;
+        const tail = last.transcript.length > done ? last.transcript.slice(done) : '';
         if (tail.length < TAIL_GUARD_CHARS + MIN_COMMIT_CHARS) return;
         const chunk = tail.slice(0, tail.length - TAIL_GUARD_CHARS);
-        console.log(`[LocalASR] ⏱️ 部分確定（${localForceFinalizeSec}秒間隔）: "${chunk}"`);
-        commitChunk(chunk, committed.length > 0, false);
-        committedStrRef.current = committed + chunk;
-        draftInterimRef.current = full.slice(committedStrRef.current.length);
+        console.log(`[LocalASR] ⏱️ 部分確定（${localForceFinalizeSec}秒間隔, result#${last.index}）: "${chunk}"`);
+        commitChunk(chunk, done > 0, false);
+        committedByResultRef.current.set(last.index, done + chunk.length);
+        draftInterimRef.current = last.transcript.slice(done + chunk.length);
         updateDraftText();
         if (websocketRef.current?.readyState === WebSocket.OPEN) {
           websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: draftInterimRef.current }));
@@ -719,6 +770,14 @@ export default function RealtimeClient() {
         enabled: forceLineBreakAtPeriod
       }));
       console.log('[WebSocket] 📝 Sent force line break at period:', forceLineBreakAtPeriod);
+
+      // 自動校正設定を送信（set_session_id送信後である必要がある）
+      ws.send(JSON.stringify({
+        type: 'set_auto_proofread',
+        enabled: autoProofread,
+        model: rewriteModel
+      }));
+      console.log('[WebSocket] 🪄 Sent auto proofread setting:', autoProofread);
 
         // Promiseを解決して接続完了を通知
         resolve();
@@ -903,6 +962,18 @@ export default function RealtimeClient() {
             }
             break;
 
+          case 'auto_proofread_started':
+            setAutoProofreadStatus(`🪄 校正中...（${message.paragraphs ?? '-'}段落・${message.chars ?? '-'}文字）`);
+            break;
+
+          case 'auto_proofread_completed':
+            setAutoProofreadStatus(`✅ 校正完了: ${message.paragraphs ?? '-'}段落に整理（${new Date().toLocaleTimeString('ja-JP')}）`);
+            break;
+
+          case 'auto_proofread_error':
+            setAutoProofreadStatus(`❌ 校正エラー: ${message.error ?? '不明なエラー'}`);
+            break;
+
           case 'error':
           case 'transcription_error':
             setError(message.error);
@@ -940,7 +1011,7 @@ export default function RealtimeClient() {
         }
       };
     }); // Promise終了
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord, updateDraftText]);
+  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord, updateDraftText, autoProofread, rewriteModel]);
 
   const disconnectWebSocket = useCallback(() => {
     // 自動切断タイマーをクリア
@@ -2037,7 +2108,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 v{packageJson.version}
               </div>
               <a
-                href="/dummy-recorder"
+                href={`${getBasePath()}/dummy-recorder`}
                 className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
               >
                 録音データ作成
@@ -2846,6 +2917,37 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                     </label>
                   )}
                 </div>
+
+                {/* 自動校正設定 */}
+                <div className="mt-3 p-2 bg-gray-50 rounded-md border border-gray-200">
+                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={autoProofread}
+                      onChange={(e) => {
+                        setAutoProofread(e.target.checked);
+                        setAutoProofreadStatus('');
+                        if (websocketRef.current?.readyState === WebSocket.OPEN) {
+                          websocketRef.current.send(JSON.stringify({
+                            type: 'set_auto_proofread',
+                            enabled: e.target.checked,
+                            model: rewriteModel
+                          }));
+                        }
+                      }}
+                      className="rounded"
+                    />
+                    🪄 自動校正（誤字修正＋パラグラフ整理）
+                  </label>
+                  <p className="mt-1 ml-6 text-xs text-gray-500">
+                    ONにすると、認識テキストはAI校正（誤字修正・句読点補完・段落分け）を経てから校正画面に確定反映されます。
+                    校正前のテキストはグレーの未確定表示のまま見えます（100文字以上たまり次第・最短15秒間隔で処理、録音停止後は残りも自動処理）。
+                    モデル: {rewriteModel}
+                  </p>
+                  {autoProofreadStatus && (
+                    <p className="mt-1 ml-6 text-xs text-purple-600">{autoProofreadStatus}</p>
+                  )}
+                </div>
               </div>
 
               {/* Audio Input Device Selection */}
@@ -3164,7 +3266,17 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               </button>
             </div>
           </div>
-          <div className="min-h-[200px] p-4 border border-gray-300 rounded-md bg-gray-50">
+          <div
+            ref={transcriptScrollRef}
+            onScroll={() => {
+              const el = transcriptScrollRef.current;
+              if (el) {
+                // 最下部から40px以内なら「最下部にいる」とみなして自動追従を有効にする
+                transcriptAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+              }
+            }}
+            className="h-[300px] min-h-[160px] resize-y overflow-y-auto p-4 border border-gray-300 rounded-md bg-gray-50"
+          >
             {(text || (isRecording && draftText)) ? (
               <p className="text-gray-900 whitespace-pre-wrap leading-relaxed">
                 {text}

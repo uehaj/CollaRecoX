@@ -10,6 +10,7 @@ import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
+import { ySyncPluginKey } from 'y-prosemirror';
 import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
 import { getBasePath } from '@/lib/basePath';
@@ -296,6 +297,23 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         setUserCount(count);
       });
 
+      // 初期同期完了時に音声追記seqの基準値を現在値へ合わせる。
+      // これをしないと、接続前にサーバ側で進んでいたseq（過去の音声追記分）を
+      // 接続後の最初の編集で誤って消費してしまう。接続後に進んだ分だけが
+      // 下線・履歴の除外対象になるよう、両方のlastSeenをここで初期化する。
+      hocusProvider.on('synced', () => {
+        try {
+          const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq');
+          if (typeof seq === 'number') {
+            speechSeqUnderlineRef.current = seq;
+            speechSeqHistoryRef.current = seq;
+            console.log('[EditTracker] 🔢 speechAppendSeq baseline initialized:', seq);
+          }
+        } catch (e) {
+          console.warn('[EditTracker] ⚠️ Failed to init speechAppendSeq baseline:', e);
+        }
+      });
+
       setProvider(hocusProvider);
     }).catch((error) => {
       console.error('[Collaborative Editor V2] Failed to load HocuspocusProvider:', error);
@@ -320,9 +338,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Create editor with collaboration and cursor sharing (only when modules are loaded)
   // ===== 音声追記の判定 =====
-  // サーバは確定テキストの本文追記と同一Yjsトランザクションで status-map の
-  // speechAppendSeq を進める。リモート変更の処理時にseqが前回見た値から進んでいれば、
-  // その変更は音声認識からの自動追記と確定でき、下線・変更履歴の対象から除外する。
+  // サーバは音声由来の本文変更（確定テキスト追記・段落区切り）のたびに、その変更と
+  // 同一Yjsトランザクションで status-map の speechAppendSeq を +1 する。
+  // リモート変更の処理時に未消費のseq増分が残っていれば、その変更は音声認識からの
+  // 自動追記と確定でき、下線・変更履歴の対象から除外する。
+  //
+  // 重要: 1回の発話でサーバが追記と段落区切りを連続して呼ぶとseqが+2以上進み、
+  // editor側には複数のリモートtrが届く。そのため「seqが変わったか」ではなく
+  // 「未消費の増分を1つずつ消費する」方式にする（変化検知方式だと2つ目以降の
+  // リモートtrがすり抜けて下線が付いてしまう）。
   // （下線用と履歴用は処理タイミングが別のため、最後に見たseqを個別に持つ）
   const speechSeqUnderlineRef = useRef<number>(-1);
   const speechSeqHistoryRef = useRef<number>(-1);
@@ -333,8 +357,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     try {
       const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq') as number | undefined;
       if (typeof seq !== 'number') return false;
-      if (seq !== lastSeenRef.current) {
+      // 初回（-1）はその時点のseqに同期するだけ（過去分を消費対象にしない）
+      if (lastSeenRef.current < 0) {
         lastSeenRef.current = seq;
+        return false;
+      }
+      // 未消費の増分が残っていれば1つだけ消費して音声追記と判定する
+      if (seq > lastSeenRef.current) {
+        lastSeenRef.current += 1;
         return true;
       }
       return false;
@@ -371,29 +401,55 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   // 既存のDecorationを位置マッピング
                   decorationSet = decorationSet.map(tr.mapping, tr.doc);
 
+                  // リモート変更（Yjs同期）かローカル変更かを判定する。
+                  // y-prosemirrorはリモート由来（音声認識のサーバ追記を含む全Yjs同期）の
+                  // トランザクションに ySyncPluginKey メタの isChangeOrigin=true を付ける。
+                  // これがリモート判定の一次情報。以前使っていた addToHistory===false は
+                  // 履歴管理用フラグで、リモート/ローカルと必ずしも一致せず誤判定の原因だった。
+                  const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+                  const isRemote = ySyncMeta?.isChangeOrigin === true
+                    || tr.getMeta('addToHistory') === false;
+
+                  // 音声追記seqの消費判定は下線表示ON/OFFに関わらず先に行う
+                  // （OFF中にseqが溜まると、ON復帰後の判定がズレるため）
+                  const isSpeechAppend = isRemote && consumeSpeechAppendSeq(speechSeqUnderlineRef);
+
                   // 下線表示がOFFなら新しいDecorationを追加しない（mapping済みで返す）
                   if (!highlightEditsRef.current) return decorationSet;
 
-                  // リモート変更（Yjs同期）かローカル変更かを判定
-                  const isRemote = tr.getMeta('addToHistory') === false;
-
                   // 音声認識からの自動追記は「変更」として扱わない（下線を付けない）
-                  if (isRemote && consumeSpeechAppendSeq(speechSeqUnderlineRef)) return decorationSet;
+                  if (isSpeechAppend) return decorationSet;
+
                   // 下線色: ローカル=自分の色、リモート=青
                   const underlineColor = isRemote ? '#3b82f6' : userInfoRef.current.color;
+                  const underlineStyle = `text-decoration: underline; text-decoration-color: ${underlineColor}; text-decoration-thickness: 2px; text-underline-offset: 2px;`;
 
-                  // 変更範囲を検出しDecorationを追加
                   const newDecos: Decoration[] = [];
-                  tr.steps.forEach((_step, i) => {
-                    const map = tr.mapping.maps[i];
-                    map.forEach((_oldStart: number, _oldEnd: number, newStart: number, newEnd: number) => {
-                      if (newEnd > newStart && newEnd <= newState.doc.content.size) {
-                        newDecos.push(Decoration.inline(newStart, newEnd, {
-                          style: `text-decoration: underline; text-decoration-color: ${underlineColor}; text-decoration-thickness: 2px; text-underline-offset: 2px;`,
-                        }));
+                  if (isRemote) {
+                    // 重要: y-prosemirrorはリモート変更を「文書全体を置き換える単一ReplaceStep」
+                    // として適用するため、stepのmappingを見ると常に文書全体が変更範囲になって
+                    // しまう（seq除外をすり抜けたリモートtrが1件あるだけで全文に下線が付き、
+                    // その下線は以後の追記でも拡大し続ける）。
+                    // そのため実際の差分（findDiffStart/findDiffEnd）から下線範囲を求める。
+                    // 同一内容の全文再描画（エディタ初期化の_forceRerender等）は差分なし＝何も塗らない
+                    const diffStart = tr.before.content.findDiffStart(tr.doc.content);
+                    if (diffStart !== null) {
+                      const diffEnd = tr.before.content.findDiffEnd(tr.doc.content);
+                      if (diffEnd && diffEnd.b > diffStart && diffEnd.b <= newState.doc.content.size) {
+                        newDecos.push(Decoration.inline(diffStart, diffEnd.b, { style: underlineStyle }));
                       }
+                    }
+                  } else {
+                    // ローカル編集はProseMirrorのstepが実変更範囲を正しく表すのでmappingから取る
+                    tr.steps.forEach((_step, i) => {
+                      const map = tr.mapping.maps[i];
+                      map.forEach((_oldStart: number, _oldEnd: number, newStart: number, newEnd: number) => {
+                        if (newEnd > newStart && newEnd <= newState.doc.content.size) {
+                          newDecos.push(Decoration.inline(newStart, newEnd, { style: underlineStyle }));
+                        }
+                      });
                     });
-                  });
+                  }
 
                   if (newDecos.length > 0) {
                     decorationSet = decorationSet.add(tr.doc, newDecos);
@@ -556,46 +612,10 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   }, [provider, userInfo, CollaborationExtension, CollaborationCursorExtension, modulesLoaded, sessionId]);
 
 
-  // Document change listener - highlight remote edits in blue
-  useEffect(() => {
-    if (!ydocRef.current || !editor || !highlightEdits) return;
-
-    try {
-      const ydoc = ydocRef.current;
-
-      // Listen to Yjs document updates to detect remote changes
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const onUpdate = (update: Uint8Array, origin: any) => {
-        // origin is null for remote changes, non-null for local changes
-        const isRemote = origin === null || origin === 'remote';
-
-        if (isRemote) {
-          console.log('[Collaborative Editor V2] 🔵 Remote change detected');
-
-          // Flash the editor to indicate remote change
-          const editorElement = document.querySelector('.ProseMirror');
-          if (editorElement) {
-            editorElement.classList.add('remote-change-flash');
-            setTimeout(() => {
-              editorElement.classList.remove('remote-change-flash');
-            }, 500);
-          }
-        }
-      };
-
-      ydoc.on('update', onUpdate);
-
-      return () => {
-        try {
-          ydoc.off('update', onUpdate);
-        } catch (error) {
-          console.warn('[Collaborative Editor V2] ⚠️ Error during update listener cleanup:', error);
-        }
-      };
-    } catch (error) {
-      console.error('[Collaborative Editor V2] ❌ Error setting up document listener:', error);
-    }
-  }, [editor, highlightEdits]);
+  // 注: 以前はリモート変更のたびにエディタ全体を光らせる演出（remote-change-flash）が
+  // あったが、音声認識の未確定テキスト（pendingText）が200ms間隔で更新されるように
+  // なったことで画面全体が常時点滅する問題が発生したため撤去した。
+  // リモート編集の可視化は編集追跡の下線（editTracker Decoration）が担う。
 
   // Transcription status listener - needs provider to ensure ydocRef is set
   useEffect(() => {
@@ -942,7 +962,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="bg-indigo-600 text-white rounded-lg px-4 py-2 flex items-center justify-between">
         <span className="text-sm font-medium">初めての方へ: 校正の操作方法はマニュアルをご確認ください</span>
         <a
-          href={`${getBasePath()}/editor-manual.html`}
+          href={`${getBasePath()}/manual.html#editor`}
           target="_blank"
           rel="noopener noreferrer"
           className="bg-white text-indigo-600 px-3 py-1 rounded text-sm font-medium hover:bg-indigo-50 transition-colors flex-shrink-0"

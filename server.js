@@ -218,6 +218,20 @@ app.prepare().then(() => {
 
     // Auto-rewrite on paragraph break - automatically rewrite the completed paragraph
     let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
+
+    // 自動校正の状態（バッファ方式: 確定テキストを溜めて、校正結果だけをドキュメントへ追記する）
+    const autoProofreadState = {
+      enabled: true, // デフォルト: 有効（クライアントのset_auto_proofreadで上書きされる）
+      inFlight: false, // 校正API実行中フラグ
+      lastRunAt: 0,    // 前回実行時刻（最短間隔の制御）
+      model: 'gpt-4.1-mini',
+      timer: null,     // 定期トリガー（録音停止後の残り分も拾う）
+      rawBuffer: '',   // 校正待ちの生テキスト（自動校正ON時は直接ドキュメントへ書かない）
+      sentTail: '',    // 送信済み校正テキストの末尾（オーバーラップ文脈用、最大300文字）
+      pendingInterim: '',     // クライアントの認識途中テキスト（未確定表示の合成用）
+      lastBufferChangeAt: 0,  // バッファ最終更新時刻（停止後の残り全量処理の判定用）
+      lastOutEndedSentence: false, // 前回の校正出力が文末（。！？）で終わったか（新段落開始の判定用）
+    };
     let rewriteModel = 'gpt-4.1-mini'; // AI再編モデル（デフォルト: gpt-4.1-mini）
 
     // Force line break at period - adds newline after each Japanese period (。)
@@ -345,6 +359,9 @@ app.prepare().then(() => {
               sendTextToHocuspocusDocument(currentSessionId, processedTranscript);
               // Clear pending text after transcription is complete
               clearPendingText(currentSessionId);
+              // 自動校正のトリガー（実行条件は関数内で判定）
+              maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
+                .catch((e) => console.error('[Auto-Proofread] ❌ trigger error:', e));
             } else {
               console.log(`[Debug] ❌ Hocuspocus integration NOT triggered - currentSessionId: ${currentSessionId ? 'SET' : 'UNDEFINED'}, transcript: ${processedTranscript ? 'HAS_CONTENT' : 'EMPTY'}`);
             }
@@ -962,6 +979,26 @@ app.prepare().then(() => {
               console.warn('[LocalASR] ⚠️ local_transcription rejected: text too long or invalid');
               break;
             }
+
+            // 自動校正ON: 直接ドキュメントへは書かず、校正バッファに溜める。
+            // 校正画面には生テキストを未確定（グレー）として見せ続け、
+            // AI校正の結果が「確定文」として追記された時点で黒字になる
+            if (autoProofreadState.enabled && currentSessionId) {
+              autoProofreadState.rawBuffer += message.text;
+              autoProofreadState.lastBufferChangeAt = Date.now();
+              // 校正が失敗し続けた場合の安全弁: バッファ過大なら未校正のまま書き出す
+              if (autoProofreadState.rawBuffer.length > 8000) {
+                const degraded = autoProofreadState.rawBuffer.slice(0, 4000);
+                autoProofreadState.rawBuffer = autoProofreadState.rawBuffer.slice(4000);
+                console.warn('[Auto-Proofread] ⚠️ バッファ過大のため4000文字を未校正のまま書き出します');
+                sendTextToHocuspocusDocument(currentSessionId, degraded, false);
+              }
+              setPendingText(currentSessionId, autoProofreadState.rawBuffer + autoProofreadState.pendingInterim);
+              maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
+                .catch((e) => console.error('[Auto-Proofread] ❌ trigger error:', e));
+              break;
+            }
+
             let localText = message.text;
             if (forceLineBreakAtPeriod) {
               localText = localText.replace(/。/g, '。\n');
@@ -978,6 +1015,41 @@ app.prepare().then(() => {
             break;
           }
 
+          case 'set_auto_proofread': {
+            // 自動校正のON/OFF（バッファ方式: 確定テキストを溜めて校正結果だけを追記する）
+            autoProofreadState.enabled = message.enabled === true;
+            if (typeof message.model === 'string' && message.model.length < 50) {
+              autoProofreadState.model = message.model;
+            }
+            if (autoProofreadState.enabled) {
+              autoProofreadState.rawBuffer = '';
+              autoProofreadState.sentTail = '';
+              autoProofreadState.pendingInterim = '';
+              autoProofreadState.lastBufferChangeAt = 0;
+              if (!autoProofreadState.timer) {
+                autoProofreadState.timer = setInterval(() => {
+                  maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
+                    .catch((e) => console.error('[Auto-Proofread] ❌ timer error:', e));
+                }, 20000);
+              }
+              console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, バッファ方式)`);
+            } else {
+              if (autoProofreadState.timer) {
+                clearInterval(autoProofreadState.timer);
+                autoProofreadState.timer = null;
+              }
+              // OFF時は校正待ちの生テキストを失わないよう、そのままドキュメントへ書き出す
+              if (autoProofreadState.rawBuffer && currentSessionId) {
+                console.log(`[Auto-Proofread] 📤 無効化に伴いバッファ${autoProofreadState.rawBuffer.length}文字を未校正のまま書き出します`);
+                sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
+                autoProofreadState.rawBuffer = '';
+                setPendingText(currentSessionId, autoProofreadState.pendingInterim);
+              }
+              console.log('[Auto-Proofread] Disabled');
+            }
+            break;
+          }
+
           case 'local_pending':
             // クライアント主認識モードの認識途中テキスト（毎回全文置き換え）を校正画面へ反映する
             localPendingCount++;
@@ -986,7 +1058,13 @@ app.prepare().then(() => {
             }
             if (currentSessionId && typeof message.text === 'string') {
               // 表示用なので上限長で切り詰める（巨大ペイロードの全クライアント配信を防止）
-              setPendingText(currentSessionId, message.text.slice(0, 500));
+              const interimText = message.text.slice(0, 500);
+              autoProofreadState.pendingInterim = interimText;
+              // 自動校正ON時は校正待ちの生バッファも未確定（グレー）として見せる
+              const composite = autoProofreadState.enabled
+                ? autoProofreadState.rawBuffer + interimText
+                : interimText;
+              setPendingText(currentSessionId, composite);
             }
             break;
 
@@ -1095,6 +1173,17 @@ app.prepare().then(() => {
 
     clientWs.on('close', () => {
       console.log('Client WebSocket disconnected');
+      // 自動校正タイマーの解放
+      if (autoProofreadState.timer) {
+        clearInterval(autoProofreadState.timer);
+        autoProofreadState.timer = null;
+      }
+      // 校正待ちバッファが残っていれば未校正のまま書き出す（テキスト喪失防止）
+      if (autoProofreadState.rawBuffer && currentSessionId) {
+        console.log(`[Auto-Proofread] 📤 切断に伴いバッファ${autoProofreadState.rawBuffer.length}文字を未校正のまま書き出します`);
+        sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
+        autoProofreadState.rawBuffer = '';
+      }
       // Clean up forceCommit observer
       if (forceCommitObserver && forceCommitStatusMap) {
         try {
@@ -1132,7 +1221,8 @@ app.prepare().then(() => {
 
   // Function to send text to Hocuspocus document
   // leadingSpace=false: 発話途中からの継続テキスト（部分確定）のため、区切りスペースを入れずに連結する
-  async function sendTextToHocuspocusDocument(sessionId, text, leadingSpace = true) {
+  // forceNewParagraph=true: 1行目を最終段落への連結ではなく、新しい段落として追加する
+  async function sendTextToHocuspocusDocument(sessionId, text, leadingSpace = true, forceNewParagraph = false) {
     try {
       console.log(`[Hocuspocus Integration] Adding text directly to document for session ${sessionId}: "${sanitizeForLog(text)}"`);
 
@@ -1163,10 +1253,10 @@ app.prepare().then(() => {
         const hasContent = fragment.length > 0;
 
         if (hasContent) {
-          // 1行目: 既存の最後のパラグラフに追加
+          // 1行目: 既存の最後のパラグラフに追加（forceNewParagraph時は新規段落として追加）
           const lastElement = fragment.get(fragment.length - 1);
 
-          if (lastElement && lastElement.nodeName === 'paragraph') {
+          if (!forceNewParagraph && lastElement && lastElement.nodeName === 'paragraph') {
             const existingTextNode = lastElement.get(0);
             const firstLine = `${leadingSpace ? ' ' : ''}${lines[0]}`;
             if (existingTextNode && existingTextNode instanceof Y.XmlText) {
@@ -1354,13 +1444,21 @@ app.prepare().then(() => {
       if (document) {
         // Use session-specific field name to match client
         const fieldName = `content-${sessionId}`;
-        
+
         // TipTap Collaboration uses XmlFragment, not Text
         const fragment = document.getXmlFragment(fieldName);
-        
+
+        // 音声フロー由来の変更であることを編集側へ伝える（下線・変更履歴の除外対象）。
+        // 重要: seq更新と段落挿入を同一Yjsトランザクションにまとめる。
+        // 別トランザクションだと編集側のseq消費判定がズレて段落挿入に下線が付く
+        // （sendTextToHocuspocusDocumentと同じ理由でtransactが必須）。
+        document.transact(() => {
+        const breakStatusMap = document.getMap(`status-${sessionId}`);
+        breakStatusMap.set('speechAppendSeq', (breakStatusMap.get('speechAppendSeq') || 0) + 1);
+
         // Only create new paragraph if there's existing content
         const hasContent = fragment.length > 0;
-        
+
         if (hasContent) {
           // ⏎は新段落のみ作成し、マーカー文字は追加しない（改行記号なので）
           // それ以外のマーカー（↩️, 🔄, 📝など）はテキストとして追加後、新段落を作成
@@ -1401,7 +1499,8 @@ app.prepare().then(() => {
         } else {
           console.log(`[Hocuspocus Integration] ⚠️ No existing content, skipping paragraph break`);
         }
-        
+        }); // end document.transact
+
       } else {
         console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
         
@@ -1459,9 +1558,6 @@ app.prepare().then(() => {
   // Function to rewrite text using OpenAI Chat API
   async function rewriteText(text, model = 'gpt-4o-mini') {
     try {
-      const OpenAI = require('openai');
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
       const systemPrompt = `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
 
 校正のルール:
@@ -1474,17 +1570,12 @@ app.prepare().then(() => {
 修正した文章のみを出力してください。説明は不要です。`;
 
       console.log(`[Auto-Rewrite] 🤖 Using model: ${model}`);
-      const response = await openai.chat.completions.create({
-        model: model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: text }
-        ],
-        temperature: 0.3,
-        max_tokens: 2048
-      });
+      const content = await callChatCompletion(model, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: text }
+      ], { temperature: 0.3, maxTokens: 2048 });
 
-      return response.choices[0]?.message?.content || text;
+      return content || text;
     } catch (error) {
       console.error(`[Auto-Rewrite] ❌ Error rewriting text:`, error);
       return text; // Return original text on error
@@ -1586,6 +1677,201 @@ app.prepare().then(() => {
     }
   }
 
+
+  // ===== 自動校正 =====
+  // 前回校正済み位置から「最後から2番目」までの段落範囲に対して、誤字修正と
+  // 冪等なパラグラフ整理を行う。最後の段落は音声の追記中のため対象に含めない。
+  // 冪等性の担保: (1)同じ範囲は二度校正しない（doneParasで範囲を前進させる）
+  //               (2)プロンプトで「既存の区切り維持・短い段落の再分割禁止」を指示
+
+  // OpenAI Chat Completions を https 直叩きで呼ぶ。
+  // openai SDK v5はfetchベースで HTTPS_PROXY / httpAgent を無視するため、
+  // 企業プロキシ環境では接続できずタイムアウトする。WSプロキシと同じ
+  // HttpsProxyAgent を使って確実にプロキシを通す
+  function callChatCompletion(model, messages, { temperature = 0.2, maxTokens = 2048, timeoutMs = 60000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const https = require('https');
+      const body = JSON.stringify({ model, messages, temperature, max_tokens: maxTokens });
+      const req = https.request({
+        hostname: 'api.openai.com',
+        path: '/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        agent: process.env.HTTPS_PROXY ? new HttpsProxyAgent(process.env.HTTPS_PROXY) : undefined,
+        timeout: timeoutMs,
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (res.statusCode !== 200) {
+              reject(new Error(`OpenAI API ${res.statusCode}: ${json.error?.message || data.slice(0, 200)}`));
+              return;
+            }
+            resolve(json.choices?.[0]?.message?.content || '');
+          } catch (parseError) {
+            reject(new Error(`OpenAI API response parse error: ${parseError.message}`));
+          }
+        });
+      });
+      req.on('timeout', () => { req.destroy(new Error(`Request timed out (${timeoutMs}ms)`)); });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
+  async function proofreadText(text, model, overlapText = '') {
+    const systemPrompt = `あなたは日本語文字起こしテキストの校正アシスタントです。音声認識の生テキスト（句読点なし）を、読みやすい文章に整えます。
+
+入力は2つの部分から成ります:
+- 【文脈】: 直前までに確定済みの校正テキストの末尾。文のつながりを判断するための参考。変更・出力してはいけない
+- 【校正対象】: 今回整える生テキスト。出力はこの部分の校正結果のみ
+
+校正のルール:
+1. 誤字脱字・音声認識の誤変換を文脈に基づいて修正する
+2. 句読点（、。）を適切に補う（音声認識は句読点を出力しない）
+3. 意味のまとまりで段落に分ける（1段落150〜300文字目安、段落の区切りは改行1つで表す）
+4. 内容の追加・削除・要約・言い換えはしない（誤りの修正と句読点・段落の整理のみ）
+5. 【校正対象】の末尾が文の途中で終わっている場合は、文を勝手に完結させず途中のまま終える
+   （続きは次回の校正対象として送られてくる）
+6. 文体（です・ます調など）を維持する
+
+出力は【校正対象】の校正結果のみ。【文脈】の内容・説明・ラベルは出力しない。`;
+
+    const userContent = `【文脈】\n${overlapText || '（なし）'}\n\n【校正対象】\n${text}`;
+
+    const content = await callChatCompletion(model, [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ], { temperature: 0.2, maxTokens: 4096, timeoutMs: 60000 });
+    return content || text;
+  }
+
+  // 改行の保証（決定的なフォールバック）: モデルが段落分割を返さなかった場合に備えて、
+  // 長すぎる段落は句点位置で機械的に分割する。400文字以下はそのまま返すため冪等
+  function splitLongParagraph(paragraph, maxLength = 400, targetLength = 250) {
+    if (paragraph.length <= maxLength) return [paragraph];
+    const parts = [];
+    let rest = paragraph;
+    while (rest.length > maxLength) {
+      // targetLength以降の最初の句点で区切る（見つからなければmaxLengthで強制分割）
+      let cut = rest.indexOf('。', targetLength);
+      if (cut === -1 || cut > maxLength * 1.5) {
+        cut = maxLength;
+      } else {
+        cut += 1; // 句点を含める
+      }
+      parts.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    if (rest) parts.push(rest);
+    return parts;
+  }
+
+  // 指定インデックスの段落テキストを取得（段落でないノードはnull）
+  function getParagraphTextByIndex(fragment, index) {
+    const Y = require('yjs');
+    const el = fragment.get(index);
+    if (!el || !(el instanceof Y.XmlElement)) return null;
+    let text = '';
+    for (let i = 0; i < el.length; i++) {
+      const child = el.get(i);
+      if (child instanceof Y.XmlText) text += child.toString();
+    }
+    return text;
+  }
+
+  // バッファ方式の自動校正:
+  // ローカル認識の確定テキストは（自動校正ON時）直接ドキュメントへは書かず、
+  // サーバ側バッファ（state.rawBuffer）に溜める。一定量たまったら、送信済み校正
+  // テキストの末尾（state.sentTail）をオーバーラップ文脈としてAI校正（誤字修正・
+  // 句読点補完・段落分け）し、校正結果だけを「次の確定文」として共有ドキュメントへ
+  // 追記する。ドキュメントの置き換えを行わないため、人の編集との競合が原理的に
+  // 発生しない（オーバーラップ部分は送信済みなので再送信しない）
+  async function maybeAutoProofread(sessionId, clientWs, state) {
+    if (!state.enabled || state.inFlight || !sessionId) return;
+    const now = Date.now();
+    if (now - state.lastRunAt < 15000) return; // 最短実行間隔15秒
+
+    const GUARD_CHARS = 100;      // バッファ末尾は発話継続中の可能性があるため残す
+    const MAX_TARGET_CHARS = 1500; // 1回の校正対象上限（大きすぎるとAPIタイムアウト）
+    const MIN_TARGET_CHARS = 100;  // 校正単位がたまるまで待つ
+
+    // バッファが30秒以上増えていない（録音停止後など）なら、ガードなしで全量を処理する
+    const stale = state.lastBufferChangeAt > 0 && now - state.lastBufferChangeAt > 30000;
+    const available = stale ? state.rawBuffer.length : state.rawBuffer.length - GUARD_CHARS;
+    if (available < (stale ? 10 : MIN_TARGET_CHARS)) return;
+    const target = state.rawBuffer.slice(0, Math.min(available, MAX_TARGET_CHARS));
+
+    state.inFlight = true;
+    state.lastRunAt = now;
+    try {
+      console.log(`[Auto-Proofread] 🪄 校正開始: ${target.length}文字（バッファ${state.rawBuffer.length}文字, model=${state.model}）`);
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({
+          type: 'auto_proofread_started',
+          chars: target.length
+        }));
+      }
+
+      const result = await proofreadText(target, state.model, state.sentTail);
+
+      // 改行の保証: モデルが段落分割を返さなかった場合に備えて、長すぎる段落は句点で機械的に分割する
+      const newParas = result
+        .split('\n')
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
+        .flatMap((p) => splitLongParagraph(p));
+      if (newParas.length === 0) return;
+      const outText = newParas.join('\n');
+
+      // 段落の区切り規則: 直前の出力が文末（。！？）で終わっていて、かつドキュメントの
+      // 最終段落がすでに十分長い場合は、最終段落への連結ではなく新しい段落として追記する。
+      // （小さな校正出力が同じ段落に連結され続けて巨大段落になるのを防ぐ）
+      let forceNewParagraph = false;
+      const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
+      if (proofDoc) {
+        const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
+        if (proofFragment.length > 0) {
+          const lastParaLen = (getParagraphTextByIndex(proofFragment, proofFragment.length - 1) || '').length;
+          forceNewParagraph = state.lastOutEndedSentence === true && lastParaLen >= 250;
+        }
+      }
+
+      // 校正結果のみを共有ドキュメントへ追記（句読点が区切りを担うため先頭スペースなし）
+      await sendTextToHocuspocusDocument(sessionId, outText, false, forceNewParagraph);
+      state.lastOutEndedSentence = /[。．！？!?]\s*$/.test(outText);
+
+      // 校正済み分をバッファから取り除き、文脈用の送信済み末尾を更新する
+      state.rawBuffer = state.rawBuffer.slice(target.length);
+      state.sentTail = (state.sentTail + outText.replace(/\n/g, '')).slice(-300);
+
+      // 校正画面の未確定（グレー）表示を更新（バッファが減ったため）
+      setPendingText(sessionId, state.rawBuffer + state.pendingInterim);
+
+      console.log(`[Auto-Proofread] ✅ 校正完了: ${newParas.length}段落を追記（残バッファ${state.rawBuffer.length}文字）`);
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({
+          type: 'auto_proofread_completed',
+          paragraphs: newParas.length,
+          chars: outText.length
+        }));
+      }
+    } catch (error) {
+      console.error('[Auto-Proofread] ❌ 校正エラー:', error);
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({ type: 'auto_proofread_error', error: error.message }));
+      }
+    } finally {
+      state.inFlight = false;
+    }
+  }
 
   // Function to send dummy audio data from client (localStorage)
   function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress, onComplete, sendInterval = 50) {
