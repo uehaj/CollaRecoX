@@ -7,6 +7,7 @@ type YDocType = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HocuspocusProviderType = any;
 import { getBasePath } from '@/lib/basePath';
+import { addRecentSession } from '@/lib/recentSessions';
 import packageJson from '../../../package.json';
 
 // ===== オンデバイス認識（ChromeオンデバイスWeb Speech API） =====
@@ -72,6 +73,10 @@ export default function RealtimeClient() {
   const hocuspocusDocRef = useRef<YDocType | null>(null);
 
   const [text, setText] = useState("");
+  // 送信した生テキストの累積（サーバのrawBufferと同じ素材）。3色表示の素材にする。
+  // 黒=AI確定済(先頭 sentRaw.length-greenLen 文字) / 緑=AI校正待ち(末尾 greenLen 文字) / グレー=interim
+  const [sentRaw, setSentRaw] = useState("");
+  const [pendingGreenLen, setPendingGreenLen] = useState(0); // サーバ配信のrawBuffer長（緑の文字数）
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null); // 文字起こし結果のスクロールボックス
   const transcriptAtBottomRef = useRef<boolean>(true); // ユーザーが最下部付近にいるか（自動追従の判定用）
 
@@ -111,7 +116,6 @@ export default function RealtimeClient() {
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [audioSource, setAudioSource] = useState<'microphone' | 'tab-capture'>('tab-capture');
   const tabCaptureStreamRef = useRef<MediaStream | null>(null);
-  const [forceLineBreakAtPeriod, setForceLineBreakAtPeriod] = useState<boolean>(true); // 句点で強制改行（デフォルト: 有効）
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
 
@@ -120,6 +124,8 @@ export default function RealtimeClient() {
   useEffect(() => {
     if (currentSessionId && typeof window !== 'undefined') {
       window.localStorage.setItem('collarecox-realtime-session-id', currentSessionId);
+      // 配信を開始した代表者として履歴に記録（ホームの「最近のセッション」に出る）。
+      addRecentSession(currentSessionId, 'host');
       try {
         const url = new URL(window.location.href);
         if (url.searchParams.get('session') !== currentSessionId) {
@@ -158,6 +164,7 @@ export default function RealtimeClient() {
   const committedByResultRef = useRef<Map<number, number>>(new Map());
   const lastInterimResultRef = useRef<{ index: number; transcript: string } | null>(null); // 最新の未確定結果
   const lastPendingSentAtRef = useRef<number>(0); // local_pending送信のスロットリング用
+  const lastCommitAtRef = useRef<number>(0); // 直前の確定コミット時刻（ポーズ=無音間隔の算出用）
   const draftFinalsRef = useRef<Array<{ text: string; finalizedAt: number }>>([]); // 未置換のローカル確定分
   const draftInterimRef = useRef<string>(''); // 認識途中のテキスト
   const [draftText, setDraftText] = useState<string>(''); // 表示用（確定分+interim）
@@ -273,10 +280,18 @@ export default function RealtimeClient() {
     // closeUtterance=true: 発話の締め（末尾にスペースを付ける）
     const commitChunk = (chunk: string, continuation: boolean, closeUtterance: boolean) => {
       if (!chunk) return;
-      const processed = forceLineBreakAtPeriod ? chunk.replace(/。/g, '。\n') : chunk;
-      setText(prev => prev + processed + (closeUtterance ? ' ' : ''));
+      setText(prev => prev + chunk + (closeUtterance ? ' ' : ''));
+      // 生テキストの累積（サーバのrawBufferと同素材＝greenLenで確定境界をマップできる）
+      setSentRaw(prev => prev + chunk);
+      // 前回確定からの間隔（無音=ポーズの近似）。サーバ側の機械的パラグラフ分割に使う。
+      // continuation（発話途中の継続確定）はポーズではないため0扱い。
+      const now = performance.now();
+      const gapMs = !continuation && lastCommitAtRef.current > 0
+        ? Math.round(now - lastCommitAtRef.current)
+        : 0;
+      lastCommitAtRef.current = now;
       if (websocketRef.current?.readyState === WebSocket.OPEN) {
-        websocketRef.current.send(JSON.stringify({ type: 'local_transcription', text: chunk, continuation }));
+        websocketRef.current.send(JSON.stringify({ type: 'local_transcription', text: chunk, continuation, gapMs }));
       }
     };
 
@@ -395,7 +410,7 @@ export default function RealtimeClient() {
         interimStartedAtRef.current = performance.now();
       }, 500);
     }
-  }, [updateDraftText, forceLineBreakAtPeriod, localForceFinalizeSec]);
+  }, [updateDraftText, localForceFinalizeSec]);
 
   // Get available audio input devices
   const getAudioDevices = useCallback(async () => {
@@ -464,13 +479,6 @@ export default function RealtimeClient() {
           console.log('[WebSocket] 📋 Sent session ID to server:', currentSessionId);
         }
 
-        // 句点で強制改行設定をサーバーへ通知
-        ws.send(JSON.stringify({
-          type: 'set_force_line_break',
-          enabled: forceLineBreakAtPeriod
-        }));
-        console.log('[WebSocket] 📝 Sent force line break at period:', forceLineBreakAtPeriod);
-
         // 自動校正設定を送信（set_session_id送信後である必要がある）
         ws.send(JSON.stringify({
           type: 'set_auto_proofread',
@@ -525,7 +533,7 @@ export default function RealtimeClient() {
         }
       };
     }); // Promise終了
-  }, [currentSessionId, forceLineBreakAtPeriod, autoProofread]);
+  }, [currentSessionId, autoProofread]);
 
   const disconnectWebSocket = useCallback(() => {
     if (websocketRef.current) {
@@ -534,24 +542,6 @@ export default function RealtimeClient() {
       websocketRef.current = null;
     }
     setIsConnected(false);
-  }, []);
-
-  // 句点で強制改行設定をサーバーに送信する関数
-  const sendForceLineBreakToServer = useCallback((enabled: boolean) => {
-    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
-      console.log('[Force Line Break] ⚠️ WebSocket not connected, settings will be applied on next connection');
-      return false;
-    }
-
-    const message = {
-      type: 'set_force_line_break',
-      enabled: enabled
-    };
-
-    websocketRef.current.send(JSON.stringify(message));
-    console.log('[Force Line Break] 📝 Sent force line break setting to server:', enabled);
-
-    return true;
   }, []);
 
   // セッションIDが変更されたときに、既存のWebSocket接続経由でサーバーに通知
@@ -717,6 +707,8 @@ export default function RealtimeClient() {
   const clearText = useCallback(() => {
     console.log('[UI] 🧹 Clearing transcription text');
     setText("");
+    setSentRaw("");
+    setPendingGreenLen(0);
     setError(null);
 
     // 共有ドキュメント側の未確定（ドラフト）表示もクリアする
@@ -730,13 +722,13 @@ export default function RealtimeClient() {
   }, []);
 
   const copyText = useCallback(async () => {
-    if (!text) {
+    if (!sentRaw) {
       console.log('[UI] ⚠️ No text to copy');
       return;
     }
 
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(sentRaw);
       console.log('[UI] 📋 Text copied to clipboard');
       // Show temporary success message
       const originalError = error;
@@ -748,7 +740,7 @@ export default function RealtimeClient() {
       console.error('[UI] ❌ Failed to copy text:', err);
       setError('コピーに失敗しました');
     }
-  }, [text, error]);
+  }, [sentRaw, error]);
 
   // Generate or retrieve session ID
   const generateSessionId = useCallback(() => {
@@ -887,6 +879,20 @@ export default function RealtimeClient() {
 
       hocuspocusProviderRef.current = provider;
 
+      // サーバが配信する rawBuffer長(pendingGreenLen)を購読し、認識画面の3色表示に使う。
+      // 黒=確定済(sentRaw先頭) / 緑=AI校正待ち(sentRaw末尾greenLen分) / グレー=interim
+      try {
+        const statusMap = ydoc.getMap(`status-${currentSessionId}`);
+        const syncGreen = () => {
+          const g = statusMap.get('pendingGreenLen');
+          setPendingGreenLen(typeof g === 'number' ? g : 0);
+        };
+        syncGreen();
+        statusMap.observe(syncGreen);
+      } catch (e) {
+        console.warn('[Hocuspocus Client] greenLen observe failed:', e);
+      }
+
       provider.on('connect', () => {
         console.log('[Hocuspocus Client] Connected to collaborative session');
       });
@@ -970,67 +976,8 @@ export default function RealtimeClient() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="space-y-6">
 
-        {/* Connection Status & Session Management - Side by Side */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Connection Status - 共有ドキュメント中継チャネルの接続状態 */}
-          <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
-            <h3 className="text-lg font-light text-ink mb-4">
-              共有ドキュメントへの中継接続
-            </h3>
-            <div className="space-y-4">
-              {/* 接続状態インジケータ（3状態: 未接続/接続済み/エラー） */}
-              <div className={`p-4 rounded-lg border ${
-                error ? 'bg-error/10 border-error/40' :
-                isConnected ? 'bg-success/10 border-success/40' :
-                'bg-surface-soft border-hairline'
-              }`}>
-                <div className="flex items-center space-x-3">
-                  <div className={`w-3 h-3 rounded-full ${
-                    error ? 'bg-error animate-pulse' :
-                    isConnected ? 'bg-success' :
-                    'bg-muted-soft'
-                  }`}></div>
-                  <div>
-                    <span className={`text-lg font-normal ${
-                      error ? 'text-error' :
-                      isConnected ? 'text-success' :
-                      'text-muted'
-                    }`}>
-                      {error ? 'エラー' :
-                       isConnected ? '接続済み' :
-                       '未接続'}
-                    </span>
-                    <p className={`text-sm ${
-                      error ? 'text-error' :
-                      isConnected ? 'text-body' :
-                      'text-muted'
-                    }`}>
-                      {error ? error :
-                       isConnected ? '認識結果を共有ドキュメントへ配信できます' :
-                       '「録音開始」で自動的に接続されます'}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* 切断ボタン（接続中のみ表示） */}
-              {isConnected && (
-                <div className="flex items-center justify-center">
-                  <button
-                    onClick={disconnectWebSocket}
-                    className="px-4 py-2 text-sm bg-surface text-error border border-error/50 rounded-lg hover:bg-error/10 transition-colors"
-                  >
-                    接続を切断
-                  </button>
-                </div>
-              )}
-
-              <p className="text-xs text-muted text-center">
-                オンデバイス認識の確定テキストは、この中継接続を通じて共有ドキュメント（校正画面）へ送られます。音声は端末内で処理され、外部へは送信されません。
-              </p>
-            </div>
-          </div>
-
+        {/* Session Management */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
           {/* Session Management */}
           <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
           <h3 className="text-lg font-light text-ink mb-4">
@@ -1116,6 +1063,15 @@ export default function RealtimeClient() {
               >
                 接続
               </button>
+              {/* 接続を切断（接続中のみ表示・接続ボタンの右） */}
+              {isConnected && (
+                <button
+                  onClick={disconnectWebSocket}
+                  className="px-4 py-2 text-sm bg-surface text-error border border-error/50 rounded-md hover:bg-error/10 transition-colors whitespace-nowrap"
+                >
+                  接続を切断
+                </button>
+              )}
             </div>
             {activeSessions.length === 0 && !isLoadingSessions && (
               <p className="text-xs text-muted mt-1">アクティブなセッションがありません</p>
@@ -1174,10 +1130,9 @@ export default function RealtimeClient() {
             </button>
           </div>
           </div>
-        </div>
 
-        {/* Controls */}
-        <div className={`p-6 rounded-lg border transition-colors ${
+          {/* Controls（音声入力からの文字起こし）。セッション管理と横並びにする */}
+          <div className={`p-6 rounded-lg border transition-colors ${
           isRecording
             ? "bg-celadon-soft border-celadon/30"
             : "bg-surface border-hairline shadow-sm"
@@ -1275,26 +1230,6 @@ export default function RealtimeClient() {
                       </span>
                     </div>
                   )}
-                </div>
-
-                {/* 句点で強制改行 */}
-                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
-                  <label className="flex items-center gap-2 text-sm font-medium text-body">
-                    <input
-                      type="checkbox"
-                      checked={forceLineBreakAtPeriod}
-                      onChange={(e) => {
-                        const newValue = e.target.checked;
-                        setForceLineBreakAtPeriod(newValue);
-                        // 接続中なら即座にサーバーへ通知
-                        if (isConnected) {
-                          sendForceLineBreakToServer(newValue);
-                        }
-                      }}
-                      className="rounded accent-celadon"
-                    />
-                    句点で強制改行（。の後に改行を追加）
-                  </label>
                 </div>
 
                 {/* 自動校正設定 */}
@@ -1399,6 +1334,7 @@ export default function RealtimeClient() {
             </div>
           </div>
         </div>
+        </div>
 
         {/* Error Display */}
         {error && (
@@ -1423,14 +1359,14 @@ export default function RealtimeClient() {
             <div className="flex gap-2">
               <button
                 onClick={copyText}
-                disabled={!text}
+                disabled={!sentRaw}
                 className="px-4 py-2 rounded-lg font-medium bg-celadon text-on-celadon hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
               >
                 📋 コピー
               </button>
               <button
                 onClick={() => setShowClearConfirmDialog(true)}
-                disabled={isRecording || !text}
+                disabled={isRecording || !sentRaw}
                 className="px-4 py-2 rounded-lg font-medium bg-surface text-error border border-error/50 hover:bg-error/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
                 テキストをクリア
@@ -1448,10 +1384,13 @@ export default function RealtimeClient() {
             }}
             className="h-[300px] min-h-[160px] resize-y overflow-y-auto p-4 border border-hairline rounded-md bg-surface-soft"
           >
-            {(text || (isRecording && draftText)) ? (
-              <p className="text-ink whitespace-pre-wrap leading-relaxed">
-                {text}
-                {/* オンデバイス認識の暫定テキスト（薄色表示。確定すると本文に取り込まれる） */}
+            {(sentRaw || (isRecording && draftText)) ? (
+              <p className="whitespace-pre-wrap leading-relaxed">
+                {/* 黒: 完全確定（サーバがAI校正して共有ドキュメントに確定した分） */}
+                <span className="text-ink">{sentRaw.slice(0, Math.max(0, sentRaw.length - pendingGreenLen))}</span>
+                {/* 緑: サーバのAI校正待ち（オンデバイス確定済・rawBuffer） */}
+                <span style={{ color: '#3fa874' }}>{sentRaw.slice(Math.max(0, sentRaw.length - pendingGreenLen))}</span>
+                {/* グレー: オンデバイス未確定（interim） */}
                 {isRecording && draftText && (
                   <span className="text-muted-soft">{draftText}</span>
                 )}
@@ -1469,9 +1408,9 @@ export default function RealtimeClient() {
               </div>
             )}
           </div>
-          {text && (
+          {sentRaw && (
             <div className="mt-4 text-sm text-body">
-              文字数: {text.length}
+              文字数: {sentRaw.length}
             </div>
           )}
         </div>

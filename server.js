@@ -181,43 +181,7 @@ app.prepare().then(() => {
     
     // No need to parse model parameter - using fixed model
     
-    // Audio buffer tracking
-    let audioBufferDuration = 0; // in milliseconds
-    let lastAudioTimestamp = Date.now();
-    let accumulatedSilenceDuration = 0; // 累積無音時間（ms）- 有音チャンクでリセット
-    let audioChunkCount = 0;
-    let autoCommitTimer = null;
-    let paragraphBreakTimer = null; // Timer for delayed paragraph break detection
-    let responseInProgress = false;
-    let lastCommitTime = 0; // Prevent too frequent commits
-    let isDummyAudioSending = false; // Flag to prevent duplicate dummy audio sends
-    let dummyAudioTimeoutId = null; // Timeout ID for stopping dummy audio sending
-    
-    // Transcription prompt tracking
-    let transcriptionPrompt = '';
-    
-    // Transcription model tracking
-    let transcriptionModel = 'gpt-4o-transcribe'; // Default model
-    
-    // Speech break detection settings
-    let speechBreakDetection = false;
-    let speechBreakMarker = '↩️'; // デフォルト: 改行絵文字
-
-    // VAD parameters - controls when OpenAI detects speech end (Server VAD mode only)
-    // vadSilenceDuration: OpenAI's VAD will fire speech_stopped after this much silence
-    let vadEnabled = true; // VAD enabled/disabled (default: true)
     let localPendingCount = 0; // local_pending受信数（ログ間引き用）
-    let vadThreshold = 0.2;
-    let vadSilenceDuration = 600; // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間（推奨: 500-700ms）
-    let vadPrefixPadding = 300;
-
-    // Paragraph break threshold - controls when to insert paragraph break marker
-    // This is independent from VAD silence duration
-    // Paragraph break is inserted only when actual silence gap >= this threshold
-    let paragraphBreakThreshold = 2500; // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入（推奨: 2000-2500ms）
-
-    // Auto-rewrite on paragraph break - automatically rewrite the completed paragraph
-    let autoRewriteOnParagraphBreak = false; // デフォルト: 無効
 
     // 自動校正の状態（バッファ方式: 確定テキストを溜めて、校正結果だけをドキュメントへ追記する）
     const autoProofreadState = {
@@ -231,64 +195,11 @@ app.prepare().then(() => {
       pendingInterim: '',     // クライアントの認識途中テキスト（未確定表示の合成用）
       lastBufferChangeAt: 0,  // バッファ最終更新時刻（停止後の残り全量処理の判定用）
       lastOutEndedSentence: false, // 前回の校正出力が文末（。！？）で終わったか（新段落開始の判定用）
+      pausePositions: [],     // rawBuffer内の「無音ポーズ境界」オフセット（機械的パラグラフ分割の一次区切り）
     };
-    let rewriteModel = 'gpt-4.1-mini'; // AI再編モデル（デフォルト: gpt-4.1-mini）
-
-    // Force line break at period - adds newline after each Japanese period (。)
-    let forceLineBreakAtPeriod = true; // デフォルト: 有効
-
-    // Auto-commit threshold (milliseconds) - can be adjusted by client
-    let autoCommitThresholdMs = 5000; // Default: 5 seconds for VA-Cable testing (longer segments = better transcription)
-    let autoCommitTimerDelayMs = 3000; // Default: 3 seconds delay before timer-commit
-    let audioBufferSize = 4096; // Default buffer size
-    let batchMultiplier = 8; // Default batch multiplier
 
     // Session management for Hocuspocus integration
     let currentSessionId = null;
-    let forceCommitObserver = null; // Store observer function for cleanup
-    let forceCommitStatusMap = null; // Store statusMap reference for cleanup
-
-    // OpenAI Realtime 文字起こしは廃止（オンデバイス認識へ全面移行）。
-    // この WebSocket はオンデバイス認識結果・自動校正を共有ドキュメントへ中継する
-    // チャネルとしてのみ機能し、OpenAI へは一切接続しない。
-    // 旧 OpenAI プロキシ経路のコードが参照する openaiWs は、接続を張らないダミー
-    // （readyState=CLOSED の no-op）に置き換える。これにより既存の openaiWs.send /
-    // openaiWs.close 等はすべて無害な空処理となり、中継・自動校正ロジックには影響しない。
-    const openaiWs = {
-      readyState: 3, // WebSocket.CLOSED
-      send() {},
-      close() {},
-      on() {},
-      removeListener() {},
-    };
-
-    // Function to create session configuration (GA transcription session shape)
-    const createSessionConfig = (prompt = '', asrModel = 'gpt-4o-transcribe') => ({
-      type: 'session.update',
-      session: {
-        type: 'transcription',
-        audio: {
-          input: {
-            format: { type: 'audio/pcm', rate: 24000 },
-            transcription: {
-              model: asrModel,  // Use dedicated ASR model (gpt-4o-transcribe)
-              language: 'ja',   // Explicitly specify Japanese to prevent other language detection
-              ...(prompt ? { prompt: prompt } : {})
-            },
-            // Conditionally enable/disable VAD based on vadEnabled flag
-            turn_detection: vadEnabled ? {
-              type: 'server_vad',
-              threshold: vadThreshold,
-              prefix_padding_ms: vadPrefixPadding,
-              silence_duration_ms: vadSilenceDuration
-            } : null  // null = disable VAD
-          }
-        }
-      }
-    });
-
-    // Initial session configuration (will be updated when prompt/model is received)
-    let sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
 
     // Handle messages from client
     clientWs.on('message', (data) => {
@@ -309,348 +220,8 @@ app.prepare().then(() => {
               currentSessionId = sidCandidate;
               console.log(`📋 Set current session ID: ${currentSessionId}`);
               console.log(`[Debug] Session ID successfully stored for Hocuspocus integration`);
-
-              // Set up forceCommit observer on statusMap
-              // Clean up previous observer if exists
-              if (forceCommitObserver && forceCommitStatusMap) {
-                try {
-                  forceCommitStatusMap.unobserve(forceCommitObserver);
-                  console.log(`[Yjs] 🧹 Cleaned up previous forceCommit observer`);
-                } catch (cleanupError) {
-                  console.warn(`[Yjs] ⚠️ Failed to clean up previous observer:`, cleanupError);
-                }
-              }
-
-              try {
-                const roomName = `transcribe-editor-v2-${message.sessionId}`;
-                const document = hocuspocus.documents.get(roomName);
-                if (document) {
-                  const statusMap = document.getMap(`status-${message.sessionId}`);
-
-                  // Create observer function and store reference for cleanup
-                  forceCommitObserver = (event) => {
-                    const forceCommit = statusMap.get('forceCommit');
-                    if (forceCommit === true) {
-                      console.log(`[Yjs] 🎤 Force commit requested for session ${message.sessionId}`);
-                      statusMap.set('forceCommit', false); // Reset immediately
-
-                      if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
-                        openaiWs.send(JSON.stringify({
-                          type: 'input_audio_buffer.commit'
-                        }));
-                        console.log('[Server] 🎤 Force commit sent to OpenAI');
-                      } else {
-                        console.log('[Server] ⚠️ No active OpenAI connection for force commit');
-                      }
-                    }
-                  };
-                  forceCommitStatusMap = statusMap;
-
-                  statusMap.observe(forceCommitObserver);
-                  console.log(`[Yjs] 👀 ForceCommit observer set up for session ${message.sessionId}`);
-                } else {
-                  console.log(`[Yjs] ⚠️ Document not found for forceCommit observer: ${roomName}`);
-                }
-              } catch (observerError) {
-                console.error(`[Yjs] ❌ Error setting up forceCommit observer:`, observerError);
-              }
             } else {
               console.log(`[Debug] ❌ set_session_id message received but sessionId is empty:`, message);
-            }
-            break;
-            
-          case 'set_prompt':
-            // Update transcription prompt
-            if (message.prompt !== undefined) {
-              transcriptionPrompt = message.prompt;
-              console.log('📝 Received transcription prompt:', transcriptionPrompt || '(empty)');
-              
-              // Update session configuration with new prompt
-              sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
-              
-              // Send updated session config to OpenAI if connection is open
-              if (openaiWs.readyState === 1) { // WebSocket.OPEN
-                console.log('🔄 Updating OpenAI session with new prompt...');
-                openaiWs.send(JSON.stringify(sessionConfig));
-                console.log('✅ Session updated with transcription prompt');
-              }
-            }
-            break;
-            
-          case 'set_transcription_model':
-            // Update transcription model
-            if (message.model) {
-              const validTranscriptionModels = ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'];
-              if (validTranscriptionModels.includes(message.model)) {
-                transcriptionModel = message.model;
-                console.log('🎤 Received transcription model:', transcriptionModel);
-                
-                // Update session configuration with new model
-                sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
-                
-                // Send updated session config to OpenAI if connection is open
-                if (openaiWs.readyState === 1) { // WebSocket.OPEN
-                  console.log('🔄 Updating OpenAI session with new transcription model...');
-                  openaiWs.send(JSON.stringify(sessionConfig));
-                  console.log('✅ Session updated with transcription model');
-                }
-              } else {
-                console.error('❌ Invalid transcription model:', message.model);
-                clientWs.send(JSON.stringify({
-                  type: 'error',
-                  error: `Invalid transcription model. Use: ${validTranscriptionModels.join(', ')}`
-                }));
-              }
-            }
-            break;
-            
-          case 'set_speech_break_detection':
-            // Update speech break detection settings
-            if (message.enabled !== undefined) {
-              speechBreakDetection = message.enabled;
-              console.log('🔸 Speech break detection enabled:', speechBreakDetection);
-            }
-            if (message.marker) {
-              speechBreakMarker = message.marker;
-              console.log('🔸 Speech break marker set to:', speechBreakMarker);
-            }
-            break;
-            
-          case 'set_vad_params':
-            // Update VAD parameters (with validation to prevent null values)
-            // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間
-            if (message.enabled !== undefined) {
-              vadEnabled = message.enabled;
-              console.log('🎛️ VAD enabled set to:', vadEnabled);
-            }
-            if (message.threshold !== undefined && message.threshold !== null && typeof message.threshold === 'number') {
-              vadThreshold = Math.max(0.0, Math.min(1.0, Number(message.threshold))); // Ensure number and clamp to 0.0-1.0
-              console.log('🎛️ VAD threshold set to:', vadThreshold);
-            }
-            if (message.silence_duration_ms !== undefined && message.silence_duration_ms !== null && typeof message.silence_duration_ms === 'number') {
-              vadSilenceDuration = Math.max(200, Math.min(10000, Number(message.silence_duration_ms))); // Ensure number and clamp to valid range
-              console.log('🎛️ VAD発話終了判定時間 set to:', vadSilenceDuration + 'ms');
-            }
-            if (message.prefix_padding_ms !== undefined && message.prefix_padding_ms !== null && typeof message.prefix_padding_ms === 'number') {
-              vadPrefixPadding = Math.max(0, Math.min(2000, Number(message.prefix_padding_ms))); // Ensure number and clamp to 0-2000
-              console.log('🎛️ VAD prefix padding set to:', vadPrefixPadding + 'ms');
-            }
-            // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入
-            if (message.paragraph_break_threshold_ms !== undefined && message.paragraph_break_threshold_ms !== null && typeof message.paragraph_break_threshold_ms === 'number') {
-              paragraphBreakThreshold = Math.max(500, Math.min(30000, Number(message.paragraph_break_threshold_ms))); // Ensure number and clamp to 500-30000
-              console.log('📝 パラグラフ区切り判定時間 set to:', paragraphBreakThreshold + 'ms');
-            }
-
-            // Update session configuration with new VAD parameters
-            sessionConfig = createSessionConfig(transcriptionPrompt, transcriptionModel);
-
-            // Send updated session config to OpenAI if connection is open
-            if (openaiWs.readyState === 1) { // WebSocket.OPEN
-              console.log('🔄 Updating OpenAI session with new VAD parameters...');
-              openaiWs.send(JSON.stringify(sessionConfig));
-              console.log('✅ Session updated with VAD parameters');
-            }
-            break;
-
-          case 'set_auto_rewrite':
-            // Update auto-rewrite on paragraph break setting
-            if (message.enabled !== undefined) {
-              autoRewriteOnParagraphBreak = message.enabled;
-              console.log('🔄 Auto-rewrite on paragraph break:', autoRewriteOnParagraphBreak ? 'enabled' : 'disabled');
-            }
-            // Update rewrite model
-            if (message.model) {
-              const validRewriteModels = ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1'];
-              if (validRewriteModels.includes(message.model)) {
-                rewriteModel = message.model;
-                console.log('🤖 Rewrite model set to:', rewriteModel);
-              } else {
-                console.error('❌ Invalid rewrite model:', message.model);
-                clientWs.send(JSON.stringify({
-                  type: 'error',
-                  error: `Invalid rewrite model. Use: ${validRewriteModels.join(', ')}`
-                }));
-              }
-            }
-            break;
-
-          case 'set_force_line_break':
-            // Update force line break at period setting
-            if (message.enabled !== undefined) {
-              forceLineBreakAtPeriod = message.enabled;
-              console.log('📝 Force line break at period:', forceLineBreakAtPeriod ? 'enabled' : 'disabled');
-            }
-            break;
-
-          case 'set_commit_threshold':
-            // Update auto-commit threshold from client
-            if (message.threshold_ms !== undefined && message.threshold_ms > 0) {
-              autoCommitThresholdMs = message.threshold_ms;
-              autoCommitTimerDelayMs = Math.max(autoCommitThresholdMs * 2, 2000); // At least 2 seconds
-              if (message.buffer_size !== undefined) {
-                audioBufferSize = message.buffer_size;
-              }
-              if (message.batch_multiplier !== undefined) {
-                batchMultiplier = message.batch_multiplier;
-              }
-              console.log(`⏱️ Auto-commit threshold set to: ${autoCommitThresholdMs}ms (buffer: ${audioBufferSize}, batch: ${batchMultiplier}, timer delay: ${autoCommitTimerDelayMs}ms)`);
-            }
-            break;
-            
-          case 'audio_chunk':
-            // Only process if we have actual audio data
-            if (!message.audio || message.audio.length === 0) {
-              console.warn('Received empty audio chunk, skipping');
-              return;
-            }
-            
-            // Validate audio data first
-            const audioData = Buffer.from(message.audio, 'base64');
-            // Node.js Bufferの共有プール問題とbyteOffsetアライメント問題を回避
-            // audioData.bufferは共有プールを指す可能性があり、byteOffsetが2バイト境界でない場合、
-            // Int16Arrayの読み取りが正しく動作しない
-            const arrayBuffer = audioData.buffer.slice(audioData.byteOffset, audioData.byteOffset + audioData.length);
-            const int16Array = new Int16Array(arrayBuffer);
-            // Use loop instead of spread operator to avoid stack overflow with large arrays
-            let maxSample = 0;
-            let sumSample = 0;
-            for (let i = 0; i < int16Array.length; i++) {
-              const absVal = Math.abs(int16Array[i]);
-              if (absVal > maxSample) maxSample = absVal;
-              sumSample += absVal;
-            }
-            const avgSample = sumSample / int16Array.length;
-            
-            audioChunkCount++;
-
-            // Log silent audio chunks but don't skip (for accurate VAD detection)
-            // Track accumulated silence duration for paragraph break detection
-            const sampleDurationMs = (audioData.length / 2 / 24000) * 1000; // ms per chunk at 24kHz
-            if (maxSample < 100) {
-              // Silent chunk - accumulate silence duration
-              accumulatedSilenceDuration += sampleDurationMs;
-              // 低遅延設定（約43ms間隔）ではチャンク毎のログがI/O負荷になるため間引く
-              if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
-                console.log(`📊 Silent audio chunk ${audioChunkCount}: max sample=${maxSample}, accumulated silence=${accumulatedSilenceDuration.toFixed(0)}ms`);
-              }
-            } else {
-              // Voice detected - reset accumulated silence
-              if (accumulatedSilenceDuration > 0) {
-                console.log(`🎤 Voice detected - resetting accumulated silence (was ${accumulatedSilenceDuration.toFixed(0)}ms)`);
-              }
-              accumulatedSilenceDuration = 0;
-            }
-
-            // Track audio buffer duration for all chunks (including silent)
-            const sampleCount = audioData.length / 2; // 16-bit = 2 bytes per sample
-            const chunkDurationMs = (sampleCount / 24000) * 1000; // duration at 24kHz
-            audioBufferDuration += chunkDurationMs;
-            lastAudioTimestamp = Date.now();
-            
-            if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
-              console.log(`Audio chunk ${audioChunkCount}: buffer=${audioBufferDuration}ms, size=${message.audio.length} chars, max sample=${maxSample}`);
-            }
-            
-            // Log first few samples for debugging
-            if (audioChunkCount <= 3) {
-              console.log(`First 10 samples:`, Array.from(int16Array.slice(0, 10)));
-            }
-            
-            // Send valid audio data with actual content
-            const audioEvent = {
-              type: 'input_audio_buffer.append',
-              audio: message.audio // Base64 encoded PCM16 audio
-            };
-            
-            // Check WebSocket state before sending
-            if (openaiWs.readyState === 1) { // WebSocket.OPEN
-              openaiWs.send(JSON.stringify(audioEvent));
-              if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
-                console.log(`✅ Audio sent to OpenAI: ${audioData.length} bytes, max sample: ${maxSample}`);
-              }
-            } else {
-              console.log(`⚠️ OpenAI WebSocket not ready (state: ${openaiWs.readyState}), skipping audio chunk`);
-            }
-            
-            // Clear any existing timer
-            if (autoCommitTimer) {
-              clearTimeout(autoCommitTimer);
-            }
-
-            // When Server VAD is enabled, skip manual commit - let OpenAI handle it automatically
-            if (vadEnabled) {
-              // VAD mode: OpenAI's Server VAD handles transcription timing automatically
-              // Just track buffer for logging purposes, don't send manual commits
-              break;
-            }
-
-            // Auto-commit when we have enough audio with rate limiting (only when VAD is disabled)
-            const now = Date.now();
-            const timeSinceLastCommit = now - lastCommitTime;
-
-            if (audioBufferDuration >= autoCommitThresholdMs && !responseInProgress && timeSinceLastCommit >= (autoCommitThresholdMs * 2)) {
-              console.log(`Auto-committing audio buffer: ${audioBufferDuration}ms (threshold: ${autoCommitThresholdMs}ms), ${audioChunkCount} chunks`);
-              responseInProgress = true;
-              lastCommitTime = now;
-
-              // Just commit the audio buffer - transcription should happen automatically
-              const commitEvent = {
-                type: 'input_audio_buffer.commit'
-              };
-
-              if (openaiWs.readyState === 1) { // WebSocket.OPEN
-                openaiWs.send(JSON.stringify(commitEvent));
-                console.log('✅ Audio buffer committed, waiting for automatic transcription...');
-              } else {
-                console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
-                responseInProgress = false; // Reset flag
-              }
-
-              // Don't reset buffer tracking immediately - let transcription complete first
-              // audioBufferDuration = 0;
-              // audioChunkCount = 0;
-            } else {
-              // Set a timer to commit after specified delay with no new audio
-              autoCommitTimer = setTimeout(() => {
-                const timerNow = Date.now();
-                const timerTimeSinceLastCommit = timerNow - lastCommitTime;
-
-                // Check buffer duration again to prevent race condition with transcription completion
-                const minBufferForTimer = Math.max(500, autoCommitThresholdMs * 0.5); // At least 50% of threshold
-                const minTimeSinceLastCommit = Math.max(1500, autoCommitThresholdMs * 1.5); // At least 1.5x threshold
-
-                if (audioBufferDuration >= minBufferForTimer && !responseInProgress && timerTimeSinceLastCommit >= minTimeSinceLastCommit) {
-                  console.log(`Timer-based commit: ${audioBufferDuration}ms (min: ${minBufferForTimer}ms), ${audioChunkCount} chunks`);
-                  responseInProgress = true;
-                  lastCommitTime = timerNow;
-
-                  // Just commit the audio buffer - transcription should happen automatically
-                  const commitEvent = {
-                    type: 'input_audio_buffer.commit'
-                  };
-
-                  if (openaiWs.readyState === 1) { // WebSocket.OPEN
-                    openaiWs.send(JSON.stringify(commitEvent));
-                    console.log('✅ Audio buffer committed (timer), waiting for automatic transcription...');
-                  } else {
-                    console.log(`⚠️ OpenAI WebSocket not ready for timer commit (state: ${openaiWs.readyState})`);
-                    responseInProgress = false; // Reset flag
-                  }
-
-                  // Don't reset buffer tracking immediately
-                  // audioBufferDuration = 0;
-                  // audioChunkCount = 0;
-                } else {
-                  // Log why commit was skipped
-                  if (audioBufferDuration < minBufferForTimer) {
-                    console.log(`⏭️  Skipping timer commit - buffer too small: ${audioBufferDuration}ms (minimum: ${minBufferForTimer}ms)`);
-                  } else if (responseInProgress) {
-                    console.log('⏭️  Skipping timer commit - response already in progress');
-                  } else if (timerTimeSinceLastCommit < minTimeSinceLastCommit) {
-                    console.log(`⏭️  Skipping timer commit - too soon after last commit: ${timerTimeSinceLastCommit}ms (minimum: ${minTimeSinceLastCommit}ms)`);
-                  }
-                }
-              }, autoCommitTimerDelayMs);
             }
             break;
             
@@ -668,25 +239,34 @@ app.prepare().then(() => {
             // 校正画面には生テキストを未確定（グレー）として見せ続け、
             // AI校正の結果が「確定文」として追記された時点で黒字になる
             if (autoProofreadState.enabled && currentSessionId) {
+              // 無音ポーズ境界を記録（このチャンクの直前で機械的に段落を区切る一次シグナル）。
+              // continuation（発話途中の継続確定）はポーズではないため記録しない。
+              if (!message.continuation && typeof message.gapMs === 'number'
+                  && message.gapMs >= PAUSE_BREAK_MS && autoProofreadState.rawBuffer.length > 0) {
+                autoProofreadState.pausePositions.push(autoProofreadState.rawBuffer.length);
+              }
               autoProofreadState.rawBuffer += message.text;
               autoProofreadState.lastBufferChangeAt = Date.now();
               // 校正が失敗し続けた場合の安全弁: バッファ過大なら未校正のまま書き出す
               if (autoProofreadState.rawBuffer.length > 8000) {
                 const degraded = autoProofreadState.rawBuffer.slice(0, 4000);
                 autoProofreadState.rawBuffer = autoProofreadState.rawBuffer.slice(4000);
+                // ポーズ境界も同じ分だけ前方シフトする
+                autoProofreadState.pausePositions = autoProofreadState.pausePositions
+                  .map((p) => p - 4000).filter((p) => p > 0);
                 console.warn('[Auto-Proofread] ⚠️ バッファ過大のため4000文字を未校正のまま書き出します');
                 sendTextToHocuspocusDocument(currentSessionId, degraded, false);
               }
-              setPendingText(currentSessionId, autoProofreadState.rawBuffer + autoProofreadState.pendingInterim);
+              {
+                const pt = autoProofreadState.rawBuffer + autoProofreadState.pendingInterim;
+                setPendingText(currentSessionId, pt, greenDisplayBreaks(autoProofreadState.rawBuffer, autoProofreadState.pausePositions), autoProofreadState.rawBuffer.length);
+              }
               maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
                 .catch((e) => console.error('[Auto-Proofread] ❌ trigger error:', e));
               break;
             }
 
-            let localText = message.text;
-            if (forceLineBreakAtPeriod) {
-              localText = localText.replace(/。/g, '。\n');
-            }
+            const localText = message.text;
             if (currentSessionId) {
               console.log(`[LocalASR] 📝 Local transcription → Hocuspocus(${currentSessionId}): "${sanitizeForLog(message.text)}"${message.continuation ? ' (継続)' : ''}`);
               // continuation=true は発話途中からの部分確定なので、区切りスペースを入れない
@@ -710,11 +290,12 @@ app.prepare().then(() => {
               autoProofreadState.sentTail = '';
               autoProofreadState.pendingInterim = '';
               autoProofreadState.lastBufferChangeAt = 0;
+              autoProofreadState.pausePositions = [];
               if (!autoProofreadState.timer) {
-                autoProofreadState.timer = setInterval(() => {
+                autoProofreadState.timer = setInterval(() => { // 6秒ごとに校正をトリガー（高頻度化）
                   maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
                     .catch((e) => console.error('[Auto-Proofread] ❌ timer error:', e));
-                }, 20000);
+                }, 6000);
               }
               console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, バッファ方式)`);
             } else {
@@ -748,99 +329,12 @@ app.prepare().then(() => {
               const composite = autoProofreadState.enabled
                 ? autoProofreadState.rawBuffer + interimText
                 : interimText;
-              setPendingText(currentSessionId, composite);
+              // そとづけの改行情報（機械分割オフセット）。自動校正ON時のみ算出する。
+              const compositeBreaks = autoProofreadState.enabled
+                ? greenDisplayBreaks(autoProofreadState.rawBuffer, autoProofreadState.pausePositions)
+                : [];
+              setPendingText(currentSessionId, composite, compositeBreaks, autoProofreadState.enabled ? autoProofreadState.rawBuffer.length : 0);
             }
-            break;
-
-          case 'audio_commit':
-            // Only commit if we have enough audio and not already processing
-            if (audioBufferDuration >= 100 && !responseInProgress) {
-              console.log(`Manual commit: ${audioBufferDuration}ms, ${audioChunkCount} chunks`);
-              responseInProgress = true;
-              lastCommitTime = Date.now();
-              
-              // Just commit the audio buffer - transcription should happen automatically
-              const commitEvent = {
-                type: 'input_audio_buffer.commit'
-              };
-              
-              if (openaiWs.readyState === 1) { // WebSocket.OPEN
-                openaiWs.send(JSON.stringify(commitEvent));
-                console.log('✅ Audio buffer committed (manual), waiting for automatic transcription...');
-              } else {
-                console.log(`⚠️ OpenAI WebSocket not ready for manual commit (state: ${openaiWs.readyState})`);
-                responseInProgress = false; // Reset flag
-              }
-              
-              // Don't reset buffer tracking immediately
-              // audioBufferDuration = 0;
-              // audioChunkCount = 0;
-            } else {
-              console.log(`Skipping manual commit - insufficient audio: ${audioBufferDuration}ms (need >= 100ms) or response in progress: ${responseInProgress}`);
-            }
-            break;
-            
-          case 'clear_audio_buffer':
-            // Clear the audio buffer
-            const clearEvent = {
-              type: 'input_audio_buffer.clear'
-            };
-            
-            if (openaiWs.readyState === 1) { // WebSocket.OPEN
-              openaiWs.send(JSON.stringify(clearEvent));
-              console.log('Audio buffer cleared');
-            } else {
-              console.log(`⚠️ OpenAI WebSocket not ready for clear (state: ${openaiWs.readyState})`);
-            }
-            
-            // Reset buffer tracking
-            audioBufferDuration = 0;
-            audioChunkCount = 0;
-            break;
-            
-          case 'send_dummy_audio_data':
-            // Send dummy audio data directly from client (localStorage)
-            if (isDummyAudioSending) {
-              console.log('⚠️ Dummy audio is already being sent, ignoring new request');
-              clientWs.send(JSON.stringify({
-                type: 'error',
-                error: '録音データ送信中です。完了をお待ちください。'
-              }));
-              break;
-            }
-            if (message.audioData) {
-              isDummyAudioSending = true;
-              const sendInterval = message.sendInterval || 50; // Default to 50ms if not specified
-              console.log(`[Dummy Audio] Using send interval: ${sendInterval}ms`);
-              dummyAudioTimeoutId = sendDummyAudioData(message.audioData, message.name || 'Client Recording', clientWs, openaiWs, () => {
-                responseInProgress = true;
-                lastCommitTime = Date.now();
-              }, () => {
-                // onComplete callback - reset flag when sending is done
-                isDummyAudioSending = false;
-                dummyAudioTimeoutId = null;
-              }, sendInterval);
-            } else {
-              console.error('❌ No audio data provided for dummy audio');
-              clientWs.send(JSON.stringify({
-                type: 'error',
-                error: 'No audio data provided for dummy audio'
-              }));
-            }
-            break;
-
-          case 'stop_dummy_audio':
-            // Stop dummy audio sending
-            console.log('[Dummy Audio] 🛑 Stop dummy audio requested');
-            if (dummyAudioTimeoutId) {
-              clearTimeout(dummyAudioTimeoutId);
-              dummyAudioTimeoutId = null;
-            }
-            isDummyAudioSending = false;
-            clientWs.send(JSON.stringify({
-              type: 'dummy_audio_completed'
-            }));
-            console.log('[Dummy Audio] ✅ Dummy audio stopped');
             break;
 
           default:
@@ -868,38 +362,10 @@ app.prepare().then(() => {
         sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
         autoProofreadState.rawBuffer = '';
       }
-      // Clean up forceCommit observer
-      if (forceCommitObserver && forceCommitStatusMap) {
-        try {
-          forceCommitStatusMap.unobserve(forceCommitObserver);
-          console.log('[Yjs] 🧹 Cleaned up forceCommit observer on disconnect');
-        } catch (cleanupError) {
-          console.warn('[Yjs] ⚠️ Failed to cleanup observer on disconnect:', cleanupError);
-        }
-        forceCommitObserver = null;
-        forceCommitStatusMap = null;
-      }
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
     });
 
     clientWs.on('error', (error) => {
       console.error('Client WebSocket error:', error);
-      // Clean up forceCommit observer
-      if (forceCommitObserver && forceCommitStatusMap) {
-        try {
-          forceCommitStatusMap.unobserve(forceCommitObserver);
-          console.log('[Yjs] 🧹 Cleaned up forceCommit observer on error');
-        } catch (cleanupError) {
-          // Ignore cleanup errors
-        }
-        forceCommitObserver = null;
-        forceCommitStatusMap = null;
-      }
-      if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.close();
-      }
     });
   });
 
@@ -1030,64 +496,32 @@ app.prepare().then(() => {
     }
   }
 
-  // Function to update transcription status in Hocuspocus document
-  function updateTranscriptionStatus(sessionId, isTranscribing) {
-    try {
-      if (!sessionId) return;
-
-      const roomName = `transcribe-editor-v2-${sessionId}`;
-      const document = hocuspocus.documents.get(roomName);
-
-      if (document) {
-        const statusMap = document.getMap(`status-${sessionId}`);
-        statusMap.set('isTranscribing', isTranscribing);
-        console.log(`[Hocuspocus Integration] 📊 Transcription status updated: ${isTranscribing}`);
-      }
-    } catch (error) {
-      console.error(`[Hocuspocus Integration] ❌ Error updating transcription status:`, error);
-    }
-  }
-
   // Pending text accumulator per session
   const pendingTextBySession = new Map();
 
-  // Function to update pending text (recognition in progress) in Hocuspocus document
-  function updatePendingText(sessionId, delta) {
+  // クライアント主認識（オンデバイス認識）のinterim用: pending textを全文置き換えで更新する。
+  // Web Speechのinterimは毎回その時点の認識仮説の全文が届き、仮説は後続音声で修正（バックトラック）されうる
+  // breaks: 未確定テキスト内の「改行（段落区切り）オフセット」配列（そとづけの区切り情報）。
+  // greenLen: 先頭から greenLen 文字は「オンデバイス確定済・AI校正待ち（緑）」、以降は
+  //           「オンデバイス未確定 interim（グレー）」。校正画面・認識画面で色分けに使う。
+  //   （3状態: グレー=interim / 緑=rawBuffer(AI校正待ち) / 黒=AI確定済の共有doc）
+  function setPendingText(sessionId, text, breaks = [], greenLen = 0) {
     try {
       if (!sessionId) return;
-
-      // Accumulate delta text
-      const currentText = pendingTextBySession.get(sessionId) || '';
-      const newText = currentText + delta;
-      pendingTextBySession.set(sessionId, newText);
-
-      const roomName = `transcribe-editor-v2-${sessionId}`;
-      const document = hocuspocus.documents.get(roomName);
-
-      if (document) {
-        const statusMap = document.getMap(`status-${sessionId}`);
-        statusMap.set('pendingText', newText);
-        console.log(`[Hocuspocus Integration] 🔤 Pending text updated: "${newText}"`);
-      }
-    } catch (error) {
-      console.error(`[Hocuspocus Integration] ❌ Error updating pending text:`, error);
-    }
-  }
-
-  // クライアント主認識（オンデバイス認識）のinterim用: pending textを全文置き換えで更新する
-  // OpenAI deltaの累積方式（updatePendingText）と異なり、Web Speechのinterimは
-  // 毎回その時点の認識仮説の全文が届き、仮説は後続音声で修正（バックトラック）されうる
-  function setPendingText(sessionId, text) {
-    try {
-      if (!sessionId) return;
-      // 同じ内容なら書き込まない（無駄なYjsブロードキャストの抑制）
-      if (pendingTextBySession.get(sessionId) === text) return;
-      pendingTextBySession.set(sessionId, text);
+      // 同じ内容なら書き込まない（無駄なYjsブロードキャストの抑制）。greenLenも比較に含める。
+      const dedupKey = `${greenLen} ${text}`;
+      if (pendingTextBySession.get(sessionId) === dedupKey) return;
+      pendingTextBySession.set(sessionId, dedupKey);
       const roomName = `transcribe-editor-v2-${sessionId}`;
       const document = hocuspocus.documents.get(roomName);
       if (document) {
         const statusMap = document.getMap(`status-${sessionId}`);
-        statusMap.set('pendingText', text);
+        // pendingText / pendingBreaks / pendingGreenLen を同一トランザクションで更新する
+        document.transact(() => {
+          statusMap.set('pendingText', text);
+          statusMap.set('pendingBreaks', Array.isArray(breaks) ? breaks : []);
+          statusMap.set('pendingGreenLen', Math.max(0, Math.min(greenLen, text.length)));
+        });
       }
     } catch (error) {
       console.error(`[Hocuspocus Integration] ❌ Error setting pending text:`, error);
@@ -1107,260 +541,17 @@ app.prepare().then(() => {
 
       if (document) {
         const statusMap = document.getMap(`status-${sessionId}`);
-        statusMap.set('pendingText', '');
+        document.transact(() => {
+          statusMap.set('pendingText', '');
+          statusMap.set('pendingBreaks', []);
+          statusMap.set('pendingGreenLen', 0);
+        });
         console.log(`[Hocuspocus Integration] 🧹 Pending text cleared`);
       }
     } catch (error) {
       console.error(`[Hocuspocus Integration] ❌ Error clearing pending text:`, error);
     }
   }
-
-  // Function to create a paragraph break in Hocuspocus document
-  async function createParagraphBreak(sessionId, marker = '⏎') {
-    try {
-      console.log(`[Hocuspocus Integration] Creating paragraph break for session ${sessionId}`);
-      
-      const roomName = `transcribe-editor-v2-${sessionId}`;
-      
-      // Access existing document from server's documents collection
-      const document = hocuspocus.documents.get(roomName);
-      
-      if (document) {
-        // Use session-specific field name to match client
-        const fieldName = `content-${sessionId}`;
-
-        // TipTap Collaboration uses XmlFragment, not Text
-        const fragment = document.getXmlFragment(fieldName);
-
-        // 音声フロー由来の変更であることを編集側へ伝える（下線・変更履歴の除外対象）。
-        // 重要: seq更新と段落挿入を同一Yjsトランザクションにまとめる。
-        // 別トランザクションだと編集側のseq消費判定がズレて段落挿入に下線が付く
-        // （sendTextToHocuspocusDocumentと同じ理由でtransactが必須）。
-        document.transact(() => {
-        const breakStatusMap = document.getMap(`status-${sessionId}`);
-        breakStatusMap.set('speechAppendSeq', (breakStatusMap.get('speechAppendSeq') || 0) + 1);
-
-        // Only create new paragraph if there's existing content
-        const hasContent = fragment.length > 0;
-
-        if (hasContent) {
-          // ⏎は新段落のみ作成し、マーカー文字は追加しない（改行記号なので）
-          // それ以外のマーカー（↩️, 🔄, 📝など）はテキストとして追加後、新段落を作成
-          const isNewlineMarker = marker === '⏎';
-
-          if (!isNewlineMarker) {
-            // Get the last paragraph and append the marker to its end
-            const lastParagraph = fragment.get(fragment.length - 1);
-            if (lastParagraph && lastParagraph instanceof (require('yjs')).XmlElement) {
-              // Find or create text node in the last paragraph to append marker
-              let lastTextNode = null;
-              for (let i = lastParagraph.length - 1; i >= 0; i--) {
-                const child = lastParagraph.get(i);
-                if (child instanceof (require('yjs')).XmlText) {
-                  lastTextNode = child;
-                  break;
-                }
-              }
-              if (lastTextNode) {
-                // Append marker to existing text
-                lastTextNode.insert(lastTextNode.length, ' ' + marker);
-              } else {
-                // Create new text node with marker
-                const newTextNode = new (require('yjs')).XmlText();
-                newTextNode.insert(0, ' ' + marker);
-                lastParagraph.insert(lastParagraph.length, [newTextNode]);
-              }
-              console.log(`[Hocuspocus Integration] ✅ Marker '${marker}' appended to last paragraph in '${fieldName}'`);
-            }
-          } else {
-            console.log(`[Hocuspocus Integration] ℹ️ Newline marker '${marker}' - skipping text append, creating new paragraph only`);
-          }
-
-          // Create a new empty paragraph for the next content
-          const newParagraph = new (require('yjs')).XmlElement('paragraph');
-          fragment.insert(fragment.length, [newParagraph]);
-          console.log(`[Hocuspocus Integration] ✅ New empty paragraph created in '${fieldName}' for speech break`);
-        } else {
-          console.log(`[Hocuspocus Integration] ⚠️ No existing content, skipping paragraph break`);
-        }
-        }); // end document.transact
-
-      } else {
-        console.log(`[Hocuspocus Integration] ⚠️ Document not found in server documents: ${roomName}`);
-        
-        // Debug: Show available documents
-        const availableDocs = Array.from(hocuspocus.documents.keys());
-        console.log(`[Hocuspocus Integration] Available documents (${availableDocs.length}):`, availableDocs);
-      }
-      
-    } catch (error) {
-      console.error(`[Hocuspocus Integration] ❌ Error creating paragraph break:`, error);
-    }
-  }
-
-  // Function to get the text of the last (completed) paragraph from Hocuspocus document
-  function getLastParagraphText(sessionId) {
-    try {
-      const roomName = `transcribe-editor-v2-${sessionId}`;
-      const document = hocuspocus.documents.get(roomName);
-
-      if (!document) {
-        console.log(`[Auto-Rewrite] ⚠️ Document not found: ${roomName}`);
-        return null;
-      }
-
-      const fieldName = `content-${sessionId}`;
-      const fragment = document.getXmlFragment(fieldName);
-
-      // Get the second-to-last paragraph (the one just completed, before the new empty paragraph)
-      if (fragment.length < 2) {
-        console.log(`[Auto-Rewrite] ⚠️ Not enough paragraphs for rewrite`);
-        return null;
-      }
-
-      const lastCompletedParagraph = fragment.get(fragment.length - 2);
-      if (!lastCompletedParagraph) {
-        return null;
-      }
-
-      // Extract text from the paragraph
-      let paragraphText = '';
-      for (let i = 0; i < lastCompletedParagraph.length; i++) {
-        const child = lastCompletedParagraph.get(i);
-        if (child instanceof (require('yjs')).XmlText) {
-          paragraphText += child.toString();
-        }
-      }
-
-      return paragraphText.trim();
-    } catch (error) {
-      console.error(`[Auto-Rewrite] ❌ Error getting last paragraph text:`, error);
-      return null;
-    }
-  }
-
-  // Function to rewrite text using OpenAI Chat API
-  async function rewriteText(text, model = 'gpt-4o-mini') {
-    try {
-      const systemPrompt = `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
-
-校正のルール:
-1. 誤字脱字を修正
-2. 句読点を適切に整理
-3. 明らかに誤った専門用語があれば補完・修正
-4. 文の意味や内容は変更しない
-5. 原文の文体やトーンを維持
-
-修正した文章のみを出力してください。説明は不要です。`;
-
-      console.log(`[Auto-Rewrite] 🤖 Using model: ${model}`);
-      const content = await callChatCompletion(model, [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: text }
-      ], { temperature: 0.3, maxTokens: 2048 });
-
-      return content || text;
-    } catch (error) {
-      console.error(`[Auto-Rewrite] ❌ Error rewriting text:`, error);
-      return text; // Return original text on error
-    }
-  }
-
-  // Function to replace the last completed paragraph with rewritten text
-  function replaceLastParagraphText(sessionId, newText) {
-    try {
-      const roomName = `transcribe-editor-v2-${sessionId}`;
-      const document = hocuspocus.documents.get(roomName);
-
-      if (!document) {
-        console.log(`[Auto-Rewrite] ⚠️ Document not found: ${roomName}`);
-        return false;
-      }
-
-      const fieldName = `content-${sessionId}`;
-      const fragment = document.getXmlFragment(fieldName);
-
-      if (fragment.length < 2) {
-        return false;
-      }
-
-      const lastCompletedParagraph = fragment.get(fragment.length - 2);
-      if (!lastCompletedParagraph || !(lastCompletedParagraph instanceof (require('yjs')).XmlElement)) {
-        return false;
-      }
-
-      // Clear existing content
-      while (lastCompletedParagraph.length > 0) {
-        lastCompletedParagraph.delete(0, 1);
-      }
-
-      // Add new text
-      const newTextNode = new (require('yjs')).XmlText();
-      newTextNode.insert(0, newText);
-      lastCompletedParagraph.insert(0, [newTextNode]);
-
-      console.log(`[Auto-Rewrite] ✅ Paragraph replaced with rewritten text`);
-      return true;
-    } catch (error) {
-      console.error(`[Auto-Rewrite] ❌ Error replacing paragraph text:`, error);
-      return false;
-    }
-  }
-
-  // Function to auto-rewrite the last paragraph on paragraph break
-  async function autoRewriteLastParagraph(sessionId, clientWs, model = 'gpt-4o-mini') {
-    try {
-      console.log(`[Auto-Rewrite] 🔄 Starting auto-rewrite for session: ${sessionId} with model: ${model}`);
-
-      // Get the text of the last completed paragraph
-      const originalText = getLastParagraphText(sessionId);
-      if (!originalText || originalText.length < 5) {
-        console.log(`[Auto-Rewrite] ⏭️ Skipping rewrite - text too short or empty`);
-        return;
-      }
-
-      console.log(`[Auto-Rewrite] 📝 Original text: "${originalText.substring(0, 50)}..."`);
-
-      // Notify client that rewrite is starting
-      clientWs.send(JSON.stringify({
-        type: 'auto_rewrite_started',
-        originalText: originalText,
-        model: model
-      }));
-
-      // Rewrite the text using OpenAI
-      const rewrittenText = await rewriteText(originalText, model);
-
-      if (rewrittenText !== originalText) {
-        console.log(`[Auto-Rewrite] ✅ Rewritten text: "${rewrittenText.substring(0, 50)}..."`);
-
-        // Replace the paragraph text in the document
-        replaceLastParagraphText(sessionId, rewrittenText);
-
-        // Notify client about the rewrite result
-        clientWs.send(JSON.stringify({
-          type: 'auto_rewrite_completed',
-          originalText: originalText,
-          rewrittenText: rewrittenText
-        }));
-      } else {
-        console.log(`[Auto-Rewrite] ℹ️ No changes needed`);
-        clientWs.send(JSON.stringify({
-          type: 'auto_rewrite_completed',
-          originalText: originalText,
-          rewrittenText: originalText,
-          noChanges: true
-        }));
-      }
-    } catch (error) {
-      console.error(`[Auto-Rewrite] ❌ Error in auto-rewrite:`, error);
-      clientWs.send(JSON.stringify({
-        type: 'auto_rewrite_error',
-        error: error.message
-      }));
-    }
-  }
-
 
   // ===== 自動校正 =====
   // 前回校正済み位置から「最後から2番目」までの段落範囲に対して、誤字修正と
@@ -1388,9 +579,12 @@ app.prepare().then(() => {
         agent: process.env.HTTPS_PROXY ? new HttpsProxyAgent(process.env.HTTPS_PROXY) : undefined,
         timeout: timeoutMs,
       }, (res) => {
-        let data = '';
-        res.on('data', (chunk) => { data += chunk; });
+        // チャンクごとに文字列連結すると、マルチバイト文字(日本語=UTF-8 3バイト)がチャンク境界で
+        // 分断されて文字化け(�)する。Bufferで蓄積し、末尾で一括してUTF-8デコードする。
+        const chunks = [];
+        res.on('data', (chunk) => { chunks.push(chunk); });
         res.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             const json = JSON.parse(data);
             if (res.statusCode !== 200) {
@@ -1411,22 +605,28 @@ app.prepare().then(() => {
   }
 
   async function proofreadText(text, model, overlapText = '') {
-    const systemPrompt = `あなたは日本語文字起こしテキストの校正アシスタントです。音声認識の生テキスト（句読点なし）を、読みやすい文章に整えます。
+    // 役割: 段落分割は機械処理(mechanicalSplit)が済ませている。AIは「誤って割れた行の結合」と
+    // 「誤字・句読点」だけを担い、新たな分割はしない（ミス分割の結合に特化したプロンプト）。
+    const systemPrompt = `あなたは日本語の会議文字起こしを整える校正アシスタントです。
+【校正対象】には、機械処理で改行（段落区切り）が挿入されています。改行が正しい位置とは限らず、一文の途中で割れていることがあります。
 
-入力は2つの部分から成ります:
-- 【文脈】: 直前までに確定済みの校正テキストの末尾。文のつながりを判断するための参考。変更・出力してはいけない
-- 【校正対象】: 今回整える生テキスト。出力はこの部分の校正結果のみ
+最優先のルール（改行の扱い）:
+- 改行は段落区切りです。原則として維持してください。
+- 結合してよいのは「前の行が文の途中で終わり、次の行がその続き」になっている＝一文が途中で割れている場合だけです。
+- 各行がそれぞれ文として成立しているなら、その改行（段落区切り）は絶対に維持します。完結した文どうしを1つの段落にまとめてはいけません。
+- 新たな改行（分割）は追加しません。
 
-校正のルール:
-1. 誤字脱字・音声認識の誤変換を文脈に基づいて修正する
-2. 句読点（、。）を適切に補う（音声認識は句読点を出力しない）
-3. 意味のまとまりで段落に分ける（1段落150〜300文字目安、段落の区切りは改行1つで表す）
-4. 内容の追加・削除・要約・言い換えはしない（誤りの修正と句読点・段落の整理のみ）
-5. 【校正対象】の末尾が文の途中で終わっている場合は、文を勝手に完結させず途中のまま終える
-   （続きは次回の校正対象として送られてくる）
-6. 文体（です・ます調など）を維持する
+その他の校正:
+- 音声認識の誤変換・誤字脱字を文脈に基づいて修正する
+- 句読点（、。）を適切に補う（音声認識は句読点を出力しない）
+- 内容の追加・削除・要約・言い換えはしない。文体（です・ます調など）も変えない
+- 末尾が文の途中なら勝手に完結させない（続きは次回送られてくる）
 
-出力は【校正対象】の校正結果のみ。【文脈】の内容・説明・ラベルは出力しない。`;
+入力:
+- 【文脈】: 直前までに確定した校正テキストの末尾。つながり判断の参考のみ。変更・出力しない
+- 【校正対象】: 今回整える、機械的に改行済みのテキスト
+
+出力は【校正対象】を上記ルールで整えた結果のみ（段落区切りは改行1つで表す）。【文脈】やラベルは出力しない。`;
 
     const userContent = `【文脈】\n${overlapText || '（なし）'}\n\n【校正対象】\n${text}`;
 
@@ -1458,6 +658,110 @@ app.prepare().then(() => {
     return parts;
   }
 
+  // ===== 機械的パラグラフ分割（ヒューリスティクス） =====
+  // AIに頼らず、無音ポーズ境界と「字数＋語境界」で確定テキストを段落に割る。
+  // 過分割が起きうるが、その結合は後段のAI(proofreadText)が担う。
+  const PAUSE_BREAK_MS = 1200; // この無音(ms)以上で段落区切りを入れる（クライアントのgapMs基準）
+  const MECH_MAX_LINE = 120;   // 確定(AI校正)単位: この文字数を超えたら語境界で機械分割（結合品質を保つ単位）
+  const OVERLAP_CHARS = 400;    // AI補正: 緑の先頭よりさかのぼって再補正に含める既確定テキスト量（80字×5行相当）
+  const OVERLAP_MAX_PARAS = 12; // AI補正: オーバーラップで再補正・置換する最大段落数（入力サイズ/コストの上限）
+  let _jaWordSegmenter = null;
+  function getJaWordSegmenter() {
+    if (_jaWordSegmenter === null) {
+      try {
+        _jaWordSegmenter = new Intl.Segmenter('ja', { granularity: 'word' });
+      } catch {
+        _jaWordSegmenter = false; // 非対応環境では文字境界にフォールバック
+      }
+    }
+    return _jaWordSegmenter || null;
+  }
+
+  // [from, to) の範囲で最後の句読点位置を返す（なければ -1）
+  function findLastPunct(text, from, to) {
+    let idx = -1;
+    const limit = Math.min(to, text.length);
+    for (let i = from; i < limit; i++) {
+      if ('、。！？!?'.includes(text[i])) idx = i;
+    }
+    return idx;
+  }
+
+  // 1セグメントが maxLen を超える場合の、字数＋語境界の「切れ目オフセット」配列を返す
+  // （句読点直後 → 語境界(Intl.Segmenter) → 強制 の優先順）。各行の開始位置。
+  function wordBoundaryCuts(text, maxLen) {
+    if (text.length <= maxLen) return [];
+    const seg = getJaWordSegmenter();
+    let boundaries = null;
+    if (seg) {
+      boundaries = [];
+      for (const { index } of seg.segment(text)) boundaries.push(index);
+      boundaries.push(text.length);
+    }
+    const cuts = [];
+    let start = 0;
+    while (text.length - start > maxLen) {
+      const hard = start + maxLen;
+      const punct = findLastPunct(text, start + Math.floor(maxLen / 2), hard);
+      let cut;
+      if (punct !== -1) {
+        cut = punct + 1;
+      } else if (boundaries) {
+        const cand = boundaries.filter((b) => b > start && b <= hard);
+        cut = cand.length > 0 ? cand[cand.length - 1] : hard;
+      } else {
+        cut = hard;
+      }
+      cuts.push(cut);
+      start = cut;
+    }
+    return cuts;
+  }
+
+  // テキストに対する「機械的パラグラフ区切り」のオフセット配列（各行の開始位置）を返す。
+  // 一次=無音ポーズ境界、二次=長いセグメントの字数＋語境界。未確定表示と確定で同一ロジックを使う。
+  function mechanicalBreakOffsets(text, pauseOffsets = [], maxLen = MECH_MAX_LINE) {
+    const pauseCuts = [...new Set(pauseOffsets)]
+      .filter((o) => o > 0 && o < text.length)
+      .sort((a, b) => a - b);
+    const cuts = new Set(pauseCuts);
+    const bounds = [0, ...pauseCuts, text.length];
+    for (let i = 0; i < bounds.length - 1; i++) {
+      const segStart = bounds[i];
+      const seg = text.slice(segStart, bounds[i + 1]);
+      for (const c of wordBoundaryCuts(seg, maxLen)) cuts.add(segStart + c);
+    }
+    return [...cuts].filter((c) => c > 0 && c < text.length).sort((a, b) => a - b);
+  }
+
+  // 緑(未確定)の表示用改行: 無音ポーズ境界のみを返す。字数での自動折返しはせず、
+  // 校正画面の横幅にあわせたCSSの自然折返しに任せる（横幅いっぱいに表示する）。
+  function greenDisplayBreaks(text, pauseOffsets = []) {
+    return [...new Set(pauseOffsets)]
+      .filter((o) => o > 0 && o < text.length)
+      .sort((a, b) => a - b);
+  }
+
+  // 指定オフセットでテキストを行配列に分割する（空行は除外）
+  function splitAtOffsets(text, offsets) {
+    const cuts = [...new Set(offsets)].filter((o) => o > 0 && o < text.length).sort((a, b) => a - b);
+    const lines = [];
+    let start = 0;
+    for (const c of cuts) {
+      const s = text.slice(start, c);
+      if (s.trim()) lines.push(s);
+      start = c;
+    }
+    const last = text.slice(start);
+    if (last.trim()) lines.push(last);
+    return lines;
+  }
+
+  // ポーズ境界＋字数/語境界で段落(行)配列に機械分割する（確定追記用）
+  function mechanicalSplit(text, pauseOffsets = [], maxLen = MECH_MAX_LINE) {
+    return splitAtOffsets(text, mechanicalBreakOffsets(text, pauseOffsets, maxLen));
+  }
+
   // 指定インデックスの段落テキストを取得（段落でないノードはnull）
   function getParagraphTextByIndex(fragment, index) {
     const Y = require('yjs');
@@ -1471,6 +775,39 @@ app.prepare().then(() => {
     return text;
   }
 
+  // オーバーラップ補正用: 末尾の deleteCount 段落を削除し、text（改行区切り）を新段落として追記する。
+  // 削除と追記を単一トランザクションにまとめ、speechAppendSeq を更新して編集追跡（下線）の対象から除外する。
+  async function replaceTailParagraphs(sessionId, deleteCount, text) {
+    const lines = text.split('\n').filter((line) => line.trim() !== '');
+    if (lines.length === 0) return;
+    const roomName = `transcribe-editor-v2-${sessionId}`;
+    const document = hocuspocus.documents.get(roomName);
+    if (!document) {
+      // ドキュメント未生成時は通常の追記にフォールバック
+      await sendTextToHocuspocusDocument(sessionId, text, false, true);
+      return;
+    }
+    const Y = require('yjs');
+    const fieldName = `content-${sessionId}`;
+    const fragment = document.getXmlFragment(fieldName);
+    document.transact(() => {
+      const statusMap = document.getMap(`status-${sessionId}`);
+      statusMap.set('speechAppendSeq', (statusMap.get('speechAppendSeq') || 0) + 1);
+      // 置換対象（末尾deleteCount段落）を削除。await中に人が編集した場合に備え現在長で丸める。
+      const del = Math.max(0, Math.min(deleteCount, fragment.length));
+      if (del > 0) fragment.delete(fragment.length - del, del);
+      // 再補正結果（オーバーラップ＋緑）を新段落として追記
+      for (const line of lines) {
+        const paragraph = new Y.XmlElement('paragraph');
+        const textNode = new Y.XmlText();
+        textNode.insert(0, line);
+        paragraph.insert(0, [textNode]);
+        fragment.insert(fragment.length, [paragraph]);
+      }
+    });
+    console.log(`[Auto-Proofread] 🔁 末尾${deleteCount}段落を置換し${lines.length}段落を確定 ('${fieldName}')`);
+  }
+
   // バッファ方式の自動校正:
   // ローカル認識の確定テキストは（自動校正ON時）直接ドキュメントへは書かず、
   // サーバ側バッファ（state.rawBuffer）に溜める。一定量たまったら、送信済み校正
@@ -1481,17 +818,29 @@ app.prepare().then(() => {
   async function maybeAutoProofread(sessionId, clientWs, state) {
     if (!state.enabled || state.inFlight || !sessionId) return;
     const now = Date.now();
-    if (now - state.lastRunAt < 15000) return; // 最短実行間隔15秒
+    if (now - state.lastRunAt < 5000) return; // 最短実行間隔5秒（緑→黒の確定を高頻度化）
 
-    const GUARD_CHARS = 100;      // バッファ末尾は発話継続中の可能性があるため残す
     const MAX_TARGET_CHARS = 1500; // 1回の校正対象上限（大きすぎるとAPIタイムアウト）
-    const MIN_TARGET_CHARS = 100;  // 校正単位がたまるまで待つ
 
-    // バッファが30秒以上増えていない（録音停止後など）なら、ガードなしで全量を処理する
-    const stale = state.lastBufferChangeAt > 0 && now - state.lastBufferChangeAt > 30000;
-    const available = stale ? state.rawBuffer.length : state.rawBuffer.length - GUARD_CHARS;
-    if (available < (stale ? 10 : MIN_TARGET_CHARS)) return;
-    const target = state.rawBuffer.slice(0, Math.min(available, MAX_TARGET_CHARS));
+    // 確定対象は「緑範囲（rawBuffer）の最後のヒューリスティクス改行まで」に限定する。
+    // 最後の改行より後ろ＝今まさに話している部分なので、AI（結合・修正）にも確定にもかけず、
+    // 緑のまま残す。録音停止後など12秒更新がなければ、ライブ末尾も無くなったとみなして全量を確定する。
+    const stale = state.lastBufferChangeAt > 0 && now - state.lastBufferChangeAt > 12000;
+    let targetLen;
+    if (stale) {
+      if (state.rawBuffer.length < 10) return;
+      targetLen = state.rawBuffer.length;
+    } else {
+      const breaks = mechanicalBreakOffsets(state.rawBuffer, state.pausePositions, MECH_MAX_LINE);
+      if (breaks.length === 0) return; // まだ区切りがない＝全体がライブ末尾。確定しない
+      targetLen = breaks[breaks.length - 1]; // 最後の改行まで（その後ろは緑のまま残す）
+      if (targetLen > MAX_TARGET_CHARS) {
+        // 上限超過時は MAX 以内の最後の改行位置まで（区切りで切る）
+        const within = breaks.filter((b) => b <= MAX_TARGET_CHARS);
+        targetLen = within.length ? within[within.length - 1] : MAX_TARGET_CHARS;
+      }
+    }
+    const target = state.rawBuffer.slice(0, targetLen);
 
     state.inFlight = true;
     state.lastRunAt = now;
@@ -1504,9 +853,51 @@ app.prepare().then(() => {
         }));
       }
 
-      const result = await proofreadText(target, state.model, state.sentTail);
+      // ① 新しい緑（target）を機械的パラグラフ分割（無音ポーズ境界＋字数/語境界）。
+      const pausesInTarget = state.pausePositions.filter((p) => p > 0 && p < target.length);
+      const mechLines = mechanicalSplit(target, pausesInTarget);
+      const greenSplit = mechLines.length > 0 ? mechLines.join('\n') : target;
 
-      // 改行の保証: モデルが段落分割を返さなかった場合に備えて、長すぎる段落は句点で機械的に分割する
+      // ② オーバーラップ: 緑の先頭よりさかのぼって、既確定の直近段落（約OVERLAP_CHARS字＝80×5行相当）を
+      //    AI補正の対象に含めて再補正し、置き換える（隣接チャンクの直和分割ではなくオーバーラップ実行）。
+      //    削除対象を正確に把握するため、既確定テキストはドキュメントから直接読み戻す。
+      const overlapLines = [];
+      let overlapDeleteCount = 0;
+      let contextBefore = '';
+      const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
+      if (proofDoc) {
+        const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
+        let acc = 0;
+        let idx = proofFragment.length - 1;
+        // 末尾の段落から、累計がOVERLAP_CHARSに達するまで（最大OVERLAP_MAX_PARAS段落）さかのぼる
+        for (; idx >= 0 && acc < OVERLAP_CHARS && overlapDeleteCount < OVERLAP_MAX_PARAS; idx--) {
+          const t = getParagraphTextByIndex(proofFragment, idx);
+          if (t === null) break; // 段落以外（画像等）に当たったら打ち切り
+          overlapLines.unshift(t);
+          acc += t.length;
+          overlapDeleteCount++;
+        }
+        // オーバーラップ窓の直前段落を【文脈】として最大300字読む（つながり判断の参考・出力されない）
+        for (; idx >= 0 && contextBefore.length < 300; idx--) {
+          const t = getParagraphTextByIndex(proofFragment, idx);
+          if (t === null) break;
+          contextBefore = t + contextBefore;
+        }
+        contextBefore = contextBefore.slice(-300);
+      }
+
+      // ③ AI補正の入力 = オーバーラップ（既確定・再補正対象）＋新しい緑。空段落は入力から除外する。
+      const overlapForInput = overlapLines.filter((l) => l.trim() !== '');
+      const combinedInput = overlapForInput.length > 0
+        ? overlapForInput.join('\n') + '\n' + greenSplit
+        : greenSplit;
+      const overlapChars = overlapLines.reduce((n, l) => n + l.length, 0);
+      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + オーバーラップ${overlapDeleteCount}段落(${overlapChars}字)`);
+
+      // ④ AIは「ミス分割の結合＋誤字・句読点」のみ（新たな分割はしない）
+      const result = await proofreadText(combinedInput, state.model, contextBefore);
+
+      // 改行の保証: AIが結合しすぎて巨大段落になった場合の安全弁（長すぎる段落は句点で分割）
       const newParas = result
         .split('\n')
         .map((s) => s.trim())
@@ -1515,31 +906,26 @@ app.prepare().then(() => {
       if (newParas.length === 0) return;
       const outText = newParas.join('\n');
 
-      // 段落の区切り規則: 直前の出力が文末（。！？）で終わっていて、かつドキュメントの
-      // 最終段落がすでに十分長い場合は、最終段落への連結ではなく新しい段落として追記する。
-      // （小さな校正出力が同じ段落に連結され続けて巨大段落になるのを防ぐ）
-      let forceNewParagraph = false;
-      const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
-      if (proofDoc) {
-        const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
-        if (proofFragment.length > 0) {
-          const lastParaLen = (getParagraphTextByIndex(proofFragment, proofFragment.length - 1) || '').length;
-          forceNewParagraph = state.lastOutEndedSentence === true && lastParaLen >= 250;
-        }
-      }
-
-      // 校正結果のみを共有ドキュメントへ追記（句読点が区切りを担うため先頭スペースなし）
-      await sendTextToHocuspocusDocument(sessionId, outText, false, forceNewParagraph);
+      // ⑤ オーバーラップ窓（末尾overlapDeleteCount段落）を削除し、再補正結果（オーバーラップ＋緑）を
+      //    新段落として追記して置き換える（単一トランザクション）。窓が空＝初回は実質追記になる。
+      await replaceTailParagraphs(sessionId, overlapDeleteCount, outText);
       state.lastOutEndedSentence = /[。．！？!?]\s*$/.test(outText);
 
       // 校正済み分をバッファから取り除き、文脈用の送信済み末尾を更新する
       state.rawBuffer = state.rawBuffer.slice(target.length);
+      // ポーズ境界も消費分だけ前方シフト（負になったものは破棄）
+      state.pausePositions = state.pausePositions
+        .map((p) => p - target.length)
+        .filter((p) => p > 0);
       state.sentTail = (state.sentTail + outText.replace(/\n/g, '')).slice(-300);
 
-      // 校正画面の未確定（グレー）表示を更新（バッファが減ったため）
-      setPendingText(sessionId, state.rawBuffer + state.pendingInterim);
+      // 校正画面の未確定（グレー）表示を更新（バッファが減ったため）。区切り情報も添える。
+      {
+        const pt = state.rawBuffer + state.pendingInterim;
+        setPendingText(sessionId, pt, greenDisplayBreaks(state.rawBuffer, state.pausePositions), state.rawBuffer.length);
+      }
 
-      console.log(`[Auto-Proofread] ✅ 校正完了: ${newParas.length}段落を追記（残バッファ${state.rawBuffer.length}文字）`);
+      console.log(`[Auto-Proofread] ✅ 校正完了: ${newParas.length}段落を確定/置換（残バッファ${state.rawBuffer.length}文字）`);
       if (clientWs.readyState === 1) {
         clientWs.send(JSON.stringify({
           type: 'auto_proofread_completed',
@@ -1555,234 +941,6 @@ app.prepare().then(() => {
     } finally {
       state.inFlight = false;
     }
-  }
-
-  // Function to send dummy audio data from client (localStorage)
-  function sendDummyAudioData(base64AudioData, recordingName, clientWs, openaiWs, setResponseInProgress, onComplete, sendInterval = 50) {
-    let currentTimeoutId = null;
-
-    const startSending = () => {
-      try {
-        console.log(`[Dummy Audio Data] 📁 Sending client audio data: ${recordingName}`);
-
-        // Convert base64 to buffer
-        const audioBuffer = Buffer.from(base64AudioData, 'base64');
-        console.log(`[Dummy Audio Data] 📊 Audio data size: ${audioBuffer.length} bytes`);
-
-        // Double-check WebSocket is ready
-        if (openaiWs.readyState !== 1) { // WebSocket.OPEN
-          console.error(`❌ OpenAI WebSocket not ready after wait (state: ${openaiWs.readyState})`);
-          clientWs.send(JSON.stringify({
-            type: 'error',
-            error: 'WebSocket connection not ready'
-          }));
-          if (onComplete) onComplete();
-          return;
-        }
-
-        // Continue with the rest of the function...
-        sendAudioChunks(audioBuffer);
-      } catch (error) {
-        console.error('[Dummy Audio Data] ❌ Error in startSending:', error);
-        clientWs.send(JSON.stringify({
-          type: 'error',
-          error: error.message
-        }));
-        if (onComplete) onComplete();
-      }
-    };
-
-    const sendAudioChunks = (audioBuffer) => {
-
-      // Calculate total duration (24kHz, 16-bit = 2 bytes per sample)
-      const totalSamples = audioBuffer.length / 2;
-      const totalSeconds = totalSamples / 24000;
-      console.log(`[Dummy Audio Data] ⏱️ Total duration: ${totalSeconds.toFixed(2)} seconds`);
-
-      // Convert audio data to base64 and send in chunks
-      const chunkSize = 4096; // Match typical audio chunk size
-      const totalChunks = Math.ceil(audioBuffer.length / chunkSize);
-      console.log(`[Dummy Audio Data] 📦 Sending ${totalChunks} chunks of ${chunkSize} bytes each`);
-
-      let chunkIndex = 0;
-      let sentBytes = 0;
-      let lastChunkSendTime = Date.now();  // For timing analysis
-
-      const sendNextChunk = () => {
-        if (chunkIndex >= totalChunks) {
-          console.log(`[Dummy Audio Data] ✅ All ${totalChunks} chunks sent successfully`);
-
-          // Send final progress update
-          clientWs.send(JSON.stringify({
-            type: 'dummy_audio_progress',
-            currentSeconds: totalSeconds,
-            totalSeconds: totalSeconds,
-            progress: 100
-          }));
-
-          // Auto-commit the audio after sending all chunks
-          setTimeout(() => {
-            console.log(`[Dummy Audio Data] 🔄 Auto-committing client audio buffer`);
-            setResponseInProgress();
-
-            const commitEvent = {
-              type: 'input_audio_buffer.commit'
-            };
-
-            if (openaiWs.readyState === 1) { // WebSocket.OPEN
-              openaiWs.send(JSON.stringify(commitEvent));
-              console.log('✅ Client audio buffer committed, waiting for transcription...');
-
-              // Wait for transcription to complete before sending dummy_audio_completed
-              // This ensures all transcription results are received
-              setTimeout(() => {
-                console.log(`[Dummy Audio Data] ⏰ Sending dummy_audio_completed after transcription delay`);
-                clientWs.send(JSON.stringify({
-                  type: 'dummy_audio_completed'
-                }));
-                console.log(`[Dummy Audio Data] 📤 Sent dummy_audio_completed to client`);
-
-                // Call onComplete callback to reset the sending flag
-                if (onComplete) {
-                  onComplete();
-                }
-              }, 3000); // Wait 3 seconds after commit for transcription to complete
-            } else {
-              console.log(`⚠️ OpenAI WebSocket not ready for commit (state: ${openaiWs.readyState})`);
-              // Still send completion event if WebSocket is not ready
-              clientWs.send(JSON.stringify({
-                type: 'dummy_audio_completed'
-              }));
-              if (onComplete) {
-                onComplete();
-              }
-            }
-          }, 1000); // Wait 1 second before committing
-
-          return;
-        }
-
-        const start = chunkIndex * chunkSize;
-        const end = Math.min(start + chunkSize, audioBuffer.length);
-        const chunk = audioBuffer.slice(start, end);
-        const base64Chunk = chunk.toString('base64');
-
-        const audioEvent = {
-          type: 'input_audio_buffer.append',
-          audio: base64Chunk
-        };
-
-        try {
-          const now = Date.now();
-          const actualInterval = now - lastChunkSendTime;
-          lastChunkSendTime = now;
-
-          openaiWs.send(JSON.stringify(audioEvent));
-          sentBytes += chunk.length;
-
-          // Calculate current progress
-          const currentSamples = sentBytes / 2;
-          const currentSeconds = currentSamples / 24000;
-          const progressPercent = (sentBytes / audioBuffer.length) * 100;
-          const samplesInChunk = chunk.length / 2;  // 16-bit = 2 bytes per sample
-
-          // Send progress update every 10 chunks or on last chunk
-          if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
-            console.log(`[Timing Analysis] 📤 DUMMY #${chunkIndex + 1}/${totalChunks} | interval: ${actualInterval}ms | samples: ${samplesInChunk} | progress: ${currentSeconds.toFixed(2)}s / ${totalSeconds.toFixed(2)}s`);
-
-            clientWs.send(JSON.stringify({
-              type: 'dummy_audio_progress',
-              currentSeconds: currentSeconds,
-              totalSeconds: totalSeconds,
-              progress: progressPercent
-            }));
-          }
-
-          chunkIndex++;
-
-          // Send next chunk after a small delay to simulate real-time streaming
-          currentTimeoutId = setTimeout(sendNextChunk, sendInterval); // Configurable delay between chunks
-
-        } catch (error) {
-          console.error(`❌ Error sending client audio chunk ${chunkIndex}:`, error);
-          clientWs.send(JSON.stringify({
-            type: 'error',
-            error: `Failed to send client audio chunk ${chunkIndex}: ${error.message}`
-          }));
-          // Reset sending flag on error
-          if (onComplete) {
-            onComplete();
-          }
-        }
-      };
-
-      // Start sending chunks
-      clientWs.send(JSON.stringify({
-        type: 'dummy_audio_started',
-        filename: recordingName,
-        totalSize: audioBuffer.length,
-        totalChunks: totalChunks,
-        totalSeconds: totalSeconds
-      }));
-
-      sendNextChunk();
-    };
-
-    // Wait for OpenAI WebSocket to be ready before sending
-    if (openaiWs.readyState === 1) { // WebSocket.OPEN
-      console.log(`[Dummy Audio Data] ✅ OpenAI WebSocket already open, starting immediately`);
-      startSending();
-    } else if (openaiWs.readyState === 0) { // WebSocket.CONNECTING
-      console.log(`[Dummy Audio Data] ⏳ Waiting for OpenAI WebSocket to connect...`);
-      clientWs.send(JSON.stringify({
-        type: 'status',
-        message: 'OpenAI APIへ接続中...'
-      }));
-
-      const onOpen = () => {
-        console.log(`[Dummy Audio Data] ✅ OpenAI WebSocket connected, starting to send audio`);
-        openaiWs.removeListener('open', onOpen);
-        openaiWs.removeListener('error', onError);
-        startSending();
-      };
-
-      const onError = (error) => {
-        console.error(`[Dummy Audio Data] ❌ OpenAI WebSocket connection error:`, error);
-        openaiWs.removeListener('open', onOpen);
-        openaiWs.removeListener('error', onError);
-        clientWs.send(JSON.stringify({
-          type: 'error',
-          error: 'OpenAI APIへの接続に失敗しました'
-        }));
-        if (onComplete) onComplete();
-      };
-
-      openaiWs.on('open', onOpen);
-      openaiWs.on('error', onError);
-
-      // Timeout after 10 seconds
-      setTimeout(() => {
-        if (openaiWs.readyState !== 1) {
-          openaiWs.removeListener('open', onOpen);
-          openaiWs.removeListener('error', onError);
-          console.error(`[Dummy Audio Data] ❌ OpenAI WebSocket connection timeout`);
-          clientWs.send(JSON.stringify({
-            type: 'error',
-            error: 'OpenAI APIへの接続がタイムアウトしました'
-          }));
-          if (onComplete) onComplete();
-        }
-      }, 10000);
-    } else {
-      console.error(`❌ OpenAI WebSocket in invalid state (state: ${openaiWs.readyState})`);
-      clientWs.send(JSON.stringify({
-        type: 'error',
-        error: 'WebSocket connection not available'
-      }));
-      if (onComplete) onComplete();
-    }
-
-    return currentTimeoutId;
   }
 
   server.listen(port, hostname, () => {
