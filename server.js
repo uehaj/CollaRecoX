@@ -298,6 +298,7 @@ app.prepare().then(() => {
                 }, 6000);
               }
               console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, バッファ方式)`);
+              setProofreadTailParas(currentSessionId, 0); // 開始直後は再補正窓なし
             } else {
               if (autoProofreadState.timer) {
                 clearInterval(autoProofreadState.timer);
@@ -311,6 +312,7 @@ app.prepare().then(() => {
                 setPendingText(currentSessionId, autoProofreadState.pendingInterim);
               }
               console.log('[Auto-Proofread] Disabled');
+            setProofreadTailParas(currentSessionId, 0); // 自動校正OFFで保護解除（全文編集可）
             }
             break;
           }
@@ -362,6 +364,8 @@ app.prepare().then(() => {
         sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
         autoProofreadState.rawBuffer = '';
       }
+      // 録音者切断で再補正は起きないため保護解除（全文編集可に戻す）
+      setProofreadTailParas(currentSessionId, 0);
     });
 
     clientWs.on('error', (error) => {
@@ -671,8 +675,9 @@ app.prepare().then(() => {
   // 過分割が起きうるが、その結合は後段のAI(proofreadText)が担う。
   const PAUSE_BREAK_MS = 1200; // この無音(ms)以上で段落区切りを入れる（クライアントのgapMs基準）
   const MECH_MAX_LINE = 120;   // 確定(AI校正)単位: この文字数を超えたら語境界で機械分割（結合品質を保つ単位）
-  const OVERLAP_CHARS = 400;    // AI補正: 緑の先頭よりさかのぼって再補正に含める既確定テキスト量（80字×5行相当）
-  const OVERLAP_MAX_PARAS = 12; // AI補正: オーバーラップで再補正・置換する最大段落数（入力サイズ/コストの上限）
+  const REWRITE_CHARS = 80;     // AI補正: 再補正で「置き換える」末尾量（=青字＋編集不可の書き換え対象領域）
+  const CONTEXT_CHARS = 80;     // AI補正: 書き換え対象の手前を【文脈】として渡す読み取り専用量（編集可・青字なし）
+  const OVERLAP_MAX_PARAS = 12; // AI補正: 書き換え対象として置換する最大段落数（入力サイズ/コストの上限）
   let _jaWordSegmenter = null;
   function getJaWordSegmenter() {
     if (_jaWordSegmenter === null) {
@@ -742,8 +747,8 @@ app.prepare().then(() => {
     return [...cuts].filter((c) => c > 0 && c < text.length).sort((a, b) => a - b);
   }
 
-  // 緑(未確定)の表示用改行: 無音ポーズ境界のみを返す。字数での自動折返しはせず、
-  // 校正画面の横幅にあわせたCSSの自然折返しに任せる（横幅いっぱいに表示する）。
+  // 緑(未確定)の表示用改行: 無音ポーズ境界のみを返す。横幅での折返しはクライアントが
+  // 実際の描画幅・フォントを実測して行う（文字数ではなく見た目の1行ぴったりで改行）。
   function greenDisplayBreaks(text, pauseOffsets = []) {
     return [...new Set(pauseOffsets)]
       .filter((o) => o > 0 && o < text.length)
@@ -812,8 +817,25 @@ app.prepare().then(() => {
         paragraph.insert(0, [textNode]);
         fragment.insert(fragment.length, [paragraph]);
       }
+      // この書き込み後、次回のAI再補正が上書きする末尾段落数（=校正画面で編集禁止＋青字にする範囲）を公開
+      let _acc = 0, _tail = 0;
+      for (let idx = fragment.length - 1; idx >= 0 && _acc < REWRITE_CHARS && _tail < OVERLAP_MAX_PARAS; idx--) {
+        const t = getParagraphTextByIndex(fragment, idx);
+        if (t === null) break;
+        _acc += t.length; _tail++;
+      }
+      statusMap.set('proofreadTailParas', _tail);
     });
     console.log(`[Auto-Proofread] 🔁 末尾${deleteCount}段落を置換し${lines.length}段落を確定 ('${fieldName}')`);
+  }
+
+  // AI再補正で上書きされる末尾段落数を共有docへ公開（校正画面の編集禁止＋青字の範囲）。0で解除。
+  function setProofreadTailParas(sessionId, count) {
+    if (!sessionId) return;
+    const document = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
+    if (!document) return;
+    const statusMap = document.getMap(`status-${sessionId}`);
+    document.transact(() => { statusMap.set('proofreadTailParas', Math.max(0, count | 0)); });
   }
 
   // バッファ方式の自動校正:
@@ -866,41 +888,42 @@ app.prepare().then(() => {
       const mechLines = mechanicalSplit(target, pausesInTarget);
       const greenSplit = mechLines.length > 0 ? mechLines.join('\n') : target;
 
-      // ② オーバーラップ: 緑の先頭よりさかのぼって、既確定の直近段落（約OVERLAP_CHARS字＝80×5行相当）を
-      //    AI補正の対象に含めて再補正し、置き換える（隣接チャンクの直和分割ではなくオーバーラップ実行）。
-      //    削除対象を正確に把握するため、既確定テキストはドキュメントから直接読み戻す。
-      const overlapLines = [];
-      let overlapDeleteCount = 0;
+      // ② オーバーラップを2分割して既確定テキストから読み戻す：
+      //    (a) 書き換え対象（末尾・累計REWRITE_CHARS字）＝再補正して置換する＝青字＋編集不可。
+      //    (b) 文脈（その手前・累計CONTEXT_CHARS字）＝AIに【文脈】として渡すだけで上書きしない＝編集可・青字なし。
+      const rewriteLines = [];
+      let overlapDeleteCount = 0; // 置換する末尾段落数（=青/ロック領域）
       let contextBefore = '';
       const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
       if (proofDoc) {
         const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
-        let acc = 0;
         let idx = proofFragment.length - 1;
-        // 末尾の段落から、累計がOVERLAP_CHARSに達するまで（最大OVERLAP_MAX_PARAS段落）さかのぼる
-        for (; idx >= 0 && acc < OVERLAP_CHARS && overlapDeleteCount < OVERLAP_MAX_PARAS; idx--) {
+        // (a) 書き換え対象：末尾から累計REWRITE_CHARS字（最大OVERLAP_MAX_PARAS段落）
+        let acc = 0;
+        for (; idx >= 0 && acc < REWRITE_CHARS && overlapDeleteCount < OVERLAP_MAX_PARAS; idx--) {
           const t = getParagraphTextByIndex(proofFragment, idx);
           if (t === null) break; // 段落以外（画像等）に当たったら打ち切り
-          overlapLines.unshift(t);
+          rewriteLines.unshift(t);
           acc += t.length;
           overlapDeleteCount++;
         }
-        // オーバーラップ窓の直前段落を【文脈】として最大300字読む（つながり判断の参考・出力されない）
-        for (; idx >= 0 && contextBefore.length < 300; idx--) {
+        // (b) 文脈：さらに手前の段落を累計CONTEXT_CHARS字まで（読み取り専用・出力されない・編集可）
+        let cacc = 0;
+        for (; idx >= 0 && cacc < CONTEXT_CHARS; idx--) {
           const t = getParagraphTextByIndex(proofFragment, idx);
           if (t === null) break;
-          contextBefore = t + contextBefore;
+          contextBefore = t + (contextBefore ? '\n' + contextBefore : '');
+          cacc += t.length;
         }
-        contextBefore = contextBefore.slice(-300);
       }
 
-      // ③ AI補正の入力 = オーバーラップ（既確定・再補正対象）＋新しい緑。空段落は入力から除外する。
-      const overlapForInput = overlapLines.filter((l) => l.trim() !== '');
-      const combinedInput = overlapForInput.length > 0
-        ? overlapForInput.join('\n') + '\n' + greenSplit
+      // ③ AI補正の入力 = 書き換え対象（既確定・再補正対象）＋新しい緑。空段落は入力から除外する。
+      const rewriteForInput = rewriteLines.filter((l) => l.trim() !== '');
+      const combinedInput = rewriteForInput.length > 0
+        ? rewriteForInput.join('\n') + '\n' + greenSplit
         : greenSplit;
-      const overlapChars = overlapLines.reduce((n, l) => n + l.length, 0);
-      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + オーバーラップ${overlapDeleteCount}段落(${overlapChars}字)`);
+      const rewriteChars = rewriteLines.reduce((n, l) => n + l.length, 0);
+      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + 書き換え対象${overlapDeleteCount}段落(${rewriteChars}字) + 文脈${contextBefore.length}字`);
 
       // ④ AIは「ミス分割の結合＋誤字・句読点」のみ（新たな分割はしない）
       const result = await proofreadText(combinedInput, state.model, contextBefore);
@@ -914,8 +937,8 @@ app.prepare().then(() => {
       if (newParas.length === 0) return;
       const outText = newParas.join('\n');
 
-      // ⑤ オーバーラップ窓（末尾overlapDeleteCount段落）を削除し、再補正結果（オーバーラップ＋緑）を
-      //    新段落として追記して置き換える（単一トランザクション）。窓が空＝初回は実質追記になる。
+      // ⑤ 書き換え対象（末尾overlapDeleteCount段落）を削除し、再補正結果（書き換え対象＋緑）を
+      //    新段落として追記して置き換える（単一トランザクション）。対象が空＝初回は実質追記になる。
       await replaceTailParagraphs(sessionId, overlapDeleteCount, outText);
       state.lastOutEndedSentence = /[。．！？!?]\s*$/.test(outText);
 
