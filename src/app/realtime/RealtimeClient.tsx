@@ -8,6 +8,7 @@ type YDocType = any;
 type HocuspocusProviderType = any;
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
+import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState, type NanoPromptSession } from '@/lib/browserLlm';
 import packageJson from '../../../package.json';
 
 // ===== オンデバイス認識（ChromeオンデバイスWeb Speech API） =====
@@ -56,13 +57,21 @@ type LocalAsrStatus = 'checking' | 'available' | 'downloadable' | 'downloading' 
 // オンデバイス認識テキストを共有ドキュメントへ中継するWebSocketから受け取るメッセージ。
 // （自動校正の進捗通知のみ。OpenAI音声認識経路は撤去済み）
 interface AutoProofreadMessage {
-  type: 'auto_proofread_started' | 'auto_proofread_completed' | 'auto_proofread_error';
+  type: 'auto_proofread_started' | 'auto_proofread_completed' | 'auto_proofread_error' | 'auto_proofread_warning';
   paragraphs?: number;
   chars?: number;
   error?: string;
 }
 
-type WebSocketMessage = AutoProofreadMessage;
+// サーバからのオンデバイス校正要求。録音端末のブラウザLLMで systemPrompt のもと userContent を校正して返す。
+interface ProofreadRequestMessage {
+  type: 'proofread_request';
+  requestId: string;
+  systemPrompt: string;
+  userContent: string;
+}
+
+type WebSocketMessage = AutoProofreadMessage | ProofreadRequestMessage;
 
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
@@ -149,6 +158,66 @@ export default function RealtimeClient() {
   const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
   // 共同校正画面でのAI再編に使用するモデル（このモデル選択UIは撤去し、サーバ既定に従う）
   const rewriteModel = 'gpt-4.1-mini';
+
+  // ===== 自動校正エンジン（サーバOpenAI / 録音端末のブラウザLLM・オンデバイス） =====
+  const [browserLlm, setBrowserLlm] = useState<BrowserLlmState>('unsupported'); // オンデバイスLLMの対応状態
+  // 保存値を同期的に読み、初期値から正しいengineにする。これで ws.onopen が probe 完了を待たずに
+  // 正しいengineを送れる（probe遅延時に誤って'server'=OpenAIへ流す privacy leak を構造的に防ぐ）。
+  // 'on-device'保存でモデル未準備でも、サーバはOpenAIへフォールバックせず未校正追記するため外部送信は起きない。
+  const [proofreadEngine, setProofreadEngine] = useState<'server' | 'on-device'>(() => {
+    if (typeof window === 'undefined') return 'server';
+    try { return window.localStorage.getItem('collarecox-proofread-engine') === 'on-device' ? 'on-device' : 'server'; } catch { return 'server'; }
+  });
+  const proofreadEngineRef = useRef<'server' | 'on-device'>(proofreadEngine); // ws.onopen等でのstale closure回避用（初期値=保存値）
+  const [nanoPreparing, setNanoPreparing] = useState(false); // モデルDL/準備中フラグ
+  const [nanoDlProgress, setNanoDlProgress] = useState<number | null>(null); // DL進捗(%)
+  const onDeviceBusyRef = useRef(false); // proofread_request の多重実行ガード
+
+  // proofreadEngine を更新し ref/localStorage へ反映、ws接続中なら即サーバへ通知する（onChange/復元の単一経路）。
+  const applyProofreadEngine = (engine: 'server' | 'on-device') => {
+    setProofreadEngine(engine);
+    proofreadEngineRef.current = engine;
+    try { window.localStorage.setItem('collarecox-proofread-engine', engine); } catch { /* localStorage不可時は無視 */ }
+    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({
+        type: 'set_auto_proofread',
+        enabled: autoProofread,
+        model: rewriteModel,
+        engine,
+      }));
+    }
+  };
+  // オンデバイスを選んだ瞬間にモデルDLを確認し、完了するまで確定させない。失敗時はフォールバックせず server に戻す。
+  const chooseOnDeviceEngine = async () => {
+    if (proofreadEngine === 'on-device' || nanoPreparing) return;
+    setNanoPreparing(true); setNanoDlProgress(null); setAutoProofreadStatus('');
+    try {
+      await ensureBrowserLlmReady((loaded) => setNanoDlProgress(Math.round(loaded * 100)));
+      setBrowserLlm('available');
+      applyProofreadEngine('on-device');
+    } catch (e) {
+      setAutoProofreadStatus('⚠️ オンデバイスAIの準備に失敗しました: ' + (e instanceof Error ? e.message : '不明なエラー'));
+      applyProofreadEngine('server');
+    } finally {
+      setNanoPreparing(false); setNanoDlProgress(null);
+    }
+  };
+  // マウント時にオンデバイスLLMの対応を検出（UIの表示可否とDLゲート用）。
+  // engineは既に保存値で同期初期化済みなので復元は不要。非対応ブラウザ（APIなし）で'on-device'保存値だけは
+  // サーバへ矯正する（この環境にオンデバイス手段がなく、ラジオも隠れて選択不能のため）。
+  // 対応ブラウザ（available/downloadable/downloading）では保存値を維持。未準備でもサーバはOpenAIへ流さず未校正追記する。
+  useEffect(() => {
+    let alive = true;
+    probeBrowserLlm().then((s) => {
+      if (!alive) return;
+      setBrowserLlm(s);
+      if (s === 'unsupported' && proofreadEngineRef.current === 'on-device') {
+        applyProofreadEngine('server');
+      }
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ===== オンデバイス認識用の状態 =====
   const primaryStreamRef = useRef<MediaStream | null>(null); // 主認識モードで取得したストリーム（停止用）
@@ -483,7 +552,8 @@ export default function RealtimeClient() {
         ws.send(JSON.stringify({
           type: 'set_auto_proofread',
           enabled: autoProofread,
-          model: rewriteModel
+          model: rewriteModel,
+          engine: proofreadEngineRef.current
         }));
         console.log('[WebSocket] 🪄 Sent auto proofread setting:', autoProofread);
 
@@ -508,6 +578,56 @@ export default function RealtimeClient() {
             case 'auto_proofread_error':
               setAutoProofreadStatus(`❌ 校正エラー: ${message.error ?? '不明なエラー'}`);
               break;
+
+            case 'auto_proofread_warning':
+              setAutoProofreadStatus(`⚠️ オンデバイス校正できず未校正で追記しました: ${message.error ?? ''}`);
+              break;
+
+            case 'proofread_request': {
+              // サーバからのオンデバイス校正要求。録音端末のブラウザLLMで処理し proofread_response を返す（外部送信なし）。
+              const reqId = message.requestId;
+              const sysPrompt = message.systemPrompt;
+              const userContent = message.userContent;
+              (async () => {
+                // 多重実行ガード（サーバはinFlightで直列化するが録音側でも保険として持つ）
+                if (onDeviceBusyRef.current) {
+                  ws.send(JSON.stringify({ type: 'proofread_response', requestId: reqId, ok: false, error: 'busy' }));
+                  return;
+                }
+                onDeviceBusyRef.current = true;
+                try {
+                  // create+prompt をクライアント側タイムアウト（サーバ12sより僅かに短い11s）でレースする。
+                  // 推論が停止/長時間化してもサーバのタイムアウト後に busy が残らず、次の要求を受けられるようにする。
+                  // session の破棄は work 内に閉じ込める（タイムアウトで放棄しても遅延完了時に確実に destroy される）。
+                  const work = (async (): Promise<string> => {
+                    const LM = getBrowserLanguageModel();
+                    if (!LM) throw new Error('on-device LM unavailable');
+                    // モデルは選択時にDL済みのため create は軽量。毎回新規セッション（履歴を持たないステートレス校正）。
+                    const s: NanoPromptSession = await LM.create({ initialPrompts: [{ role: 'system', content: sysPrompt }] });
+                    try {
+                      return await s.prompt(userContent);
+                    } finally {
+                      s.destroy?.();
+                    }
+                  })();
+                  work.catch(() => { /* タイムアウト後に遅れて来る結果/拒否は無視（未処理reject防止） */ });
+                  const out = await Promise.race([
+                    work,
+                    new Promise<string>((_, rej) => setTimeout(() => rej(new Error('client on-device timeout 11s')), 11000)),
+                  ]);
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'proofread_response', requestId: reqId, ok: true, text: out || '' }));
+                  }
+                } catch (e) {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'proofread_response', requestId: reqId, ok: false, error: e instanceof Error ? e.message : String(e) }));
+                  }
+                } finally {
+                  onDeviceBusyRef.current = false;
+                }
+              })().catch(() => { /* ws切断時のsend失敗等は無視（サーバ側はタイムアウトで未校正追記にフォールバック） */ });
+              break;
+            }
 
             default:
               console.log('[WebSocket] ❓ Unknown message type:', message);
@@ -1245,7 +1365,8 @@ export default function RealtimeClient() {
                           websocketRef.current.send(JSON.stringify({
                             type: 'set_auto_proofread',
                             enabled: e.target.checked,
-                            model: rewriteModel
+                            model: rewriteModel,
+                            engine: proofreadEngineRef.current
                           }));
                         }
                       }}
@@ -1257,6 +1378,43 @@ export default function RealtimeClient() {
                     ONにすると、認識テキストはAI校正（誤字修正・句読点補完・段落分け）を経てから校正画面に確定反映されます。
                     校正前のテキストはグレーの未確定表示のまま見えます（100文字以上たまり次第・最短15秒間隔で処理、録音停止後は残りも自動処理）。
                   </p>
+                  {/* 校正エンジン: サーバOpenAI / オンデバイス（ブラウザLLM）。対応ブラウザでのみ後者を表示 */}
+                  {browserLlm !== 'unsupported' && (
+                    <div className="mt-2 ml-6">
+                      <span className="block text-xs font-medium text-body mb-1">校正エンジン</span>
+                      <div className="flex items-center gap-4 text-xs text-body">
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="proofread-engine"
+                            checked={proofreadEngine === 'server'}
+                            onChange={() => applyProofreadEngine('server')}
+                            className="accent-celadon"
+                          />
+                          サーバ（OpenAI）
+                        </label>
+                        <label className={`flex items-center gap-1.5 ${nanoPreparing ? 'opacity-60 cursor-wait' : 'cursor-pointer'}`}>
+                          <input
+                            type="radio"
+                            name="proofread-engine"
+                            checked={proofreadEngine === 'on-device'}
+                            disabled={nanoPreparing}
+                            onChange={chooseOnDeviceEngine}
+                            className="accent-celadon"
+                          />
+                          オンデバイス（ブラウザLLM）
+                          {nanoPreparing && <span className="text-muted">（モデル準備中… {nanoDlProgress ?? 0}%）</span>}
+                        </label>
+                      </div>
+                      {proofreadEngine === 'on-device' && (
+                        <p className="mt-1 text-xs text-muted">
+                          録音端末のブラウザ内蔵LLM（Chrome=Gemini Nano／Edge=Phi 等）で校正します（外部送信なし）。
+                          選択時にモデルの準備（初回はDL）を確認します。録音中の同端末で実行するため、長文では認識表示が一瞬もたつくことがあります。
+                          校正できなかった分はOpenAIへ送らず、未校正のまま追記して警告を表示します。
+                        </p>
+                      )}
+                    </div>
+                  )}
                   {autoProofreadStatus && (
                     <p className="mt-1 ml-6 text-xs text-celadon-active">{autoProofreadStatus}</p>
                   )}

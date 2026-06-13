@@ -196,6 +196,9 @@ app.prepare().then(() => {
       lastBufferChangeAt: 0,  // バッファ最終更新時刻（停止後の残り全量処理の判定用）
       lastOutEndedSentence: false, // 前回の校正出力が文末（。！？）で終わったか（新段落開始の判定用）
       pausePositions: [],     // rawBuffer内の「無音ポーズ境界」オフセット（機械的パラグラフ分割の一次区切り）
+      engine: 'server',       // 校正エンジン: 'server'(サーバOpenAI) or 'on-device'(録音端末のブラウザLLM)
+      pendingProofreads: new Map(), // オンデバイス校正の進行中要求（requestId -> {resolve, reject, timer}）
+      proofreadReqSeq: 0,     // proofread_request の requestId 採番用カウンタ
     };
 
     // Session management for Hocuspocus integration
@@ -285,20 +288,24 @@ app.prepare().then(() => {
             if (typeof message.model === 'string' && message.model.length < 50) {
               autoProofreadState.model = message.model;
             }
+            // 校正エンジン: 'on-device'（録音端末のブラウザLLM）のみ受理、それ以外は'server'（既定=サーバOpenAI）
+            autoProofreadState.engine = message.engine === 'on-device' ? 'on-device' : 'server';
             if (autoProofreadState.enabled) {
-              autoProofreadState.rawBuffer = '';
-              autoProofreadState.sentTail = '';
-              autoProofreadState.pendingInterim = '';
-              autoProofreadState.lastBufferChangeAt = 0;
-              autoProofreadState.pausePositions = [];
+              // バッファ初期化と定期トリガー開始は「無効→有効」の初回のみ。
+              // 既に有効な状態でのエンジン変更等の再送ではバッファ・保護状態を保持する（溜まったテキストの喪失防止）。
               if (!autoProofreadState.timer) {
+                autoProofreadState.rawBuffer = '';
+                autoProofreadState.sentTail = '';
+                autoProofreadState.pendingInterim = '';
+                autoProofreadState.lastBufferChangeAt = 0;
+                autoProofreadState.pausePositions = [];
                 autoProofreadState.timer = setInterval(() => { // 6秒ごとに校正をトリガー（高頻度化）
                   maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
                     .catch((e) => console.error('[Auto-Proofread] ❌ timer error:', e));
                 }, 6000);
+                setProofreadTailChars(currentSessionId, 0); // 開始直後は再補正窓なし
               }
-              console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, バッファ方式)`);
-              setProofreadTailParas(currentSessionId, 0); // 開始直後は再補正窓なし
+              console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, engine=${autoProofreadState.engine}, バッファ方式)`);
             } else {
               if (autoProofreadState.timer) {
                 clearInterval(autoProofreadState.timer);
@@ -312,7 +319,7 @@ app.prepare().then(() => {
                 setPendingText(currentSessionId, autoProofreadState.pendingInterim);
               }
               console.log('[Auto-Proofread] Disabled');
-            setProofreadTailParas(currentSessionId, 0); // 自動校正OFFで保護解除（全文編集可）
+            setProofreadTailChars(currentSessionId, 0); // 自動校正OFFで保護解除（全文編集可）
             }
             break;
           }
@@ -339,6 +346,22 @@ app.prepare().then(() => {
             }
             break;
 
+          case 'proofread_response': {
+            // オンデバイス校正（録音端末のブラウザLLM）の結果。requestIdで対応する要求を解決/拒否する。
+            const rid = message.requestId;
+            if (typeof rid !== 'string') break;
+            const entry = autoProofreadState.pendingProofreads.get(rid);
+            if (!entry) break; // タイムアウト後の遅延応答・重複・不明なIDは無視
+            clearTimeout(entry.timer);
+            autoProofreadState.pendingProofreads.delete(rid);
+            if (message.ok === true && typeof message.text === 'string' && message.text.trim() !== '') {
+              entry.resolve(message.text);
+            } else {
+              entry.reject(new Error(typeof message.error === 'string' ? message.error : 'on-device proofread failed'));
+            }
+            break;
+          }
+
           default:
             console.log('Unhandled client message type:', message.type);
         }
@@ -358,6 +381,14 @@ app.prepare().then(() => {
         clearInterval(autoProofreadState.timer);
         autoProofreadState.timer = null;
       }
+      // 進行中のオンデバイス校正要求を解放（タイマー解除＋reject）。残バッファは下でまとめてフラッシュされる。
+      if (autoProofreadState.pendingProofreads.size > 0) {
+        for (const entry of autoProofreadState.pendingProofreads.values()) {
+          clearTimeout(entry.timer);
+          entry.reject(new Error('connection closed'));
+        }
+        autoProofreadState.pendingProofreads.clear();
+      }
       // 校正待ちバッファが残っていれば未校正のまま書き出す（テキスト喪失防止）
       if (autoProofreadState.rawBuffer && currentSessionId) {
         console.log(`[Auto-Proofread] 📤 切断に伴いバッファ${autoProofreadState.rawBuffer.length}文字を未校正のまま書き出します`);
@@ -365,7 +396,7 @@ app.prepare().then(() => {
         autoProofreadState.rawBuffer = '';
       }
       // 録音者切断で再補正は起きないため保護解除（全文編集可に戻す）
-      setProofreadTailParas(currentSessionId, 0);
+      setProofreadTailChars(currentSessionId, 0);
     });
 
     clientWs.on('error', (error) => {
@@ -608,7 +639,10 @@ app.prepare().then(() => {
     });
   }
 
-  async function proofreadText(text, model, overlapText = '') {
+  // 校正用メッセージ（systemPrompt + userContent）を組み立てる。
+  // サーバOpenAI経路（proofreadText）とオンデバイス委譲経路（requestProofreadFromRecorder）の
+  // 双方が同じプロンプトを使うための単一の真実源。
+  function buildProofreadMessages(text, overlapText = '') {
     // 役割: 段落分割は機械処理(mechanicalSplit)が済ませている。AIは「誤って割れた行の結合」と
     // 「誤字・句読点」だけを担い、新たな分割はしない（ミス分割の結合に特化したプロンプト）。
     const systemPrompt = `あなたは日本語の会議文字起こしを整える校正アシスタントです。
@@ -641,12 +675,33 @@ app.prepare().then(() => {
 出力は【校正対象】を上記ルールで整えた結果のみ（段落区切りは改行1つで表す）。【文脈】やラベルは出力しない。`;
 
     const userContent = `【文脈】\n${overlapText || '（なし）'}\n\n【校正対象】\n${text}`;
+    return { systemPrompt, userContent };
+  }
 
+  async function proofreadText(text, model, overlapText = '') {
+    const { systemPrompt, userContent } = buildProofreadMessages(text, overlapText);
     const content = await callChatCompletion(model, [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userContent }
     ], { temperature: 0.2, maxTokens: 4096, timeoutMs: 60000 });
     return content || text;
+  }
+
+  // オンデバイス校正（録音端末のブラウザLLM）へ既存の中継WebSocket経由で委譲する。
+  // systemPrompt/userContent はサーバ側の buildProofreadMessages で生成（単一の真実源）。
+  // 録音側は proofread_request を受けてブラウザLLMで処理し proofread_response（requestId付き）を返す。
+  // ONDEVICE_TIMEOUT_MS 超過・録音側ws切断・出力異常では reject し、呼び出し側がフォールバックせず警告継続する。
+  function requestProofreadFromRecorder(clientWs, state, systemPrompt, userContent) {
+    return new Promise((resolve, reject) => {
+      if (!clientWs || clientWs.readyState !== 1) { reject(new Error('recorder ws not open')); return; }
+      const requestId = `${Date.now()}-${(state.proofreadReqSeq = (state.proofreadReqSeq + 1) | 0)}`;
+      const timer = setTimeout(() => {
+        state.pendingProofreads.delete(requestId);
+        reject(new Error('on-device proofread timeout'));
+      }, ONDEVICE_TIMEOUT_MS);
+      state.pendingProofreads.set(requestId, { resolve, reject, timer });
+      clientWs.send(JSON.stringify({ type: 'proofread_request', requestId, systemPrompt, userContent }));
+    });
   }
 
   // 改行の保証（決定的なフォールバック）: モデルが段落分割を返さなかった場合に備えて、
@@ -678,6 +733,7 @@ app.prepare().then(() => {
   const REWRITE_CHARS = 80;     // AI補正: 再補正で「置き換える」末尾量（=青字＋編集不可の書き換え対象領域）
   const CONTEXT_CHARS = 80;     // AI補正: 書き換え対象の手前を【文脈】として渡す読み取り専用量（編集可・青字なし）
   const OVERLAP_MAX_PARAS = 12; // AI補正: 書き換え対象として置換する最大段落数（入力サイズ/コストの上限）
+  const ONDEVICE_TIMEOUT_MS = 12000; // オンデバイス校正(録音端末のブラウザLLM)の待機上限。超過＝フォールバックせず未校正で続行（stale窓12sに整合）
   let _jaWordSegmenter = null;
   function getJaWordSegmenter() {
     if (_jaWordSegmenter === null) {
@@ -788,10 +844,12 @@ app.prepare().then(() => {
     return text;
   }
 
-  // オーバーラップ補正用: 末尾の deleteCount 段落を削除し、text（改行区切り）を新段落として追記する。
-  // 削除と追記を単一トランザクションにまとめ、speechAppendSeq を更新して編集追跡（下線）の対象から除外する。
-  async function replaceTailParagraphs(sessionId, deleteCount, text) {
-    const lines = text.split('\n').filter((line) => line.trim() !== '');
+  // オーバーラップ補正(文字単位): 末尾の deleteCharCount 文字を削除し、text(改行区切り)を追記する。
+  // 段落をまたいで末尾から正確に deleteCharCount 文字を削り、境界段落の「頭」は保持して、補正結果の
+  // 先頭行をその頭に連結する（段落しばりを外し、青=末尾ちょうど deleteCharCount 文字に一致させる）。
+  // 削除位置はトランザクション内の現在状態から数え直すため、await中の文脈側編集（頭の編集）と競合しない。
+  async function replaceTailChars(sessionId, deleteCharCount, text) {
+    const lines = text.split('\n').map((l) => l.trim()).filter((l) => l !== '');
     if (lines.length === 0) return;
     const roomName = `transcribe-editor-v2-${sessionId}`;
     const document = hocuspocus.documents.get(roomName);
@@ -806,36 +864,63 @@ app.prepare().then(() => {
     document.transact(() => {
       const statusMap = document.getMap(`status-${sessionId}`);
       statusMap.set('speechAppendSeq', (statusMap.get('speechAppendSeq') || 0) + 1);
-      // 置換対象（末尾deleteCount段落）を削除。await中に人が編集した場合に備え現在長で丸める。
-      const del = Math.max(0, Math.min(deleteCount, fragment.length));
-      if (del > 0) fragment.delete(fragment.length - del, del);
-      // 再補正結果（オーバーラップ＋緑）を新段落として追記
-      for (const line of lines) {
+      // 末尾から deleteCharCount 文字を削除（段落をまたぐ）。境界段落は頭を残し末尾だけ削る。
+      let remaining = Math.max(0, deleteCharCount | 0);
+      let boundaryEl = null; // 部分削除して頭を残した段落（=補正結果の先頭行を連結する先）
+      while (remaining > 0 && fragment.length > 0) {
+        const lastIdx = fragment.length - 1;
+        const el = fragment.get(lastIdx);
+        if (!(el instanceof Y.XmlElement)) break; // 段落以外に当たったら打ち切り
+        let tlen = 0;
+        for (let c = 0; c < el.length; c++) { const ch = el.get(c); if (ch instanceof Y.XmlText) tlen += ch.toString().length; }
+        if (tlen <= remaining) {
+          fragment.delete(lastIdx, 1); // 段落まるごと削除
+          remaining -= tlen;
+        } else {
+          // 部分削除: 末尾 remaining 文字を XmlText 子の後ろから削る（頭は保持）
+          let toDel = remaining;
+          for (let c = el.length - 1; c >= 0 && toDel > 0; c--) {
+            const ch = el.get(c);
+            if (!(ch instanceof Y.XmlText)) continue;
+            const len = ch.toString().length;
+            if (len <= toDel) { if (len > 0) ch.delete(0, len); toDel -= len; }
+            else { ch.delete(len - toDel, toDel); toDel = 0; }
+          }
+          boundaryEl = el;
+          remaining = 0;
+        }
+      }
+      // 補正結果を挿入。境界段落があれば先頭行をその頭に連結（無装飾で追記）し、残りを新段落に。
+      let startLine = 0;
+      if (boundaryEl) {
+        let lastText = null;
+        for (let c = boundaryEl.length - 1; c >= 0; c--) { const ch = boundaryEl.get(c); if (ch instanceof Y.XmlText) { lastText = ch; break; } }
+        if (!lastText) { lastText = new Y.XmlText(); boundaryEl.insert(boundaryEl.length, [lastText]); }
+        lastText.insert(lastText.toString().length, lines[0]);
+        startLine = 1;
+      }
+      for (let k = startLine; k < lines.length; k++) {
         const paragraph = new Y.XmlElement('paragraph');
         const textNode = new Y.XmlText();
-        textNode.insert(0, line);
+        textNode.insert(0, lines[k]);
         paragraph.insert(0, [textNode]);
         fragment.insert(fragment.length, [paragraph]);
       }
-      // この書き込み後、次回のAI再補正が上書きする末尾段落数（=校正画面で編集禁止＋青字にする範囲）を公開
-      let _acc = 0, _tail = 0;
-      for (let idx = fragment.length - 1; idx >= 0 && _acc < REWRITE_CHARS && _tail < OVERLAP_MAX_PARAS; idx--) {
-        const t = getParagraphTextByIndex(fragment, idx);
-        if (t === null) break;
-        _acc += t.length; _tail++;
-      }
-      statusMap.set('proofreadTailParas', _tail);
+      // この書き込み後、次回のAI再補正が上書きする末尾文字数（=校正画面で編集禁止＋青字にする範囲）を公開
+      let total = 0;
+      for (let i = 0; i < fragment.length; i++) { const t = getParagraphTextByIndex(fragment, i); if (t !== null) total += t.length; }
+      statusMap.set('proofreadTailChars', Math.min(REWRITE_CHARS, total));
     });
-    console.log(`[Auto-Proofread] 🔁 末尾${deleteCount}段落を置換し${lines.length}段落を確定 ('${fieldName}')`);
+    console.log(`[Auto-Proofread] 🔁 末尾${deleteCharCount}字を置換し${lines.length}行を確定 ('${fieldName}')`);
   }
 
-  // AI再補正で上書きされる末尾段落数を共有docへ公開（校正画面の編集禁止＋青字の範囲）。0で解除。
-  function setProofreadTailParas(sessionId, count) {
+  // AI再補正で上書きされる末尾文字数を共有docへ公開（校正画面の編集禁止＋青字の範囲）。0で解除。
+  function setProofreadTailChars(sessionId, count) {
     if (!sessionId) return;
     const document = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
     if (!document) return;
     const statusMap = document.getMap(`status-${sessionId}`);
-    document.transact(() => { statusMap.set('proofreadTailParas', Math.max(0, count | 0)); });
+    document.transact(() => { statusMap.set('proofreadTailChars', Math.max(0, count | 0)); });
   }
 
   // バッファ方式の自動校正:
@@ -888,27 +973,37 @@ app.prepare().then(() => {
       const mechLines = mechanicalSplit(target, pausesInTarget);
       const greenSplit = mechLines.length > 0 ? mechLines.join('\n') : target;
 
-      // ② オーバーラップを2分割して既確定テキストから読み戻す：
-      //    (a) 書き換え対象（末尾・累計REWRITE_CHARS字）＝再補正して置換する＝青字＋編集不可。
+      // ② オーバーラップを「文字単位」で既確定テキストから読み戻す（段落しばりなし）：
+      //    (a) 書き換え対象（末尾・ちょうどREWRITE_CHARS字）＝再補正して置換する＝青字＋編集不可。段落をまたいで部分的に取る。
       //    (b) 文脈（その手前・累計CONTEXT_CHARS字）＝AIに【文脈】として渡すだけで上書きしない＝編集可・青字なし。
-      const rewriteLines = [];
-      let overlapDeleteCount = 0; // 置換する末尾段落数（=青/ロック領域）
+      let windowText = '';            // 書き換え対象テキスト（内部の段落区切りは改行で表す）
+      let deleteCharCount = 0;        // 置換する末尾の文字数（=青/ロック領域の文字数）
       let contextBefore = '';
       const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
       if (proofDoc) {
         const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
+        // 末尾から累計REWRITE_CHARS字に達するまで段落を集める（先頭=最古に集めた段落は部分的に窓へ入りうる）
+        const collected = []; // ドキュメント順
+        let sum = 0;
         let idx = proofFragment.length - 1;
-        // (a) 書き換え対象：末尾から累計REWRITE_CHARS字（最大OVERLAP_MAX_PARAS段落）
-        let acc = 0;
-        for (; idx >= 0 && acc < REWRITE_CHARS && overlapDeleteCount < OVERLAP_MAX_PARAS; idx--) {
+        for (; idx >= 0 && sum < REWRITE_CHARS; idx--) {
           const t = getParagraphTextByIndex(proofFragment, idx);
           if (t === null) break; // 段落以外（画像等）に当たったら打ち切り
-          rewriteLines.unshift(t);
-          acc += t.length;
-          overlapDeleteCount++;
+          collected.unshift(t);
+          sum += t.length;
         }
-        // (b) 文脈：さらに手前の段落を累計CONTEXT_CHARS字まで（読み取り専用・出力されない・編集可）
+        // 窓に入らない先頭段落の頭の文字数（=境界段落のうち文脈側に残る分）
+        const over = Math.max(0, sum - REWRITE_CHARS);
+        windowText = collected.map((t, k) => (k === 0 && over > 0) ? t.slice(over) : t).join('\n');
+        deleteCharCount = sum - over; // = min(REWRITE_CHARS, sum)。窓の実文字数（改行は含めない）
+        // (b) 文脈：境界段落の頭(書き換え窓の直前・最大CONTEXT_CHARS字) + さらに手前の段落を累計CONTEXT_CHARS字まで。
+        //     境界段落の頭を丸ごと入れると大段落で数百字に膨らむため、窓の直前ぶんだけに切る。
         let cacc = 0;
+        if (over > 0) {
+          const headCtx = collected[0].slice(Math.max(0, over - CONTEXT_CHARS), over);
+          contextBefore = headCtx;
+          cacc = headCtx.length;
+        }
         for (; idx >= 0 && cacc < CONTEXT_CHARS; idx--) {
           const t = getParagraphTextByIndex(proofFragment, idx);
           if (t === null) break;
@@ -917,16 +1012,45 @@ app.prepare().then(() => {
         }
       }
 
-      // ③ AI補正の入力 = 書き換え対象（既確定・再補正対象）＋新しい緑。空段落は入力から除外する。
-      const rewriteForInput = rewriteLines.filter((l) => l.trim() !== '');
-      const combinedInput = rewriteForInput.length > 0
-        ? rewriteForInput.join('\n') + '\n' + greenSplit
+      // ③ AI補正の入力 = 書き換え対象（既確定・再補正対象の末尾REWRITE_CHARS字）＋新しい緑。
+      const combinedInput = deleteCharCount > 0
+        ? windowText + '\n' + greenSplit
         : greenSplit;
-      const rewriteChars = rewriteLines.reduce((n, l) => n + l.length, 0);
-      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + 書き換え対象${overlapDeleteCount}段落(${rewriteChars}字) + 文脈${contextBefore.length}字`);
+      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + 書き換え対象${deleteCharCount}字 + 文脈${contextBefore.length}字`);
 
-      // ④ AIは「ミス分割の結合＋誤字・句読点」のみ（新たな分割はしない）
-      const result = await proofreadText(combinedInput, state.model, contextBefore);
+      // ④ AI補正: エンジンに応じてサーバOpenAIか録音端末のブラウザLLMに委譲する。
+      //    オンデバイスは「外部送信なし」が趣旨のため、失敗時もOpenAIへはフォールバックせず、
+      //    警告を出して未校正のまま追記して続行する（ユーザー合意の方針）。
+      let result;
+      if (state.engine === 'on-device') {
+        const { systemPrompt, userContent } = buildProofreadMessages(combinedInput, contextBefore);
+        try {
+          result = await requestProofreadFromRecorder(clientWs, state, systemPrompt, userContent);
+          // 出力異常チェック（オンデバイスは指示追従が弱い）。空・極端な長さは校正失敗扱いにする。
+          if (typeof result !== 'string' || result.trim() === ''
+              || result.length < combinedInput.length * 0.3
+              || result.length > combinedInput.length * 3) {
+            throw new Error('オンデバイス校正の出力が異常な長さ');
+          }
+        } catch (e) {
+          console.warn('[Auto-Proofread] ⚠️ オンデバイス校正失敗（フォールバックせず未校正で追記）:', e.message);
+          // 録音端末が切断済みなら close ハンドラが全量フラッシュするため、ここでは触らない（二重書き防止）。
+          if (clientWs.readyState === 1) {
+            // 新しい緑（target）を未校正のまま追記し、バッファを前進させる（外部送信はしない）。
+            await sendTextToHocuspocusDocument(sessionId, greenSplit, false);
+            state.rawBuffer = state.rawBuffer.slice(target.length);
+            state.pausePositions = state.pausePositions.map((p) => p - target.length).filter((p) => p > 0);
+            state.sentTail = (state.sentTail + greenSplit.replace(/\n/g, '')).slice(-300);
+            const pt = state.rawBuffer + state.pendingInterim;
+            setPendingText(sessionId, pt, greenDisplayBreaks(state.rawBuffer, state.pausePositions), state.rawBuffer.length);
+            setProofreadTailChars(sessionId, 0); // 未校正で追記＝再補正窓なし。青ロックを解除して編集可に戻す
+            clientWs.send(JSON.stringify({ type: 'auto_proofread_warning', error: e.message, chars: target.length }));
+          }
+          return; // finally で inFlight 解除
+        }
+      } else {
+        result = await proofreadText(combinedInput, state.model, contextBefore);
+      }
 
       // 改行の保証: AIが結合しすぎて巨大段落になった場合の安全弁（長すぎる段落は句点で分割）
       const newParas = result
@@ -937,9 +1061,9 @@ app.prepare().then(() => {
       if (newParas.length === 0) return;
       const outText = newParas.join('\n');
 
-      // ⑤ 書き換え対象（末尾overlapDeleteCount段落）を削除し、再補正結果（書き換え対象＋緑）を
-      //    新段落として追記して置き換える（単一トランザクション）。対象が空＝初回は実質追記になる。
-      await replaceTailParagraphs(sessionId, overlapDeleteCount, outText);
+      // ⑤ 書き換え対象（末尾ちょうどdeleteCharCount字）を削除し、再補正結果（書き換え対象＋緑）を
+      //    追記して置き換える（単一トランザクション）。対象が空＝初回は実質追記になる。
+      await replaceTailChars(sessionId, deleteCharCount, outText);
       state.lastOutEndedSentence = /[。．！？!?]\s*$/.test(outText);
 
       // 校正済み分をバッファから取り除き、文脈用の送信済み末尾を更新する

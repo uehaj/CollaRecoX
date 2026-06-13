@@ -472,7 +472,31 @@
       <h3>共同編集画面の機能</h3>
       <p>共同編集画面では、以下の機能が利用できます。</p>
 
-      <h4 style="margin-top: 20px; color: var(--ink); font-weight: 500;">ツールバー機能</h4>
+      <h4 style="margin-top: 20px; color: var(--ink); font-weight: 500;">文字の色（緑・青）の意味</h4>
+      <p>自動校正を使っているとき、文字起こし結果は<strong style="font-weight: 500;">色で状態</strong>を表します。色は「いま自動処理中」の合図です。</p>
+      <table class="param-table">
+        <tr>
+          <th>色</th>
+          <th>意味</th>
+        </tr>
+        <tr>
+          <td><span style="color: #3f9d6b; font-weight: 500;">緑色の文字</span></td>
+          <td>音声認識で確定したものの、まだAI校正（誤字修正・句読点補完・整文）が済んでいない<strong style="font-weight: 500;">「校正待ち」</strong>のテキストです。校正が済むと黒字の確定テキストになります。表示用のため直接は編集できません。</td>
+        </tr>
+        <tr>
+          <td><span style="color: #2563eb; font-weight: 500;">青色の文字</span></td>
+          <td>直近の確定テキストのうち、<strong style="font-weight: 500;">次のAI再補正で上書きされる対象</strong>の範囲です。ここを編集しても再補正で上書きされてしまうため、<strong style="font-weight: 500;">編集できません（編集ロック）</strong>。少し待つと確定して黒字になり、編集できるようになります。</td>
+        </tr>
+        <tr>
+          <td>黒色の文字</td>
+          <td>校正が完了して確定したテキストです。自由に編集できます。</td>
+        </tr>
+      </table>
+      <div class="tip">
+        緑・青の部分はまだ自動処理中です。急いで直さず、<strong style="font-weight: 500;">黒字になってから</strong>編集するのがおすすめです。自動校正がOFFのとき（または録音していないとき）は緑・青は現れません。
+      </div>
+
+      <h4 style="margin-top: 25px; color: var(--ink); font-weight: 500;">ツールバー機能</h4>
       <table class="param-table">
         <tr>
           <th>ボタン</th>
