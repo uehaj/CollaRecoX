@@ -35,24 +35,24 @@
 <body>
 <div class="wrap">
   <h1>文字起こし → 共同校正パイプライン ロジック仕様</h1>
-  <p class="lead">interim → 機械分割（ヒューリスティクス）→ AI補正（結合）→ 確定。2026-06-13 時点の実装。<br>
+  <p class="lead">interim → 機械分割（ヒューリスティクス）→ AI補正（オーバーラップ再補正・結合・誤字句読点・不明瞭語の括弧化）→ 確定（直近段落の置換＋追記）。2026-06-13 時点の実装。<br>
   対象: <code>src/app/realtime/RealtimeClient.tsx</code>（認識画面・録音者）／<code>server.js</code>（中継＋自動校正）／<code>src/app/editor/[sessionId]/CollaborativeEditorV2.tsx</code>（校正画面）。</p>
 
   <div class="note">
-    <strong>大前提</strong>：音声認識は<strong>Chromeオンデバイスの Web Speech API</strong>（<code>processLocally</code>, ja-JP）。音声は外部送信されない。
-    認識結果は録音者が単一の WebSocket <code>/api/realtime-ws</code> 経由でサーバへ送り、サーバが Yjs/Hocuspocus 共有ドキュメントへ反映。
-    校正画面の参加者はその共有ドキュメントを編集する。OpenAI は<strong>文字起こしには使わない</strong>（自動校正・AI編集の chat completions のみ使用）。
+    <strong>大前提</strong>：音声認識は<strong>Chromeオンデバイスの Web Speech API</strong>（<code>processLocally</code>, ja-JP）。録音者はマイク／<strong>タブ音声（<code>getDisplayMedia</code> の音声トラックを <code>SpeechRecognition.start(track)</code> へ）</strong>のいずれも選べ、いずれも<strong>音声は外部送信されない</strong>。
+    認識結果は録音者が単一の WebSocket <code>/api/realtime-ws</code> 経由でサーバへ送り、サーバが Yjs/Hocuspocus 共有ドキュメントへ反映。校正画面の参加者はその共有ドキュメントを編集する。
+    OpenAI は<strong>文字起こしには使わない</strong>。<strong>自動校正・AI編集の chat completions のみ</strong>に使い、ここでは<strong>テキストが外部送信される</strong>（音声は送信されない）。
   </div>
 
   <h2>1. テキストの4段階と色</h2>
   <p>1つの発話テキストは、次の4段階を経て「動かない確定文」になる。校正画面・認識画面で色が進む。</p>
   <div class="stage"><div class="n">①</div><div><strong><span class="sw" style="background:var(--gray)"></span>interim（グレー）</strong> — オンデバイス認識の途中仮説。後続音声で書き換わる（バックトラック）。改行は入れない。</div></div>
-  <div class="stage"><div class="n">②</div><div><strong><span class="sw" style="background:var(--green)"></span>機械分割済み（緑）</strong> — オンデバイスが<em>確定(final)</em>した生テキスト。サーバの <code>rawBuffer</code> に蓄積。表示用に<strong>機械的な改行</strong>を細かく入れる（後述）。まだ AI 補正前。</div></div>
-  <div class="stage"><div class="n">③</div><div><strong>AI補正（緑→黒へ）</strong> — 緑のうち「最後の改行まで」を AI が処理：誤って割れた一文の<strong>結合</strong>＋誤字・句読点。新たな分割はしない。</div></div>
-  <div class="stage"><div class="n">④</div><div><strong><span class="sw" style="background:var(--ink)"></span>確定（黒）</strong> — AI補正の結果を共有ドキュメントへ段落として<strong>追記のみ</strong>（置き換えなし＝人の校正と競合しない）。</div></div>
+  <div class="stage"><div class="n">②</div><div><strong><span class="sw" style="background:var(--green)"></span>機械分割済み（緑）</strong> — オンデバイスが<em>確定(final)</em>した生テキスト。サーバの <code>rawBuffer</code> に蓄積。表示は<strong>校正画面の横幅いっぱいにCSSで折り返し</strong>、改行（<code>&lt;br&gt;</code>）は<strong>無音ポーズ境界のみ</strong>に入れる（<code>greenDisplayBreaks</code>）。まだ AI 補正前。</div></div>
+  <div class="stage"><div class="n">③</div><div><strong>AI補正（緑→黒へ）</strong> — 緑のうち「最後の機械改行(120字基準)まで」を対象に、その手前の<strong>既確定テキスト約400字をオーバーラップ</strong>として一緒に AI へ渡し、<strong>句点基準で行を結合</strong>（文末でない行は次行と結合）＋誤字・句読点＋<strong>不明瞭語の <code>[ ]</code> 括弧化</strong>。新たな分割はしない。</div></div>
+  <div class="stage"><div class="n">④</div><div><strong><span class="sw" style="background:var(--ink)"></span>確定（黒）</strong> — AI補正の結果で<strong>直近の段落（オーバーラップ窓）を置換</strong>し、新規分を段落として追記（<code>replaceTailParagraphs</code>・単一トランザクション）。</div></div>
 
   <h2>2. データフロー</h2>
-<pre><code>[録音者ブラウザ] オンデバイス認識(Web Speech)
+<pre><code>[録音者ブラウザ] オンデバイス認識(Web Speech / マイク or タブ音声)
    │  interim毎(200msスロットル) → local_pending {text}
    │  final毎               → local_transcription {text, continuation, gapMs}
    ▼  (WebSocket /api/realtime-ws)
@@ -61,13 +61,14 @@
    ├ setPendingText(): 共有docの statusMap に
    │     pendingText     = rawBuffer + interim
    │     pendingGreenLen = rawBuffer.length            (緑/グレーの境界)
-   │     pendingBreaks   = 機械改行オフセット(緑のみ・40字基準)  ← そとづけの区切り情報
+   │     pendingBreaks   = greenDisplayBreaks(緑のみ・ポーズ境界のみ) ← 字数折返しはCSS(横幅)に任せる
    └ maybeAutoProofread()（最短5秒間隔／6秒タイマー）
          target = rawBuffer の「最後の機械改行(120字基準)まで」  ← それ以降(ライブ末尾)は緑のまま
-         ① mechanicalSplit(target,120) で機械分割した行を作り
-         ② AI(proofreadText, gpt-4.1-mini)で「結合＋誤字＋句読点」
-         ③ sendTextToHocuspocusDocument(..., forceNewParagraph) で段落追記（バッチ境界の改行を保持）
-         consume: rawBuffer から target を除去・pausePositions/ sentTail を更新
+         ① mechanicalSplit(target,120) で機械分割した行を作る
+         ② doc末尾から既確定段落を約400字(最大12段落)読み戻して「オーバーラップ」入力に含める
+         ③ AI(proofreadText, gpt-4.1-mini)で「句点基準の結合＋誤字＋句読点＋不明瞭語[]括弧化」
+         ④ replaceTailParagraphs(): 読み戻した直近段落を削除し、再補正結果を新段落として追記＝置換
+         consume: rawBuffer から target を除去・pausePositions を更新
    ▼  (Yjs同期)
 [校正画面 CollaborativeEditorV2 / 録音画面 RealtimeClient]
    黒 = 共有doc段落(AI確定)  緑 = rawBuffer(AI待ち)  グレー = interim</code></pre>
@@ -79,39 +80,42 @@
     <li><strong>二次：字数＋語境界</strong> — 1セグメントが <code>maxLen</code> を超えたら、<code>Intl.Segmenter('ja',{granularity:'word'})</code> の語境界（句読点があれば句読点直後を優先）で分割。語の途中では切らない。</li>
   </ul>
   <table>
-    <tr><th>用途</th><th>定数</th><th>意図</th></tr>
-    <tr><td>緑の<strong>表示</strong>改行</td><td><code>GREEN_DISPLAY_MAX = 40</code></td><td>緑を短い行に細かく刻む。行が伸びて再ワラップ→視線が泳ぐのを防ぐ（読みの安定）。AIが後で結合する前提なので細かくてよい。</td></tr>
+    <tr><th>用途</th><th>パラメータ</th><th>意図</th></tr>
+    <tr><td>緑の<strong>表示</strong>改行</td><td><code>greenDisplayBreaks</code>（<strong>ポーズ境界のみ</strong>）</td><td>字数での強制改行はやめ、校正画面の<strong>横幅いっぱいにCSSで自然折返し</strong>。意味のある無音ポーズでのみ改行する。</td></tr>
     <tr><td><strong>確定</strong>(AI補正)単位</td><td><code>MECH_MAX_LINE = 120</code></td><td>AIに渡す1セグメントの上限。大きめにして文の途中分割を減らし、AIの<strong>結合</strong>品質を保つ。</td></tr>
   </table>
 
-  <h2>4. AI補正（結合＋誤字＋句読点）</h2>
-  <p><code>proofreadText()</code> が <code>gpt-4.1-mini</code> に投げる。<strong>分割はしない・結合と校正だけ</strong>に特化したプロンプト：</p>
+  <h2>4. AI補正（オーバーラップ・句点基準の結合・括弧化）</h2>
+  <p><code>proofreadText()</code> が <code>gpt-4.1-mini</code> に投げる。<strong>分割はしない</strong>。判定基準は「文として成立しているか」ではなく<strong>「句点（。！？）で完結しているか」</strong>に統一し、句点で終わらない行（体言止め・列挙の途中を含む）は結合する。プロンプト要約：</p>
   <pre><code>あなたは日本語の会議文字起こしを整える校正アシスタントです。
-【校正対象】には機械処理で改行が挿入されています（位置は不正確で、一文の途中で割れていることがあります）。
+【校正対象】には機械処理で改行が挿入されています（位置は不正確）。
 
 最優先（改行の扱い）:
- - 改行は段落区切り。原則維持する。
- - 結合してよいのは「前の行が文の途中で終わり、次の行がその続き」＝一文が途中で割れている場合だけ。
- - 各行が文として成立していれば、その改行は絶対に維持する（完結文どうしを1段落にまとめない）。
- - 新たな改行（分割）は追加しない。
-その他: 誤字・誤変換の修正／句読点(、。)の補完／内容や文体は変えない／
-        末尾が文の途中なら勝手に完結させない（続きは次回送られる）。
-【文脈】= 直前までに確定した校正テキスト末尾（参考のみ・出力しない）。</code></pre>
+ - 機械改行は仮の区切り。各行が「文末（句点。！？で完結する位置）」かで判断。
+ - 文末で終わっていない行（体言止め・列挙の途中など）は、句読点を補い次行と結合し1文にする。
+   「答え」「こと」等の名詞で終わっても、文として完結していなければ結合する。
+ - 句点で完結している行は段落区切りを維持（完結文を無理に1段落にまとめなくてよい）。
+ - 文の途中に新たな改行（分割）は追加しない。
+その他: 誤字・誤変換の修正／句読点(、。)の補完／内容・文体は変えない／末尾が文途中なら完結させない。
+不明瞭語: 認識ミスで正しい語を確信を持って復元できない箇所は、削除や推測書き換えをせず
+          原文のまま半角 [ ] で囲んで残す。すでに [ ] 済みは二重に囲まない（few-shot例つき）。
+【文脈】= オーバーラップ窓の直前の確定テキスト末尾（参考のみ・出力しない）。</code></pre>
 
-  <h2>5. 確定の境界とライブ末尾</h2>
+  <h2>5. オーバーラップ補正と置換（直和分割ではない）</h2>
+  <p>以前の「追記のみ・置き換えなし」をやめ、<strong>オーバーラップ＋直近段落の置換</strong>に変更した。確定境界をまたぐ分割文の結合や、直前段落の再補正ができる。</p>
   <ul>
-    <li>AI補正・確定の対象は <code>rawBuffer</code> の<strong>「最後の機械改行(120字基準)まで」</strong>に限定する。</li>
-    <li><strong>最後の改行より後＝ライブ末尾</strong>（今まさに話している部分）は、AI（結合・修正）にも確定にもかけず、<strong>緑のまま</strong>残す。人が見ている末尾が大きく動いて見失うのを防ぐため。</li>
-    <li>各確定バッチは必ず改行境界で終わるので、追記時は <code>forceNewParagraph=true</code>（既存内容がある場合）で<strong>必ず新段落として追記</strong>し、バッチ境界の改行を保持する。</li>
-    <li><strong>追記のみ・置き換えなし</strong>。<code>sentTail</code>（送信済み末尾300字）を【文脈】としてAIに渡し、つながりを判断させる。よって人の同時編集と競合しない。</li>
+    <li>AI補正・確定の<strong>対象（緑）</strong>は <code>rawBuffer</code> の<strong>「最後の機械改行(120字基準)まで」</strong>。最後の改行より後＝<strong>ライブ末尾</strong>は緑のまま残す（末尾が動いて見失うのを防ぐ）。</li>
+    <li><strong>オーバーラップ</strong>：doc末尾から既確定段落を<strong>累計約 <code>OVERLAP_CHARS=400</code> 字（最大 <code>OVERLAP_MAX_PARAS=12</code> 段落）</strong>読み戻し、緑の対象と一緒に AI へ渡す。窓の直前段落（最大300字）を <strong>【文脈】</strong>として参考に渡す。</li>
+    <li><strong>置換</strong>：<code>replaceTailParagraphs()</code> が読み戻した直近段落を削除し、再補正結果（オーバーラップ＋緑）を新段落として追記する。削除＋追記は<strong>単一Yjsトランザクション</strong>で行い、<code>speechAppendSeq</code> を更新して校正画面の編集追跡（下線）の対象から除外する。</li>
+    <li><strong>トレードオフ</strong>：直近約400字は5秒ごとに再補正・置換されるため、<strong>末尾付近を人が編集中だと上書きされ得る</strong>（窓の外＝過去の確定テキストは安全）。<code>await</code> 中に段落数が変わった場合に備え、削除数は現在の段落数で丸めて過剰削除を防止。初回（空doc）は窓が空＝実質追記。</li>
     <li>録音停止後など <strong>12秒</strong> バッファ更新がなければ（<code>stale</code>）、ライブ末尾も含め全量を確定する。</li>
   </ul>
 
   <h2>6. そとづけの区切り情報と未確定表示</h2>
   <p>未確定テキストに <code>\n</code> を埋め込むと ProseMirror では空白に潰れる。そこで<strong>区切り位置を別チャネル</strong>で持つ：</p>
   <ul>
-    <li>サーバ statusMap: <code>pendingText</code>（緑+グレーの連結）／<code>pendingGreenLen</code>（緑＝先頭rawBuffer長）／<code>pendingBreaks</code>（緑内の改行オフセット配列・40字基準）。</li>
-    <li>校正画面: 未確定インライン Decoration の <code>&lt;span&gt;</code> を、<code>pendingBreaks</code> の位置に <code>&lt;br&gt;</code> を入れて複数行描画。先頭 <code>pendingGreenLen</code> 文字を緑(<code>#3fa874</code>)、以降をグレー(<code>#9ca3af</code>)。</li>
+    <li>サーバ statusMap: <code>pendingText</code>（緑+グレーの連結）／<code>pendingGreenLen</code>（緑＝先頭rawBuffer長）／<code>pendingBreaks</code>（<strong>緑内のポーズ境界オフセットのみ</strong>＝<code>greenDisplayBreaks</code>。字数折返しは入れない）。</li>
+    <li>校正画面: 未確定インライン Decoration の <code>&lt;span&gt;</code> を、<code>pendingBreaks</code> の位置に <code>&lt;br&gt;</code> を入れて描画。先頭 <code>pendingGreenLen</code> 文字を緑(<code>#3fa874</code>)、以降をグレー(<code>#9ca3af</code>)。<strong>直前に確定テキストがあれば緑の冒頭も <code>&lt;br&gt;</code> で行頭から開始</strong>（確定文の続きに繋げない）。</li>
     <li>認識画面: 録音者が送った生テキスト累積 <code>sentRaw</code> を、<code>pendingGreenLen</code> で「黒＝先頭(sentRaw.length−greenLen)／緑＝末尾greenLen分／グレー＝interim」に色分け。確定境界が校正画面と一致。</li>
   </ul>
 
@@ -119,19 +123,22 @@
   <table>
     <tr><th>パラメータ</th><th>値</th><th>意味</th></tr>
     <tr><td><code>PAUSE_BREAK_MS</code></td><td>1200ms</td><td>この無音以上で段落（ポーズ）区切り</td></tr>
-    <tr><td><code>GREEN_DISPLAY_MAX</code></td><td>40字</td><td>緑の表示改行の間隔（読みの安定）</td></tr>
+    <tr><td>緑の表示改行</td><td>ポーズ境界のみ</td><td>字数折返しはCSS(横幅いっぱい)に任せる（<code>greenDisplayBreaks</code>）</td></tr>
     <tr><td><code>MECH_MAX_LINE</code></td><td>120字</td><td>AI補正の1セグメント上限（結合品質）</td></tr>
+    <tr><td><code>OVERLAP_CHARS</code></td><td>400字</td><td>緑の先頭よりさかのぼって再補正に含める既確定量（80字×5行相当）</td></tr>
+    <tr><td><code>OVERLAP_MAX_PARAS</code></td><td>12段落</td><td>オーバーラップで再補正・置換する最大段落数（入力サイズ/コスト上限）</td></tr>
     <tr><td>最短実行間隔</td><td>5秒</td><td>AI補正の最短間隔（緑→黒の頻度）</td></tr>
     <tr><td>定期タイマー</td><td>6秒</td><td>発話が途切れても定期的に補正をトリガー</td></tr>
     <tr><td><code>stale</code> 判定</td><td>12秒</td><td>更新が止まったらライブ末尾も含め全量確定</td></tr>
-    <tr><td>AIモデル</td><td>gpt-4.1-mini</td><td>自動校正（結合＋誤字＋句読点）</td></tr>
+    <tr><td>AIモデル</td><td>gpt-4.1-mini</td><td>自動校正（結合＋誤字＋句読点＋括弧化）</td></tr>
     <tr><td>interim配信スロットル</td><td>200ms</td><td>local_pendingの送信間隔</td></tr>
   </table>
 
-  <h2>8. 校正画面の本文スクロール</h2>
+  <h2>8. 校正画面の本文スクロールと表示モード</h2>
   <ul>
     <li>本文は <code>h-[60vh] overflow-y-auto</code> のスクロールボックス。新規追記に<strong>自動追従</strong>して末尾を表示。</li>
     <li>本文クリック／上スクロールで自動追従を<strong>停止</strong>。停止中に末尾が伸びたら右下に <strong>▼ ボタン</strong>を表示し、押すと最下部へ移動して追従を再開（最下部到達でも自動再開）。</li>
+    <li><strong>閲覧モード</strong>：URL クエリ <code>?mode=view</code> のとき編集不可（<code>editor.setEditable(false)</code>）＋編集UI（書式・AI編集・Markdown編集）を非表示。既定（<code>mode=edit</code>／未指定）は編集可。音声追記などのリモート更新は閲覧中も反映される。</li>
   </ul>
 
   <h2>9. フェイルセーフ</h2>
@@ -139,9 +146,10 @@
     <li>自動校正OFF時は <code>rawBuffer</code> を使わず、確定テキストを直接ドキュメントへ書く（interimのみグレー）。</li>
     <li>バッファ過大（8000字超）時は未校正のまま一部書き出し（テキスト喪失防止）。切断時もバッファをflush。</li>
     <li>オンデバイス認識が無音で停止しても <code>onend</code> で自動再起動。非対応ブラウザでは機能が静かに無効化。</li>
+    <li><strong>文字化け対策</strong>：OpenAI応答は <code>callChatCompletion</code> で<strong>Bufferを蓄積し末尾で一括UTF-8デコード</strong>（<code>Buffer.concat</code>）。チャンク境界でマルチバイト文字が分断されて <code>�</code> になるのを防ぐ。</li>
   </ul>
 
-  <p class="meta" style="margin-top:40px;">補足: この仕様は実装途上のもの（未コミット）。未使用化した関数（<code>pendingDisplayBreaks</code> / <code>lastPauseOffset</code> / <code>getParagraphTextByIndex</code>）はコミット時に整理予定。</p>
+  <p class="meta" style="margin-top:40px;">補足: 旧仕様にあった「直和分割・追記のみ」「緑40字固定改行（GREEN_DISPLAY_MAX）」「句点強制改行オプション」「OpenAIリアルタイム音声経路」「未使用関数 <code>pendingDisplayBreaks</code>／<code>lastPauseOffset</code>」は撤去済み。<code>getParagraphTextByIndex</code> はオーバーラップ補正で使用中。</p>
 </div>
 </body>
 </html>
