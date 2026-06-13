@@ -57,6 +57,9 @@ const editTrackKey = new PluginKey('editTrack');
 // Decorationなので共有ドキュメント本体・編集履歴には一切影響しない
 const pendingTextKey = new PluginKey('pendingTextInline');
 
+// AI再補正で上書きされる末尾領域（編集禁止＋青字）用PluginKey
+const protectedTailKey = new PluginKey('protectedTail');
+
 // 未確定spanを、そとづけの区切り情報(breaks=改行オフセット配列)で複数行描画する。
 // テキストには \n を埋め込まず、breaksの位置で <br> を挿入して改行表示にする
 // （ProseMirrorのテキストノードでは \n が空白に潰れるため）。
@@ -65,13 +68,45 @@ const pendingTextKey = new PluginKey('pendingTextInline');
 // （確定文の末尾に続けず <br> で改行する）。
 const PENDING_GREEN = '#3fa874'; // 緑: AI校正待ち（rawBuffer）
 const PENDING_GRAY = '#9ca3af';  // グレー: オンデバイス未確定（interim）
-function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[], greenLen: number, breakBeforeFirst = false) {
+
+// 緑の折返しを「画面の実描画幅」で行うためのテキスト幅測定（canvasで実測・使い回し）。
+let _measureCanvas: HTMLCanvasElement | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null;
+  if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
+  return _measureCanvas.getContext('2d');
+}
+// pauseCuts（ポーズ＝段落境界）を保ちつつ、描画幅 availWidth(px) を超える位置に改行オフセットを足す。
+// 文字数ではなく「見た目の1行ぴったり」で折り返す。
+function widthCutOffsets(text: string, pauseCuts: Set<number>, font: string, availWidth: number): Set<number> {
+  const cuts = new Set<number>(pauseCuts);
+  const ctx = getMeasureCtx();
+  if (!ctx || !(availWidth > 0)) return cuts;
+  ctx.font = font;
+  let acc = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (pauseCuts.has(i)) acc = 0; // ポーズ境界で行頭リセット
+    const w = ctx.measureText(text[i]).width;
+    if (acc > 0 && acc + w > availWidth) {
+      cuts.add(i); // 文字iの前で改行
+      acc = w;
+    } else {
+      acc += w;
+    }
+  }
+  return cuts;
+}
+
+function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[], greenLen: number, breakBeforeFirst = false, wrap: { font: string; availWidth: number } | null = null) {
   span.textContent = '';
   if (!text) return;
   const green = Math.max(0, Math.min(greenLen || 0, text.length));
-  const cuts = Array.isArray(breaks)
-    ? [...new Set(breaks)].filter((o) => o > 0 && o < text.length).sort((a, b) => a - b)
-    : [];
+  const pauseCuts = new Set<number>(
+    Array.isArray(breaks) ? [...new Set(breaks)].filter((o) => o > 0 && o < text.length) : []
+  );
+  // 横幅での折返しを実測して足す（pauseCutsは保持）。wrapが無ければポーズ境界のみ。
+  const cutSet = wrap ? widthCutOffsets(text, pauseCuts, wrap.font, wrap.availWidth) : pauseCuts;
+  const cuts = [...cutSet].filter((o) => o > 0 && o < text.length).sort((a, b) => a - b);
   const lines: Array<[number, number]> = [];
   let s = 0;
   for (const c of cuts) { lines.push([s, c]); s = c; }
@@ -95,6 +130,32 @@ function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[]
     }
   });
 }
+// Chrome 内蔵 Prompt API（Gemini Nano・オンデバイス）。Node では使えずブラウザ専用。型は最小限で定義する。
+interface NanoPromptSession { prompt: (input: string) => Promise<string>; destroy?: () => void; }
+interface NanoPromptMonitor { addEventListener: (type: string, cb: (e: { loaded?: number; total?: number }) => void) => void; }
+interface NanoLanguageModel {
+  availability: () => Promise<'unavailable' | 'downloadable' | 'downloading' | 'available'>;
+  create: (opts: { initialPrompts?: { role: string; content: string }[]; monitor?: (m: NanoPromptMonitor) => void }) => Promise<NanoPromptSession>;
+}
+const getNanoLanguageModel = (): NanoLanguageModel | null => {
+  if (typeof self === 'undefined') return null;
+  const w = self as unknown as { LanguageModel?: NanoLanguageModel; ai?: { languageModel?: NanoLanguageModel } };
+  return w.LanguageModel || w.ai?.languageModel || null;
+};
+// AI編集の校正用システムプロンプト（サーバの /api/rewrite と同一。OpenAI/Nano 双方で使う）
+const buildRewriteSystemPrompt = (prompt: string): string => `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
+
+校正のルール:
+1. 誤字脱字を修正
+2. 句読点を適切に整理
+3. 明らかに誤った専門用語があれば補完・修正
+4. 文の意味や内容は変更しない
+5. 原文の文体やトーンを維持
+
+${prompt ? `追加の指示: ${prompt}` : ''}
+
+修正した文章のみを出力してください。説明は不要です。`;
+
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -150,6 +211,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [userCount, setUserCount] = useState(1);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingText, setPendingText] = useState(''); // Recognition in progress text
+  const [protectedTailParas, setProtectedTailParas] = useState(0); // AI再補正で上書きされる末尾段落数（編集禁止＋青字）
   const [changeHistory, setChangeHistory] = useState<ChangeEntry[]>([]);
   const [showHistory, setShowHistory] = useState(true);
   const lastContentRef = useRef<string>('');
@@ -164,6 +226,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [rewriteResult, setRewriteResult] = useState<{ original: string; rewritten: string } | null>(null);
   const [customPrompt, setCustomPrompt] = useState('');
   const [promptHistory, setPromptHistory] = useState<string[]>([]);
+  // AI編集のエンジン: 'openai'（サーバ経由）or 'nano'（ブラウザのGemini Nano・オンデバイス）。localStorageに保存
+  const [rewriteEngine, setRewriteEngine] = useState<'openai' | 'nano'>(() => {
+    if (typeof window === 'undefined') return 'openai';
+    try { return window.localStorage.getItem('collarecox-rewrite-engine') === 'nano' ? 'nano' : 'openai'; } catch { return 'openai'; }
+  });
+  const selectRewriteEngine = (engine: 'openai' | 'nano') => {
+    setRewriteEngine(engine);
+    try { window.localStorage.setItem('collarecox-rewrite-engine', engine); } catch { /* localStorage不可時は無視 */ }
+  };
 
   // Markdown Edit states
   const [showMarkdownModal, setShowMarkdownModal] = useState(false);
@@ -407,6 +478,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const pendingSpanRef = useRef<HTMLSpanElement | null>(null);
   const pendingBreaksRef = useRef<number[]>([]); // 未確定テキストの改行オフセット（そとづけ区切り情報）
   const pendingGreenLenRef = useRef<number>(0); // 緑(AI校正待ち)で表示する先頭文字数。以降はグレー(interim)
+  const pendingWrapRef = useRef<{ font: string; availWidth: number } | null>(null); // 緑の実幅折返し用（描画幅・フォント）
 
   // 本文スクロール領域: 自動追従スクロール＋手動操作時の停止＋▼ボタンで復帰
   const editorScrollRef = useRef<HTMLDivElement | null>(null);
@@ -565,10 +637,74 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       span.style.color = '#9ca3af';
                       pendingSpanRef.current = span;
                     }
-                    renderPendingSpan(pendingSpanRef.current, text, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst);
+                    renderPendingSpan(pendingSpanRef.current, text, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst, pendingWrapRef.current);
                     return pendingSpanRef.current;
                   }, { side: 1, key: 'pending-inline' });
                   return DecorationSet.create(doc, [widget]);
+                },
+              },
+            }),
+          ];
+        },
+      }),
+      // AI再補正で上書きされる末尾領域: 青字＋人による編集(追加/変更/削除)を禁止。
+      // 緑(AI待ち)は別Decorationで、ここは確定黒のうち再補正窓に入る段落のみが対象。
+      Extension.create({
+        name: 'protectedTail',
+        addProseMirrorPlugins() {
+          // 末尾から n 個のトップレベルブロックの開始位置（doc座標）
+          const protectedStart = (doc: { childCount: number; child: (i: number) => { nodeSize: number } }, n: number): number => {
+            const startIdx = Math.max(0, doc.childCount - n);
+            let pos = 0;
+            for (let i = 0; i < startIdx; i++) pos += doc.child(i).nodeSize;
+            return pos;
+          };
+          return [
+            new Plugin({
+              key: protectedTailKey,
+              state: {
+                init: () => 0,
+                apply(tr, prev) {
+                  const meta = tr.getMeta(protectedTailKey);
+                  return typeof meta === 'number' ? meta : prev;
+                },
+              },
+              // 保護領域への「人による」編集を禁止。リモート(Yjs同期=音声追記/AI再補正)は許可する。
+              filterTransaction(tr, state) {
+                if (!tr.docChanged) return true;
+                const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+                if (ySyncMeta?.isChangeOrigin === true || tr.getMeta('addToHistory') === false) return true;
+                const n = (protectedTailKey.getState(state) as number) || 0;
+                if (n <= 0) return true;
+                const from = protectedStart(state.doc, n);
+                let blocked = false;
+                tr.steps.forEach((step) => {
+                  step.getMap().forEach((oldStart: number, oldEnd: number) => {
+                    if (oldEnd >= from) blocked = true;
+                  });
+                });
+                return !blocked;
+              },
+              props: {
+                decorations(state) {
+                  const n = (protectedTailKey.getState(state) as number) || 0;
+                  if (n <= 0) return DecorationSet.empty;
+                  const doc = state.doc;
+                  const total = doc.childCount;
+                  const startIdx = Math.max(0, total - n);
+                  const decos: Decoration[] = [];
+                  let pos = 0;
+                  for (let i = 0; i < total; i++) {
+                    const node = doc.child(i);
+                    if (i >= startIdx) {
+                      decos.push(Decoration.node(pos, pos + node.nodeSize, {
+                        style: 'color:#2563eb',
+                        title: 'AI再補正中のため編集できません',
+                      }));
+                    }
+                    pos += node.nodeSize;
+                  }
+                  return DecorationSet.create(doc, decos);
                 },
               },
             }),
@@ -704,6 +840,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         if (pending) {
           console.log('[Collaborative Editor V2] 🔤 Pending text:', pending);
         }
+        // AI再補正で上書きされる末尾段落数（編集禁止＋青字の範囲）
+        const pTail = statusMap.get('proofreadTailParas');
+        setProtectedTailParas(typeof pTail === 'number' ? pTail : 0);
       };
 
       // Initial check
@@ -734,13 +873,29 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         // 直前に確定テキストがあれば緑の冒頭を行頭から始める（描画の都度、現在のdocから判定）
         const lastChild = editor.state.doc.lastChild;
         const breakBeforeFirst = !!(lastChild && lastChild.isTextblock && lastChild.textContent.trim().length > 0);
-        renderPendingSpan(pendingSpanRef.current, pendingText, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst);
+        // 本文の実描画幅とフォントを測定して緑を「見た目の1行ぴったり」で折り返す。widget側でも使えるようrefへ保存。
+        let wrap: { font: string; availWidth: number } | null = null;
+        try {
+          const dom = editor.view.dom as HTMLElement;
+          const cs = getComputedStyle(dom);
+          const availWidth = dom.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+          wrap = { font: `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`, availWidth };
+        } catch { wrap = null; }
+        pendingWrapRef.current = wrap;
+        renderPendingSpan(pendingSpanRef.current, pendingText, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst, wrap);
       }
       editor.view.dispatch(editor.state.tr.setMeta(pendingTextKey, pendingText));
     } catch (error) {
       console.warn('[Collaborative Editor V2] ⚠️ Error updating pending decoration:', error);
     }
   }, [editor, pendingText]);
+
+  // AI再補正で上書きされる末尾段落数を Decoration/filterTransaction へ反映する（青字＋編集禁止）
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, protectedTailParas)); }
+    catch (e) { console.warn('[Collaborative Editor V2] ⚠️ protectedTail update error:', e); }
+  }, [editor, protectedTailParas]);
 
   // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
   useEffect(() => {
@@ -939,7 +1094,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setShowRewriteModal(true);
   };
 
-  // AI Rewrite - 実行
+  // Gemini Nano（ブラウザのオンデバイスLLM）でAI編集を実行する。Nodeは関与せず外部送信なし。
+  const rewriteWithNano = async (text: string, prompt: string): Promise<string> => {
+    const LM = getNanoLanguageModel();
+    if (!LM) throw new Error('このブラウザはオンデバイスAI(Gemini Nano)に未対応です。Chrome 138+ と chrome://flags の prompt-api 有効化を確認してください');
+    const avail = await LM.availability();
+    if (avail === 'unavailable') throw new Error('Gemini Nano が利用できません（フラグ未設定・非対応環境・ディスク不足など）');
+    const session = await LM.create({
+      initialPrompts: [{ role: 'system', content: buildRewriteSystemPrompt(prompt) }],
+    });
+    try {
+      const out = await session.prompt(text);
+      return out || text;
+    } finally {
+      session.destroy?.();
+    }
+  };
+
+  // AI Rewrite - 実行（エンジンに応じて OpenAI(サーバ) か Gemini Nano(オンデバイス) を使う）
   const executeRewrite = async () => {
     if (!editor || isRewriting || !selectedTextForRewrite.trim()) return;
 
@@ -951,18 +1123,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
     setIsRewriting(true);
     try {
-      const response = await fetch(`${getBasePath()}/api/rewrite`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Rewrite failed');
+      let rewritten: string;
+      if (rewriteEngine === 'nano') {
+        // ブラウザ内のGemini Nanoで処理
+        rewritten = await rewriteWithNano(selectedTextForRewrite, customPrompt);
+      } else {
+        // 従来どおりサーバ(OpenAI)で処理
+        const response = await fetch(`${getBasePath()}/api/rewrite`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
+        });
+        if (!response.ok) {
+          throw new Error('Rewrite failed');
+        }
+        const data = await response.json();
+        rewritten = data.rewritten;
       }
-
-      const data = await response.json();
-      setRewriteResult({ original: data.original, rewritten: data.rewritten });
+      setRewriteResult({ original: selectedTextForRewrite, rewritten });
       setRewriteModalPhase('result');
 
       // プロンプト履歴に保存（重複排除、最大10件）
@@ -972,7 +1150,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       localStorage.setItem('ai-rewrite-prompt-history', JSON.stringify(newHistory));
     } catch (error) {
       console.error('[AI Rewrite] Error:', error);
-      alert('AI編集に失敗しました');
+      alert(rewriteEngine === 'nano'
+        ? 'オンデバイスAI(Gemini Nano)での編集に失敗しました: ' + (error instanceof Error ? error.message : '不明なエラー')
+        : 'AI編集に失敗しました');
     } finally {
       setIsRewriting(false);
     }
@@ -1328,21 +1508,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 </button>
               )}
             </div>
-            {/* 手動認識確定ボタン - スクロール領域の外・最下段・右寄せ */}
-            <div className="px-4 py-2 border-t border-hairline-soft flex justify-end">
-              <button
-                onClick={handleForceCommit}
-                disabled={!isTranscribing || isForceCommitPending}
-                title="現在の認識バッファを強制的に確定します"
-                className={`px-3 py-1 text-sm rounded-md transition-colors ${
-                  !isTranscribing || isForceCommitPending
-                    ? 'bg-celadon-disabled text-muted cursor-not-allowed'
-                    : 'bg-celadon text-on-celadon hover:bg-celadon-active'
-                }`}
-              >
-                {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
-              </button>
-            </div>
           </div>
         </div>
 
@@ -1485,6 +1650,36 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     />
                     {!customPrompt.trim() && (
                       <p className="text-xs text-error mt-1">編集プロンプトは必須です</p>
+                    )}
+                  </div>
+
+                  {/* エンジン選択: OpenAI（サーバ）/ Gemini Nano（オンデバイス） */}
+                  <div className="mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">エンジン</label>
+                    <div className="flex items-center gap-4 text-sm text-body">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="rewrite-engine"
+                          checked={rewriteEngine === 'openai'}
+                          onChange={() => selectRewriteEngine('openai')}
+                          className="accent-celadon"
+                        />
+                        OpenAI（サーバ）
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="rewrite-engine"
+                          checked={rewriteEngine === 'nano'}
+                          onChange={() => selectRewriteEngine('nano')}
+                          className="accent-celadon"
+                        />
+                        オンデバイス（Gemini Nano）
+                      </label>
+                    </div>
+                    {rewriteEngine === 'nano' && (
+                      <p className="text-xs text-muted mt-1">Chrome内蔵のGemini Nanoで処理（外部送信なし）。要 Chrome 138+ ／ <code>chrome://flags/#prompt-api-for-gemini-nano</code> 有効化 ／ 初回モデルDL。</p>
                     )}
                   </div>
                 </>
