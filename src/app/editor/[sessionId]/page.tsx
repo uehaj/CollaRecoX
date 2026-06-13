@@ -13,15 +13,15 @@ export default async function EditorPage({ params }: PageProps) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center">
-          <h1 className="text-2xl font-bold text-red-600 mb-4">Invalid Session</h1>
-          <p className="text-gray-600">Session ID is required to access the collaborative editor.</p>
+          <h1 className="text-2xl font-light text-error mb-4">Invalid Session</h1>
+          <p className="text-body">Session ID is required to access the collaborative editor.</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-canvas">
       <EditorHeader sessionId={sessionId} />
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">

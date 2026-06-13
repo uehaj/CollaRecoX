@@ -517,7 +517,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         openOnClick: true,
         autolink: true,
         HTMLAttributes: {
-          class: 'text-blue-600 underline hover:text-blue-800',
+          class: 'text-celadon underline hover:text-celadon-active',
         },
       }),
       // Add Collaboration when extension is loaded
@@ -796,7 +796,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     const selectedText = editor.state.doc.textBetween(from, to, ' ');
 
     if (!selectedText.trim()) {
-      alert('テキストを選択してAI再編の範囲を指定してください');
+      alert('テキストを選択してAI編集の範囲を指定してください');
       return;
     }
 
@@ -844,7 +844,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       localStorage.setItem('ai-rewrite-prompt-history', JSON.stringify(newHistory));
     } catch (error) {
       console.error('[AI Rewrite] Error:', error);
-      alert('AI再編に失敗しました');
+      alert('AI編集に失敗しました');
     } finally {
       setIsRewriting(false);
     }
@@ -938,8 +938,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">読み込み中...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-celadon mx-auto mb-4"></div>
+          <p className="text-body">読み込み中...</p>
         </div>
       </div>
     );
@@ -949,8 +949,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">共同校正エディターを初期化中...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-celadon mx-auto mb-4"></div>
+          <p className="text-body">共同校正エディターを初期化中...</p>
         </div>
       </div>
     );
@@ -959,31 +959,31 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   return (
     <div className="space-y-4">
       {/* 校正者マニュアルバナー */}
-      <div className="bg-indigo-600 text-white rounded-lg px-4 py-2 flex items-center justify-between">
+      <div className="bg-celadon text-on-celadon rounded-lg px-4 py-2 flex items-center justify-between">
         <span className="text-sm font-medium">初めての方へ: 校正の操作方法はマニュアルをご確認ください</span>
         <a
           href={`${getBasePath()}/manual.html#editor`}
           target="_blank"
           rel="noopener noreferrer"
-          className="bg-white text-indigo-600 px-3 py-1 rounded text-sm font-medium hover:bg-indigo-50 transition-colors flex-shrink-0"
+          className="bg-surface text-celadon-active px-3 py-1 rounded-md text-sm font-medium hover:bg-celadon-soft transition-colors flex-shrink-0"
         >
           校正者マニュアルを開く
         </a>
       </div>
       {/* Sticky Header - Connection Status + Toolbar */}
-      <div className="sticky top-0 z-10 bg-gray-50 space-y-2 pb-2">
+      <div className="sticky top-0 z-10 bg-canvas space-y-2 pb-2">
         {/* Connection Status */}
-        <div className="bg-white rounded-lg shadow-sm border p-4">
+        <div className="bg-surface rounded-lg shadow-sm border border-hairline p-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-4">
             <div className="flex items-center space-x-2">
-              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-              <span className="text-sm font-medium">
+              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-success' : 'bg-error'}`}></div>
+              <span className="text-sm font-medium text-ink">
                 {isConnected ? '接続済み' : '接続中...'}
               </span>
             </div>
             <div className="flex items-center space-x-2">
-              <span className="text-sm text-gray-600">
+              <span className="text-sm text-body">
                 {connectedUsers.length > 0 ? connectedUsers.length : userCount}人が参加中:
               </span>
               {/* Connected Users Avatars */}
@@ -992,7 +992,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   connectedUsers.map((user) => (
                     <div
                       key={user.id}
-                      className="w-6 h-6 rounded-full border-2 border-white flex items-center justify-center text-xs text-white font-medium"
+                      className="w-6 h-6 rounded-full border-2 border-surface flex items-center justify-center text-xs text-white font-medium"
                       style={{ backgroundColor: user.color }}
                       title={`${user.name} (${user.id === userIdRef.current ? '自分' : '参加者'})`}
                     >
@@ -1001,7 +1001,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   ))
                 ) : (
                   <div
-                    className="w-6 h-6 rounded-full border-2 border-white flex items-center justify-center text-xs text-white font-medium"
+                    className="w-6 h-6 rounded-full border-2 border-surface flex items-center justify-center text-xs text-white font-medium"
                     style={{ backgroundColor: userInfo.color }}
                     title={userInfo.name}
                   >
@@ -1026,30 +1026,30 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     if (e.key === 'Enter') saveUserName();
                     if (e.key === 'Escape') cancelEditUserName();
                   }}
-                  className="text-sm px-2 py-0.5 border border-gray-300 rounded w-24 focus:outline-none focus:border-blue-500"
+                  className="text-sm px-2 py-0.5 border border-hairline rounded-md w-24 focus:outline-none focus:border-celadon focus:ring-1 focus:ring-celadon"
                   autoFocus
                 />
                 <button
                   onClick={saveUserName}
-                  className="text-xs px-2 py-0.5 bg-blue-500 text-white rounded hover:bg-blue-600"
+                  className="text-xs px-2 py-0.5 bg-celadon text-on-celadon rounded-md hover:bg-celadon-active transition-colors"
                 >
                   保存
                 </button>
                 <button
                   onClick={cancelEditUserName}
-                  className="text-xs px-2 py-0.5 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+                  className="text-xs px-2 py-0.5 bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
                 >
                   取消
                 </button>
               </div>
             ) : (
               <div className="flex items-center space-x-1">
-                <span className="text-sm text-gray-500">
+                <span className="text-sm text-muted">
                   {userInfo.name} {provider ? '✓' : '⌛'}
                 </span>
                 <button
                   onClick={startEditingUserName}
-                  className="text-xs text-gray-400 hover:text-gray-600"
+                  className="text-xs text-muted hover:text-body transition-colors"
                   title="ユーザー名を編集"
                 >
                   ✏️
@@ -1061,47 +1061,47 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       </div>
 
       {/* Editor Toolbar */}
-      <div className="bg-white rounded-lg shadow-sm border p-3">
+      <div className="bg-surface rounded-lg shadow-sm border border-hairline p-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
             <button
               onClick={() => editor.chain().focus().toggleBold().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('bold') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('bold') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               太字
             </button>
             <button
               onClick={() => editor.chain().focus().toggleItalic().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('italic') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('italic') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               斜体
             </button>
             <button
               onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('heading', { level: 2 }) ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('heading', { level: 2 }) ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               見出し
             </button>
             <button
               onClick={() => editor.chain().focus().toggleBulletList().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('bulletList') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('bulletList') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               箇条書き
             </button>
             <button
               onClick={() => editor.chain().focus().toggleHighlight({ color: userInfo.color }).run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('highlight') ? 'bg-yellow-500 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('highlight') ? 'text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
               style={editor.isActive('highlight') ? { backgroundColor: userInfo.color } : {}}
               title="選択したテキストをハイライト"
             >
               🖍 ハイライト
             </button>
-            <label className="flex items-center space-x-1 text-sm text-gray-600" title="他者の編集を下線で表示">
+            <label className="flex items-center space-x-1 text-sm text-body" title="他者の編集を下線で表示">
               <input
                 type="checkbox"
                 checked={highlightEdits}
                 onChange={(e) => setHighlightEdits(e.target.checked)}
-                className="rounded"
+                className="rounded accent-celadon"
               />
               <span>下線表示</span>
             </label>
@@ -1109,7 +1109,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             <select
               value={fontSize}
               onChange={(e) => setFontSize(e.target.value as 'xs' | 'sm' | 'base' | 'lg')}
-              className="px-2 py-1 text-sm border border-gray-300 rounded bg-white"
+              className="px-2 py-1 text-sm border border-hairline rounded-md bg-surface text-ink focus:outline-none focus:ring-1 focus:ring-celadon"
               title="文字サイズ"
             >
               <option value="xs">極小</option>
@@ -1126,22 +1126,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   alert('テキストをクリップボードにコピーしました');
                 });
               }}
-              className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
+              className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
             >
               テキストをコピー
             </button>
             <button
               onClick={handleRewrite}
               disabled={isRewriting}
-              title="AIでテキストを再編します"
-              className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              title="AIでテキストを編集します"
+              className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
             >
-              {isRewriting ? '処理中...' : 'AI再編'}
+              {isRewriting ? '処理中...' : 'AI編集'}
             </button>
             <button
               onClick={handleMarkdownEdit}
               title="選択箇所をMarkdownで編集します"
-              className="px-3 py-1 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors"
+              className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active transition-colors"
             >
               Markdown編集
             </button>
@@ -1154,18 +1154,18 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="flex gap-4">
         {/* Editor */}
         <div className="flex-1">
-          <div className={`bg-white rounded-lg shadow-sm border min-h-[600px] editor-font-${fontSize}`}>
+          <div className={`bg-surface rounded-lg shadow-sm border border-hairline min-h-[600px] editor-font-${fontSize}`}>
             <EditorContent editor={editor} />
             {/* 手動認識確定ボタン - エディター最下段・右寄せ */}
-            <div className="px-4 py-2 border-t border-gray-100 flex justify-end">
+            <div className="px-4 py-2 border-t border-hairline-soft flex justify-end">
               <button
                 onClick={handleForceCommit}
                 disabled={!isTranscribing || isForceCommitPending}
                 title="現在の認識バッファを強制的に確定します"
-                className={`px-3 py-1 text-sm rounded transition-colors ${
+                className={`px-3 py-1 text-sm rounded-md transition-colors ${
                   !isTranscribing || isForceCommitPending
-                    ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                    : 'bg-orange-500 text-white hover:bg-orange-600'
+                    ? 'bg-celadon-disabled text-muted cursor-not-allowed'
+                    : 'bg-celadon text-on-celadon hover:bg-celadon-active'
                 }`}
               >
                 {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
@@ -1174,7 +1174,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration）に変更 */}
             {isTranscribing && !pendingText && (
               <div className="px-4 pb-4">
-                <p className="text-gray-400 italic animate-pulse">
+                <p className="text-muted italic animate-pulse">
                   認識中...
                 </p>
               </div>
@@ -1185,19 +1185,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         {/* Change History Sidebar */}
         {showHistory && (
           <div className="w-80 flex-shrink-0">
-            <div className="bg-white rounded-lg shadow-sm border p-4 sticky top-4">
+            <div className="bg-surface rounded-lg shadow-sm border border-hairline p-4 sticky top-4">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-medium text-gray-900">変更履歴</h3>
+                <h3 className="text-lg font-medium text-ink">変更履歴</h3>
                 <button
                   onClick={() => setShowHistory(false)}
-                  className="text-gray-400 hover:text-gray-600"
+                  className="text-muted hover:text-body transition-colors"
                 >
                   ×
                 </button>
               </div>
               <div className="space-y-3 max-h-[500px] overflow-y-auto">
                 {changeHistory.length === 0 ? (
-                  <p className="text-gray-500 text-sm">変更履歴はありません</p>
+                  <p className="text-muted text-sm">変更履歴はありません</p>
                 ) : (
                   changeHistory.map((entry) => (
                     <div key={entry.id} className="border-l-2 pl-3 py-1" style={{ borderColor: entry.userColor }}>
@@ -1207,21 +1207,21 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             className="w-2 h-2 rounded-full"
                             style={{ backgroundColor: entry.userColor }}
                           ></div>
-                          <span className="text-xs font-medium text-gray-500">{entry.userName}</span>
+                          <span className="text-xs font-medium text-muted">{entry.userName}</span>
                         </div>
-                        <span className="text-xs text-gray-400">
+                        <span className="text-xs text-muted">
                           {entry.timestamp.toLocaleTimeString('ja-JP')}
                         </span>
                       </div>
                       <div className="text-sm mt-0.5">
                         <span className={`text-xs font-medium px-1 py-0.5 rounded ${
-                          entry.action === 'insert' ? 'bg-green-100 text-green-700' :
-                          entry.action === 'delete' ? 'bg-red-100 text-red-700' :
-                          'bg-blue-100 text-blue-700'
+                          entry.action === 'insert' ? 'bg-success/10 text-success' :
+                          entry.action === 'delete' ? 'bg-error/10 text-error' :
+                          'bg-celadon-soft text-celadon-active'
                         }`}>
                           {entry.action === 'insert' ? '追加' : entry.action === 'delete' ? '削除' : '変更'}
                         </span>
-                        <span className="ml-1.5 text-gray-700 text-sm break-all">{entry.content}</span>
+                        <span className="ml-1.5 text-body text-sm break-all">{entry.content}</span>
                       </div>
                     </div>
                   ))
@@ -1236,32 +1236,20 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       {!showHistory && (
         <button
           onClick={() => setShowHistory(true)}
-          className="fixed right-4 top-1/2 transform -translate-y-1/2 px-2 py-4 bg-blue-600 text-white rounded-l-lg shadow-lg hover:bg-blue-700 transition-colors"
+          className="fixed right-4 top-1/2 transform -translate-y-1/2 px-2 py-4 bg-celadon text-on-celadon rounded-l-lg shadow-sm hover:bg-celadon-active transition-colors"
         >
           履歴
         </button>
       )}
 
-      {/* Instructions */}
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-        <h3 className="text-lg font-medium text-blue-900 mb-2">共同校正</h3>
-        <ul className="text-blue-800 space-y-1 text-sm">
-          <li>• このURLを他の人と共有して、一緒に校正できます</li>
-          <li>• リアルタイム文字起こしの結果が自動的にここに追加されます</li>
-          <li>• 複数の人が同時に校正でき、変更がリアルタイムで同期されます</li>
-          <li>• 右のサイドバーで変更履歴を確認できます</li>
-          <li>• 「AI再編」で誤字修正や句読点整理ができます</li>
-        </ul>
-      </div>
-
-      {/* AI Rewrite Modal */}
+      {/* AI Edit Modal */}
       {showRewriteModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden">
+          <div className="bg-surface border border-hairline rounded-lg shadow-sm max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden">
             {/* ヘッダー */}
-            <div className="p-4 border-b">
-              <h3 className="text-lg font-medium text-gray-900">
-                {rewriteModalPhase === 'selection' ? 'AI再編 - テキスト選択' : 'AI再編 - プレビュー'}
+            <div className="p-4 border-b border-hairline">
+              <h3 className="text-lg font-light text-ink">
+                {rewriteModalPhase === 'selection' ? 'AI編集 - テキスト選択' : 'AI編集 - プレビュー'}
               </h3>
             </div>
 
@@ -1271,17 +1259,17 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 /* 選択フェーズ */
                 <>
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       以下の箇所を選択しています
                     </label>
-                    <div className="p-3 bg-yellow-50 rounded border border-yellow-200 text-sm whitespace-pre-wrap max-h-40 overflow-y-auto">
+                    <div className="p-3 bg-surface-soft rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-40 overflow-y-auto">
                       {selectedTextForRewrite}
                     </div>
                   </div>
 
                   {/* テンプレート選択 */}
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       テンプレートから選択
                     </label>
                     <div className="flex flex-wrap gap-2">
@@ -1289,7 +1277,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                         <button
                           key={index}
                           onClick={() => setCustomPrompt(prev => prev ? `${prev}\n${template.prompt}` : template.prompt)}
-                          className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
+                          className="px-2 py-1 text-xs bg-celadon-soft text-celadon-active rounded-md hover:bg-surface-tint transition-colors"
                         >
                           {template.label}
                         </button>
@@ -1300,7 +1288,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   {/* 履歴選択 */}
                   {promptHistory.length > 0 && (
                     <div className="mb-4">
-                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                      <label className="block text-sm font-medium text-body-strong mb-2">
                         履歴から選択
                       </label>
                       <div className="flex flex-wrap gap-2">
@@ -1308,7 +1296,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                           <button
                             key={index}
                             onClick={() => setCustomPrompt(prompt)}
-                            className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors max-w-xs truncate"
+                            className="px-2 py-1 text-xs bg-surface-soft text-body rounded-md hover:bg-surface-tint transition-colors max-w-xs truncate"
                             title={prompt}
                           >
                             {prompt.length > 20 ? prompt.substring(0, 20) + '...' : prompt}
@@ -1320,19 +1308,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
                   {/* プロンプト入力 */}
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      編集プロンプト <span className="text-red-500">*</span>
+                    <label className="block text-sm font-medium text-body-strong mb-2">
+                      編集プロンプト <span className="text-error">*</span>
                     </label>
                     <textarea
                       value={customPrompt}
                       onChange={(e) => setCustomPrompt(e.target.value)}
                       placeholder="どのように編集するか指示を入力してください"
-                      className={`w-full px-3 py-2 border rounded-md text-sm h-24 ${
-                        !customPrompt.trim() ? 'border-red-300 bg-red-50' : 'border-gray-300'
+                      className={`w-full px-3 py-2 border rounded-md text-sm h-24 text-ink focus:outline-none focus:ring-1 focus:ring-celadon ${
+                        !customPrompt.trim() ? 'border-error bg-error/5' : 'border-hairline'
                       }`}
                     />
                     {!customPrompt.trim() && (
-                      <p className="text-xs text-red-500 mt-1">編集プロンプトは必須です</p>
+                      <p className="text-xs text-error mt-1">編集プロンプトは必須です</p>
                     )}
                   </div>
                 </>
@@ -1340,20 +1328,20 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 /* 結果フェーズ */
                 <>
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       使用した編集プロンプト
                     </label>
-                    <div className="p-2 bg-purple-50 border border-purple-200 rounded text-sm text-purple-800">
+                    <div className="p-2 bg-celadon-soft border border-hairline rounded-md text-sm text-celadon-active">
                       {customPrompt}
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                      <h4 className="text-sm font-medium text-body-strong mb-2">
                         元のテキスト
-                        <span className="ml-2 text-xs text-red-500">（削除部分に<span className="line-through">取り消し線</span>）</span>
+                        <span className="ml-2 text-xs text-error">（削除部分に<span className="line-through">取り消し線</span>）</span>
                       </h4>
-                      <div className="p-3 bg-gray-50 rounded border text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                      <div className="p-3 bg-surface-soft rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-80 overflow-y-auto">
                         {rewriteResult && (() => {
                           const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
                           return diff.map((part, index) => {
@@ -1362,7 +1350,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             }
                             if (part.removed) {
                               return (
-                                <span key={index} className="bg-red-100 text-red-800 line-through">
+                                <span key={index} className="bg-error/10 text-error line-through">
                                   {part.value}
                                 </span>
                               );
@@ -1373,11 +1361,11 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       </div>
                     </div>
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                      <h4 className="text-sm font-medium text-body-strong mb-2">
                         修正後のテキスト
-                        <span className="ml-2 text-xs text-green-600">（追加部分に<span className="underline decoration-green-500 decoration-2">下線</span>）</span>
+                        <span className="ml-2 text-xs text-success">（追加部分に<span className="underline decoration-success decoration-2">下線</span>）</span>
                       </h4>
-                      <div className="p-3 bg-green-50 rounded border border-green-200 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                      <div className="p-3 bg-success/5 rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-80 overflow-y-auto">
                         {rewriteResult && (() => {
                           const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
                           return diff.map((part, index) => {
@@ -1386,7 +1374,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             }
                             if (part.added) {
                               return (
-                                <span key={index} className="bg-green-100 text-green-800 underline decoration-green-500 decoration-2">
+                                <span key={index} className="bg-success/10 text-success underline decoration-success decoration-2">
                                   {part.value}
                                 </span>
                               );
@@ -1402,10 +1390,10 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             </div>
 
             {/* フッター */}
-            <div className="p-4 border-t flex justify-end space-x-3">
+            <div className="p-4 border-t border-hairline flex justify-end space-x-3">
               <button
                 onClick={closeRewriteModal}
-                className="px-4 py-2 text-sm text-gray-700 bg-gray-200 rounded hover:bg-gray-300"
+                className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft transition-colors"
               >
                 キャンセル
               </button>
@@ -1413,22 +1401,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 <button
                   onClick={executeRewrite}
                   disabled={isRewriting || !customPrompt.trim()}
-                  className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
                 >
-                  {isRewriting ? '処理中...' : 'AI再編を実行'}
+                  {isRewriting ? '処理中...' : 'AI編集を実行'}
                 </button>
               ) : (
                 <>
                   <button
                     onClick={() => setRewriteModalPhase('selection')}
                     disabled={isRewriting}
-                    className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
+                    className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft disabled:opacity-50 transition-colors"
                   >
                     {isRewriting ? '処理中...' : '再実行'}
                   </button>
                   <button
                     onClick={applyRewrite}
-                    className="px-4 py-2 text-sm text-white bg-blue-600 rounded hover:bg-blue-700"
+                    className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active transition-colors"
                   >
                     適用
                   </button>
@@ -1442,13 +1430,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       {/* Markdown Edit Modal */}
       {showMarkdownModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
+          <div className="bg-surface border border-hairline rounded-lg shadow-sm w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
             {/* ヘッダー */}
-            <div className="p-4 border-b flex justify-between items-center">
-              <h3 className="text-lg font-medium text-gray-900">Markdown編集</h3>
+            <div className="p-4 border-b border-hairline flex justify-between items-center">
+              <h3 className="text-lg font-light text-ink">Markdown編集</h3>
               <button
                 onClick={closeMarkdownModal}
-                className="text-gray-400 hover:text-gray-600"
+                className="text-muted hover:text-body transition-colors"
               >
                 ✕
               </button>
@@ -1456,31 +1444,31 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
             {/* コンテンツ */}
             <div className="p-4 overflow-y-auto flex-1">
-              <p className="text-sm text-gray-600 mb-3">
+              <p className="text-sm text-body mb-3">
                 選択箇所をMarkdown形式で編集できます。リンクや基本的なHTMLタグの挿入が可能です。
               </p>
               <textarea
                 value={markdownText}
                 onChange={(e) => setMarkdownText(e.target.value)}
-                className="w-full h-64 px-3 py-2 border border-gray-300 rounded-md font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="w-full h-64 px-3 py-2 border border-hairline rounded-md font-mono text-sm text-ink resize-none focus:outline-none focus:ring-2 focus:ring-celadon"
                 placeholder="Markdownを入力..."
               />
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-muted mt-2">
                 例: **太字**, *斜体*, [リンク](URL), # 見出し, - リスト
               </p>
             </div>
 
             {/* フッター */}
-            <div className="p-4 border-t flex justify-end gap-2">
+            <div className="p-4 border-t border-hairline flex justify-end gap-2">
               <button
                 onClick={closeMarkdownModal}
-                className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded hover:bg-gray-200"
+                className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft transition-colors"
               >
                 キャンセル
               </button>
               <button
                 onClick={applyMarkdownEdit}
-                className="px-4 py-2 text-sm text-white bg-indigo-600 rounded hover:bg-indigo-700"
+                className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active transition-colors"
               >
                 適用
               </button>

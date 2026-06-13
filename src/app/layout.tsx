@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI-Powered Audio Transcription",
-  description: "Real-time speech-to-text transcription using OpenAI GPT-4o models",
+  title: "Collarecox - AI音声文字起こし",
+  description: "オンデバイス音声認識による、ブラウザ完結のリアルタイム文字起こしと共同校正",
 };
 
 export default function RootLayout({

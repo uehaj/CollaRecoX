@@ -1,29 +1,64 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/*
+ * Hakuji (白磁) — porcelain-clean light-first theme.
+ * 明るい磁器調キャンバスに、単一の青磁(celadon)アクセント。軽量タイポと広い余白。
+ * 各画面は bg-canvas / text-ink / bg-celadon / border-hairline 等のトークンで参照する。
+ */
+@theme {
+  /* Surfaces */
+  --color-canvas: #f7fafb;        /* 明るい磁器調の床。nav/hero/body */
+  --color-surface: #ffffff;       /* 純白カード */
+  --color-surface-soft: #eef3f5;  /* 静かな灰のグルーピング面/フッター */
+  --color-surface-tint: #e3f1f4;  /* 青磁トーンの強調面 */
+  --color-surface-ink: #16242a;   /* 1ページ1回の濃いインク帯 */
+  --color-surface-ink-soft: #1e3138;
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  /* Text (純黒は使わない) */
+  --color-ink: #16242a;           /* 見出し/主要テキスト */
+  --color-body-strong: #243740;
+  --color-body: #46555c;          /* 既定本文色 */
+  --color-muted: #76858b;         /* キャプション/非アクティブ */
+  --color-muted-soft: #9aa6ab;    /* プレースホルダ */
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* Celadon (唯一の彩度あるアクセント) */
+  --color-celadon: #3d9aaf;
+  --color-celadon-active: #2f8094;
+  --color-celadon-bright: #54b3c8;
+  --color-celadon-soft: #e3f1f4;
+  --color-celadon-disabled: #c9d4d7;
+
+  /* Hairlines */
+  --color-hairline: #e2e8ea;
+  --color-hairline-soft: #eef2f4;
+
+  /* On-color text */
+  --color-on-celadon: #ffffff;
+  --color-on-ink: #f2f6f7;
+  --color-on-ink-soft: #9fb0b6;
+
+  /* Semantic (低彩度・磁器調に調和。意味は保持) */
+  --color-success: #3fa874;
+  --color-warning: #dca33a;
+  --color-error: #d75c4d;
+
+  /* Type */
+  --font-sans: var(--font-geist-sans, "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+  --font-mono: var(--font-geist-mono, "Geist Mono", "JetBrains Mono", ui-monospace, monospace);
+
+  /* 後方互換: 既存の bg-background / text-foreground 参照を白磁に橋渡し */
+  --color-background: #f7fafb;
+  --color-foreground: #16242a;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-canvas);
+  color: var(--color-body);
+  font-family: var(--font-sans);
+  /* 軽量タイポを基調にする（bold は使わない） */
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* Collaboration Cursor Styles */

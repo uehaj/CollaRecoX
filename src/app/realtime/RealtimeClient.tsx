@@ -6,142 +6,10 @@ import React, { useRef, useState, useCallback, useEffect } from "react";
 type YDocType = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HocuspocusProviderType = any;
-import { getAllRecordings, type AudioRecording } from '@/lib/indexedDB';
 import { getBasePath } from '@/lib/basePath';
 import packageJson from '../../../package.json';
 
-interface PromptPreset {
-  id: string;
-  name: string;
-  description: string;
-  prompt: string;
-}
-
-const PROMPT_PRESETS: PromptPreset[] = [
-  {
-    id: 'none',
-    name: 'プロンプトなし',
-    description: 'デフォルトの文字起こし',
-    prompt: ''
-  },
-  {
-    id: 'filler-removal',
-    name: 'フィラー除去',
-    description: '「えー」「あのー」などのフィラーを除去',
-    prompt: 'フィラー（「えー」「あのー」「その」「まあ」など）を除去し、明瞭で読みやすい文章に変換してください。'
-  },
-  {
-    id: 'clean-formal',
-    name: '整理・敬語化',
-    description: 'フィラー除去 + 敬語への変換',
-    prompt: 'フィラーを除去し、敬語を使った丁寧で読みやすい文章に整理して変換してください。'
-  },
-  {
-    id: 'desu-masu',
-    name: 'です・ます調に変換',
-    description: '文末を「です・ます」調に統一',
-    prompt: '文章を「です・ます」調（丁寧語）に変換してください。フィラーも除去してください。'
-  },
-  {
-    id: 'da-dearu',
-    name: 'だ・である調に変換',
-    description: '文末を「だ・である」調に統一',
-    prompt: '文章を「だ・である」調（常体）に変換してください。フィラーも除去してください。'
-  }
-];
-
-interface TranscriptionMessage {
-  type: 'transcription';
-  text: string;
-  item_id: string;
-}
-
-interface ErrorMessage {
-  type: 'error' | 'transcription_error';
-  error: string;
-  item_id?: string;
-}
-
-interface StatusMessage {
-  type: 'ready' | 'speech_started' | 'speech_stopped';
-  message?: string;
-  audio_start_ms?: number;
-  audio_end_ms?: number;
-  item_id?: string;
-  marker?: string | null;
-  silence_gap_ms?: number;
-  silence_threshold_ms?: number;
-}
-
-interface DummyAudioMessage {
-  type: 'dummy_audio_started' | 'dummy_audio_completed';
-  filename?: string;
-  totalSeconds?: number;
-}
-
-interface DummyAudioProgressMessage {
-  type: 'dummy_audio_progress';
-  currentSeconds: number;
-  totalSeconds: number;
-  progress: number;
-}
-
-interface TranscriptionDeltaMessage {
-  type: 'transcription_delta';
-  delta: string;
-  item_id: string;
-}
-
-interface ParagraphBreakMessage {
-  type: 'paragraph_break';
-  marker: string;
-}
-
-interface AutoProofreadMessage {
-  type: 'auto_proofread_started' | 'auto_proofread_completed' | 'auto_proofread_error';
-  paragraphs?: number;
-  chars?: number;
-  error?: string;
-}
-
-type WebSocketMessage = TranscriptionMessage | ErrorMessage | StatusMessage | DummyAudioMessage | DummyAudioProgressMessage | TranscriptionDeltaMessage | ParagraphBreakMessage | AutoProofreadMessage;
-
-// ===== 遅延測定（タブ音声キャプチャ → 文字起こし表示） =====
-// 測定方式: 送信した音声のバッファ位置(ms)とキャプチャ時刻(performance.now)を元帳に記録し、
-// OpenAIのspeech_startedが返すaudio_start_ms（バッファ上の発話開始位置）から
-// 発話開始のキャプチャ時刻を逆引きする。クライアント完結なのでサーバとのクロック同期は不要。
-
-// 送信済み音声チャンクのバッファ位置範囲とキャプチャ時刻
-interface SentAudioLedgerEntry {
-  startMs: number;    // OpenAIバッファ上の開始位置（送信音声の累積ms）
-  endMs: number;      // 同 終了位置
-  capturedAt: number; // チャンク末尾のキャプチャ時刻（performance.now）
-}
-
-// 発話（音声区間）ごとの遅延測定記録
-interface LatencyRecord {
-  itemId: string;
-  basis: 'vad' | 'local'; // 発話開始時刻の根拠: OpenAI VAD位置の逆引き / クライアント側の有音立ち上がり検出
-  speechCapturedAt: number;       // 発話開始音声のキャプチャ時刻
-  speechEndCapturedAt?: number;   // 発話終了音声のキャプチャ時刻
-  vadDetectMs?: number;           // 発話開始 → speech_started受信
-  firstDeltaMs?: number;          // 発話開始 → 初回transcription_delta受信
-  completedMs?: number;           // 発話開始 → 確定テキスト受信
-  completedFromSpeechEndMs?: number; // 発話終了 → 確定テキスト受信
-  renderMs?: number;              // 発話開始 → 確定テキスト描画完了
-  text?: string;                  // 確定テキスト（先頭のみ）
-}
-
-const formatLatencyMs = (value: number | undefined): string =>
-  typeof value === 'number' ? `${value.toFixed(0)}ms` : '-';
-
-const averageLatencyMs = (records: LatencyRecord[], pick: (r: LatencyRecord) => number | undefined): string => {
-  const values = records.map(pick).filter((v): v is number => typeof v === 'number');
-  if (values.length === 0) return '-';
-  return `${(values.reduce((sum, v) => sum + v, 0) / values.length).toFixed(0)}ms`;
-};
-
-// ===== ローカルドラフト認識（ChromeオンデバイスWeb Speech API） =====
+// ===== オンデバイス認識（ChromeオンデバイスWeb Speech API） =====
 // Chrome 139+のオンデバイス認識（processLocally）とChrome 135+のMediaStreamTrack入力
 // （start(track)）を併用し、話している最中から粗いドラフトを表示する。
 // 実験的APIでlib.domに型がないため、必要最小限の型を自前で宣言する。
@@ -184,29 +52,28 @@ const getSpeechRecognitionCtor = (): LocalSpeechRecognitionStatic | null => {
 
 type LocalAsrStatus = 'checking' | 'available' | 'downloadable' | 'downloading' | 'unavailable' | 'unsupported';
 
+// オンデバイス認識テキストを共有ドキュメントへ中継するWebSocketから受け取るメッセージ。
+// （自動校正の進捗通知のみ。OpenAI音声認識経路は撤去済み）
+interface AutoProofreadMessage {
+  type: 'auto_proofread_started' | 'auto_proofread_completed' | 'auto_proofread_error';
+  paragraphs?: number;
+  chars?: number;
+  error?: string;
+}
+
+type WebSocketMessage = AutoProofreadMessage;
+
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | AudioWorkletNode | null>(null);
   const recordingStateRef = useRef<boolean>(false);
 
-  // Hocuspocus client refs for test functionality
+  // Hocuspocus client refs（共有ドキュメント同期用）
   const hocuspocusProviderRef = useRef<HocuspocusProviderType | null>(null);
   const hocuspocusDocRef = useRef<YDocType | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const yjsModuleRef = useRef<any>(null);
 
   const [text, setText] = useState("");
-  const textRef = useRef<string>(""); // Keep latest text value for logging
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null); // 文字起こし結果のスクロールボックス
   const transcriptAtBottomRef = useRef<boolean>(true); // ユーザーが最下部付近にいるか（自動追従の判定用）
-  const [pendingText, setPendingText] = useState(""); // Recognition in progress text
-  const pendingItemIdRef = useRef<string | null>(null); // Track current pending item_id
-
-  // Update textRef when text changes
-  useEffect(() => {
-    textRef.current = text;
-  }, [text]);
 
   // Initialize session ID on component mount
   // リロードのたびにセッションIDが変わると校正画面とのペアリングが切れるため、
@@ -238,25 +105,13 @@ export default function RealtimeClient() {
   }, []); // Empty dependency array - runs only once on mount
 
   const [isRecording, setIsRecording] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false); // 接続中の状態
+  const [isConnected, setIsConnected] = useState(false); // 共有ドキュメント中継WebSocketの接続状態
   const [error, setError] = useState<string | null>(null);
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [audioSource, setAudioSource] = useState<'microphone' | 'tab-capture'>('tab-capture');
   const tabCaptureStreamRef = useRef<MediaStream | null>(null);
-  const [selectedPromptPreset, setSelectedPromptPreset] = useState<string>('none');
-  const [customPrompt, setCustomPrompt] = useState<string>('');
-  const [promptMode, setPromptMode] = useState<'preset' | 'custom'>('preset');
-  const [transcriptionModel, setTranscriptionModel] = useState<string>('gpt-4o-transcribe');
-  const [speechBreakDetection, setSpeechBreakDetection] = useState<boolean>(true);
-  const [breakMarker, setBreakMarker] = useState<string>('↩️'); // デフォルト: 改行絵文字
-  const [vadEnabled, setVadEnabled] = useState<boolean>(true); // VAD有効/無効（デフォルト:有効）
-  const [vadThreshold, setVadThreshold] = useState<number>(0.5);
-  const [vadSilenceDuration, setVadSilenceDuration] = useState<number>(600); // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間（推奨: 500-700ms）
-  const [vadPrefixPadding, setVadPrefixPadding] = useState<number>(300);
-  const [paragraphBreakThreshold, setParagraphBreakThreshold] = useState<number>(2500); // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入（推奨: 2000-2500ms）
+  const [forceLineBreakAtPeriod, setForceLineBreakAtPeriod] = useState<boolean>(true); // 句点で強制改行（デフォルト: 有効）
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [sessionIdInput, setSessionIdInput] = useState<string>('');
 
@@ -276,46 +131,21 @@ export default function RealtimeClient() {
       }
     }
   }, [currentSessionId]);
-  const [isDummyAudioSending, setIsDummyAudioSending] = useState<boolean>(false);
-  const [dummyAudioProgress, setDummyAudioProgress] = useState<{ currentSeconds: number; totalSeconds: number } | null>(null);
-  const [localStorageRecordings, setLocalStorageRecordings] = useState<AudioRecording[]>([]);
-  const [selectedRecordingId, setSelectedRecordingId] = useState<string>('');
-  const [dummySendInterval, setDummySendInterval] = useState<number>(50); // Dummy audio send interval in ms
-  const [audioBufferSize, setAudioBufferSize] = useState<number>(2048); // ScriptProcessor buffer size (256, 512, 1024, 2048, 4096, 8192, 16384) 2048=約43ms（低遅延）
-  const [batchMultiplier, setBatchMultiplier] = useState<number>(1); // 一括送信する際のバッチ数（1=即時送信が最も低遅延。8だと約1365msの送信待ち遅延が発生する）
-  const accumulatedAudioRef = useRef<Int16Array[]>([]); // 蓄積用バッファ
-  const [skipSilentChunks, setSkipSilentChunks] = useState<boolean>(false); // 無音チャンクをスキップするかどうか（デフォルト:無効=高精度）
-  const [forceLineBreakAtPeriod, setForceLineBreakAtPeriod] = useState<boolean>(true); // 句点で強制改行（デフォルト: 有効）
   const [recordingElapsedTime, setRecordingElapsedTime] = useState<number>(0);
   const recordingStartTimeRef = useRef<number>(0);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const autoDisconnectTimerRef = useRef<NodeJS.Timeout | null>(null); // 自動切断タイマー
-  const tabCaptureCommitTimerRef = useRef<NodeJS.Timeout | null>(null); // タブキャプチャ用定期コミットタイマー
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [autoDisconnectDelay, setAutoDisconnectDelay] = useState<number>(30); // 自動切断までの秒数（デフォルト30秒）- Story-2でUI設定を追加予定
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
   const [activeSessions, setActiveSessions] = useState<{sessionId: string, connectionCount: number}[]>([]);
   const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(false);
-  const [settingsUpdateMessage, setSettingsUpdateMessage] = useState<string>(''); // 設定更新のフィードバックメッセージ
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
-  const [rewriteModel, setRewriteModel] = useState<string>('gpt-4.1-mini'); // AI再編モデル
   const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
   const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
+  // 共同校正画面でのAI再編に使用するモデル（このモデル選択UIは撤去し、サーバ既定に従う）
+  const rewriteModel = 'gpt-4.1-mini';
 
-  // ===== 遅延測定用の状態 =====
-  const sentAudioLedgerRef = useRef<SentAudioLedgerEntry[]>([]); // 送信済み音声の位置元帳
-  const sentAudioTotalMsRef = useRef<number>(0); // 送信済み音声の累積ms（OpenAIバッファ位置と一致）
-  const accumulatedMetaRef = useRef<Array<{ samples: number; capturedAt: number }>>([]); // 蓄積中チャンクのキャプチャ時刻
-  const voiceOnsetQueueRef = useRef<Array<{ positionMs: number; capturedAt: number }>>([]); // 無音→有音の立ち上がり候補（VADイベントが来ない経路のフォールバック）
-  const lastChunkVoicedRef = useRef<boolean>(false); // 直前チャンクが有音だったか（立ち上がり検出用）
-  const utteranceMapRef = useRef<Map<string, LatencyRecord>>(new Map()); // item_id → 測定中の発話記録
-  const [latencyRecords, setLatencyRecords] = useState<LatencyRecord[]>([]); // 確定した測定記録（UI表示用）
-
-  // ===== ローカル認識（オンデバイス）用の状態 =====
-  const [recognitionEngine, setRecognitionEngine] = useState<'local' | 'openai'>('local'); // 主認識エンジン（local=オンデバイス認識のみ・OpenAIへ音声を送らない）
-  const primaryStreamRef = useRef<MediaStream | null>(null); // ローカル主認識モードで取得したストリーム（停止用）
-  const [localDraftEnabled, setLocalDraftEnabled] = useState<boolean>(true); // OpenAIモード時のドラフト表示ON/OFF
+  // ===== オンデバイス認識用の状態 =====
+  const primaryStreamRef = useRef<MediaStream | null>(null); // 主認識モードで取得したストリーム（停止用）
   const [localAsrStatus, setLocalAsrStatus] = useState<LocalAsrStatus>('checking'); // ja-JPオンデバイス認識の利用可否
   const localRecognitionRef = useRef<LocalSpeechRecognition | null>(null);
   const localAsrRestartTimerRef = useRef<NodeJS.Timeout | null>(null); // 自動再起動用タイマー
@@ -330,7 +160,6 @@ export default function RealtimeClient() {
   const lastPendingSentAtRef = useRef<number>(0); // local_pending送信のスロットリング用
   const draftFinalsRef = useRef<Array<{ text: string; finalizedAt: number }>>([]); // 未置換のローカル確定分
   const draftInterimRef = useRef<string>(''); // 認識途中のテキスト
-  const draftSuppressUntilRef = useRef<number>(0); // OpenAI確定直後に届くローカル確定を抑制する期限
   const [draftText, setDraftText] = useState<string>(''); // 表示用（確定分+interim）
 
   // 文字起こし結果の自動追従スクロール
@@ -341,71 +170,9 @@ export default function RealtimeClient() {
     if (el && transcriptAtBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [text, pendingText, draftText]);
+  }, [text, draftText]);
 
-  // Get current prompt for transcription
-  const getCurrentPrompt = useCallback((): string => {
-    let basePrompt = '';
-    
-    if (promptMode === 'custom') {
-      basePrompt = customPrompt;
-    } else {
-      const preset = PROMPT_PRESETS.find(p => p.id === selectedPromptPreset);
-      basePrompt = preset?.prompt || '';
-    }
-
-    return basePrompt;
-  }, [promptMode, customPrompt, selectedPromptPreset]);
-
-
-  // Audio processing utility functions
-  const floatTo16BitPCM = useCallback((float32Array: Float32Array): Int16Array => {
-    const int16Array = new Int16Array(float32Array.length);
-    for (let i = 0; i < float32Array.length; i++) {
-      const s = Math.max(-1, Math.min(1, float32Array[i]));
-      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return int16Array;
-  }, []);
-
-  const arrayBufferToBase64 = useCallback((buffer: ArrayBuffer): string => {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  }, []);
-
-  // 遅延測定: バッファ位置(ms)から該当音声のキャプチャ時刻を元帳から逆引きする。
-  // チャンク末尾のキャプチャ時刻から位置差分を引いて線形補間する
-  const captureTimeAtPosition = useCallback((positionMs: number): number | null => {
-    const ledger = sentAudioLedgerRef.current;
-    for (let i = ledger.length - 1; i >= 0; i--) {
-      const entry = ledger[i];
-      if (positionMs >= entry.startMs && positionMs <= entry.endMs) {
-        return entry.capturedAt - (entry.endMs - positionMs);
-      }
-    }
-    return null; // 元帳範囲外（ダミー音声併用などで位置がズレた場合は測定しない）
-  }, []);
-
-  // 遅延測定: item_idに対応する発話記録を取得。VADイベントが来ていない経路
-  // （タブキャプチャの定期コミット等）はローカル有音立ち上がりを発話開始として代用する
-  const resolveUtteranceRecord = useCallback((itemId: string | undefined): LatencyRecord | undefined => {
-    if (!itemId) return undefined;
-    let record = utteranceMapRef.current.get(itemId);
-    if (!record) {
-      const onset = voiceOnsetQueueRef.current.shift();
-      if (onset) {
-        record = { itemId, basis: 'local', speechCapturedAt: onset.capturedAt };
-        utteranceMapRef.current.set(itemId, record);
-      }
-    }
-    return record;
-  }, []);
-
-  // ===== ローカルドラフト認識 =====
+  // ===== オンデバイス認識 =====
 
   // マウント時にja-JPオンデバイス認識の利用可否を確認
   useEffect(() => {
@@ -450,7 +217,7 @@ export default function RealtimeClient() {
     setDraftText(finals + draftInterimRef.current);
   }, []);
 
-  // ローカルドラフト認識を停止してドラフトをクリア
+  // オンデバイス認識を停止してドラフトをクリア
   const stopLocalDraftRecognition = useCallback(() => {
     if (localAsrRestartTimerRef.current) {
       clearTimeout(localAsrRestartTimerRef.current);
@@ -467,7 +234,7 @@ export default function RealtimeClient() {
     localRecognitionRef.current = null; // 先にnull化してonendの自動再起動を抑止する
     if (rec) {
       try { rec.abort(); } catch { /* already stopped */ }
-      console.log('[LocalDraft] 🛑 ローカル認識を停止');
+      console.log('[LocalASR] 🛑 オンデバイス認識を停止');
     }
     draftFinalsRef.current = [];
     draftInterimRef.current = '';
@@ -478,10 +245,9 @@ export default function RealtimeClient() {
     }
   }, []);
 
-  // ローカル認識を起動（録音開始時に音声ストリームを直接入力する）
-  // primary=true: 主認識モード。確定テキストを本文に直接追加し、共有ドキュメントへ転送する
-  // primary=false: ドラフトモード。薄色表示し、OpenAI確定テキストで置き換える
-  const startLocalDraftRecognition = useCallback((stream: MediaStream, primary: boolean) => {
+  // オンデバイス認識を起動（録音開始時に音声ストリームを直接入力する）。
+  // 確定テキストを本文に直接追加し、共有ドキュメントへ転送する。未確定は薄色表示する
+  const startLocalDraftRecognition = useCallback((stream: MediaStream) => {
     const ctor = getSpeechRecognitionCtor();
     const track = stream.getAudioTracks()[0];
     if (!ctor || !track) return;
@@ -528,24 +294,16 @@ export default function RealtimeClient() {
             const result = event.results[i];
             const transcript = result[0]?.transcript || '';
             if (result.isFinal) {
-              if (primary) {
-                // 結果インデックスごとのコミット済み文字数を参照し、未コミットの残りだけを確定する。
-                // 文字列照合やリセットを行わないため、同じテキストの重複コミットは構造的に起きない
-                const done = committedByResultRef.current.get(i) || 0;
-                const remainder = transcript.length > done ? transcript.slice(done) : '';
-                commitChunk(remainder, done > 0, true);
-                committedByResultRef.current.set(i, transcript.length);
-                if (lastInterimResultRef.current?.index === i) {
-                  lastInterimResultRef.current = null;
-                }
-                console.log(`[LocalASR] ✅ 確定(result#${i}): ${transcript}`);
-              } else if (performance.now() < draftSuppressUntilRef.current) {
-                // OpenAI確定の直後に届いたローカル確定は、置き換え済み発話分とみなして破棄
-                console.log(`[LocalDraft] （置き換え済みとして破棄）: ${transcript}`);
-              } else {
-                draftFinalsRef.current.push({ text: transcript, finalizedAt: performance.now() });
-                console.log(`[LocalDraft] ローカル確定: ${transcript}`);
+              // 結果インデックスごとのコミット済み文字数を参照し、未コミットの残りだけを確定する。
+              // 文字列照合やリセットを行わないため、同じテキストの重複コミットは構造的に起きない
+              const done = committedByResultRef.current.get(i) || 0;
+              const remainder = transcript.length > done ? transcript.slice(done) : '';
+              commitChunk(remainder, done > 0, true);
+              committedByResultRef.current.set(i, transcript.length);
+              if (lastInterimResultRef.current?.index === i) {
+                lastInterimResultRef.current = null;
               }
+              console.log(`[LocalASR] ✅ 確定(result#${i}): ${transcript}`);
             } else {
               // 未確定: コミット済み分を除いた残りだけを表示・配信の対象にする
               const done = committedByResultRef.current.get(i) || 0;
@@ -565,9 +323,9 @@ export default function RealtimeClient() {
           } else {
             interimStartedAtRef.current = null;
           }
-          // 主認識モード: 未確定テキストも共有ドキュメント（校正画面）へ随時配信する
+          // 未確定テキストも共有ドキュメント（校正画面）へ随時配信する。
           // interimの発火は高頻度なため200msでスロットリングする（クリア（空文字）は即時送信）
-          if (primary && websocketRef.current?.readyState === WebSocket.OPEN) {
+          if (websocketRef.current?.readyState === WebSocket.OPEN) {
             const nowMs = performance.now();
             if (displayTail === '' || nowMs - lastPendingSentAtRef.current > 200) {
               websocketRef.current.send(JSON.stringify({ type: 'local_pending', text: displayTail }));
@@ -577,7 +335,7 @@ export default function RealtimeClient() {
         };
 
         rec.onerror = (event) => {
-          console.warn('[LocalDraft] 認識エラー:', event.error);
+          console.warn('[LocalASR] 認識エラー:', event.error);
         };
 
         rec.onend = () => {
@@ -591,9 +349,9 @@ export default function RealtimeClient() {
                   lastInterimResultRef.current = null;
                   interimStartedAtRef.current = null;
                   rec.start(track);
-                  console.log('[LocalDraft] 🔄 ローカル認識を自動再起動');
+                  console.log('[LocalASR] 🔄 ローカル認識を自動再起動');
                 } catch (err) {
-                  console.warn('[LocalDraft] 自動再起動失敗:', err);
+                  console.warn('[LocalASR] 自動再起動失敗:', err);
                 }
               }
             }, 250);
@@ -602,7 +360,7 @@ export default function RealtimeClient() {
 
         rec.start(track); // MediaStreamTrack入力（Chrome 135+）。タブ音声を直接認識できる
         localRecognitionRef.current = rec;
-        console.log(`[LocalASR] 🎙️ ローカル認識を開始（${primary ? '主認識' : 'ドラフト'}モード・オンデバイス・ja-JP）`);
+        console.log('[LocalASR] 🎙️ オンデバイス認識を開始（ja-JP）');
       } catch (err) {
         console.warn('[LocalASR] 起動失敗:', err);
       }
@@ -613,7 +371,7 @@ export default function RealtimeClient() {
     // 未確定（interim）が一定時間続いたら、バックトラックで変わりやすい末尾を残して
     // 安定した前半部分を自前で確定する。認識は止めないので音声の欠落は発生しない。
     // （stop()による強制確定はオンデバイス認識では仮説を破棄してしまうため使えない）
-    if (primary && localForceFinalizeSec > 0) {
+    if (localForceFinalizeSec > 0) {
       const TAIL_GUARD_CHARS = 12; // 揺れやすい末尾は確定しない
       const MIN_COMMIT_CHARS = 4;  // 細切れ確定を避ける最小文字数
       forceFinalizeTimerRef.current = setInterval(() => {
@@ -673,6 +431,9 @@ export default function RealtimeClient() {
   }, [selectedDeviceId]);
 
   // WebSocket connection management - returns Promise for async flow
+  // オンデバイス認識テキストを共有ドキュメントへ中継するWebSocket接続を確立する。
+  // この接続はサーバ経由で local_transcription / local_pending を共有ドキュメントへ転送する
+  // 中継チャネルとしてのみ使う（OpenAIへ音声を送る経路は撤去済み）
   const connectWebSocket = useCallback((): Promise<void> => {
     return new Promise((resolve, reject) => {
       if (websocketRef.current?.readyState === WebSocket.OPEN) {
@@ -681,424 +442,98 @@ export default function RealtimeClient() {
         return;
       }
 
-      setIsConnecting(true);
-      const currentPrompt = getCurrentPrompt();
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
       const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws`;
-      console.log('[WebSocket] 🔗 Connecting to:', wsUrl);
-      console.log('[WebSocket] Using transcription prompt:', currentPrompt || '(none)');
+      console.log('[WebSocket] 🔗 Connecting (relay channel) to:', wsUrl);
       const ws = new WebSocket(wsUrl);
       websocketRef.current = ws;
 
       ws.onopen = () => {
-        console.log('[WebSocket] ✅ Connected successfully');
+        console.log('[WebSocket] ✅ Connected successfully (relay channel)');
         setIsConnected(true);
-        setIsConnecting(false);
         setError(null);
 
-        // 遅延測定の状態をリセット
-        // OpenAIセッションはWS接続ごとに作られるため、バッファ位置の基準もここで揃える
-        sentAudioLedgerRef.current = [];
-        sentAudioTotalMsRef.current = 0;
-        accumulatedMetaRef.current = [];
-        voiceOnsetQueueRef.current = [];
-        utteranceMapRef.current.clear();
-        lastChunkVoicedRef.current = false;
-      
-      // Send session ID to server if available
-      if (currentSessionId) {
+        // セッションIDをサーバーへ通知（共有ドキュメントの宛先決定に使う）
+        if (currentSessionId) {
+          ws.send(JSON.stringify({
+            type: 'set_session_id',
+            sessionId: currentSessionId
+          }));
+          console.log('[WebSocket] 📋 Sent session ID to server:', currentSessionId);
+        }
+
+        // 句点で強制改行設定をサーバーへ通知
         ws.send(JSON.stringify({
-          type: 'set_session_id',
-          sessionId: currentSessionId
+          type: 'set_force_line_break',
+          enabled: forceLineBreakAtPeriod
         }));
-        console.log('[WebSocket] 📋 Sent session ID to server:', currentSessionId);
-      }
-      
-      // Send prompt configuration to server
-      if (currentPrompt) {
+        console.log('[WebSocket] 📝 Sent force line break at period:', forceLineBreakAtPeriod);
+
+        // 自動校正設定を送信（set_session_id送信後である必要がある）
         ws.send(JSON.stringify({
-          type: 'set_prompt',
-          prompt: currentPrompt
+          type: 'set_auto_proofread',
+          enabled: autoProofread,
+          model: rewriteModel
         }));
-        console.log('[WebSocket] 📝 Sent transcription prompt to server');
-      }
-      
-      // Send transcription model configuration to server
-      ws.send(JSON.stringify({
-        type: 'set_transcription_model',
-        model: transcriptionModel
-      }));
-      console.log('[WebSocket] 🎤 Sent transcription model to server:', transcriptionModel);
-      
-      // Send speech break detection settings to server
-      ws.send(JSON.stringify({
-        type: 'set_speech_break_detection',
-        enabled: speechBreakDetection,
-        marker: breakMarker
-      }));
-      console.log('[WebSocket] 🔸 Sent speech break detection settings:', { enabled: speechBreakDetection, marker: breakMarker });
-      
-      // Send VAD parameters and paragraph break threshold to server
-      // VAD発話終了判定時間: OpenAIがspeech_stoppedを発火する無音時間
-      // パラグラフ区切り判定時間: この時間以上の無音でマーカー挿入（VADとは独立）
-      ws.send(JSON.stringify({
-        type: 'set_vad_params',
-        enabled: vadEnabled,
-        threshold: vadThreshold,
-        silence_duration_ms: vadSilenceDuration,
-        prefix_padding_ms: vadPrefixPadding,
-        paragraph_break_threshold_ms: paragraphBreakThreshold
-      }));
-      console.log('[WebSocket] 🎛️ Sent VAD parameters:', { enabled: vadEnabled, threshold: vadThreshold, silence_duration_ms: vadSilenceDuration, prefix_padding_ms: vadPrefixPadding, paragraph_break_threshold_ms: paragraphBreakThreshold });
-
-      // Calculate and send commit threshold based on buffer settings
-      // Formula: (audioBufferSize * batchMultiplier / 24000) * 1000 milliseconds
-      const commitThresholdMs = Math.floor((audioBufferSize * batchMultiplier / 24000) * 1000);
-      ws.send(JSON.stringify({
-        type: 'set_commit_threshold',
-        threshold_ms: commitThresholdMs,
-        buffer_size: audioBufferSize,
-        batch_multiplier: batchMultiplier
-      }));
-      console.log('[WebSocket] ⏱️ Sent commit threshold:', commitThresholdMs, 'ms (buffer:', audioBufferSize, 'samples × batch:', batchMultiplier, ')');
-
-      // Send force line break at period setting
-      ws.send(JSON.stringify({
-        type: 'set_force_line_break',
-        enabled: forceLineBreakAtPeriod
-      }));
-      console.log('[WebSocket] 📝 Sent force line break at period:', forceLineBreakAtPeriod);
-
-      // 自動校正設定を送信（set_session_id送信後である必要がある）
-      ws.send(JSON.stringify({
-        type: 'set_auto_proofread',
-        enabled: autoProofread,
-        model: rewriteModel
-      }));
-      console.log('[WebSocket] 🪄 Sent auto proofread setting:', autoProofread);
+        console.log('[WebSocket] 🪄 Sent auto proofread setting:', autoProofread);
 
         // Promiseを解決して接続完了を通知
         resolve();
       };
 
       ws.onmessage = (event) => {
-      try {
-        const message: WebSocketMessage = JSON.parse(event.data);
-        console.log('[WebSocket] 📨 Received message:', message.type, message);
-        
-        switch (message.type) {
-          case 'ready':
-            console.log('[Realtime API] 🚀 API ready for audio streaming');
-            break;
-            
-          case 'transcription':
-            console.log('[Transcription] 📝 Received text:', message.text);
-            // 遅延測定: 確定テキスト受信と描画完了の時刻を記録
-            {
-              const record = resolveUtteranceRecord(message.item_id);
-              if (record) {
-                const receivedAt = performance.now();
-                record.completedMs = receivedAt - record.speechCapturedAt;
-                if (record.speechEndCapturedAt !== undefined) {
-                  record.completedFromSpeechEndMs = receivedAt - record.speechEndCapturedAt;
-                }
-                record.text = (message.text || '').slice(0, 30);
-                // まず受信時点の記録をパネルに反映し、描画完了時刻は後から追記する
-                // （タブ非表示中はrequestAnimationFrameが止まるため2段階更新にする）
-                utteranceMapRef.current.delete(record.itemId);
-                setLatencyRecords(prev => [...prev.slice(-19), { ...record }]);
-                // 2フレーム後 = setTextの結果が描画された後の時刻でrenderMsを確定する
-                requestAnimationFrame(() => requestAnimationFrame(() => {
-                  record.renderMs = performance.now() - record.speechCapturedAt;
-                  console.log(
-                    `[Latency] ✅ item=${record.itemId} basis=${record.basis} | ` +
-                    `VAD検出=${formatLatencyMs(record.vadDetectMs)} ` +
-                    `初回テキスト=${formatLatencyMs(record.firstDeltaMs)} ` +
-                    `確定=${formatLatencyMs(record.completedMs)} ` +
-                    `発話終了→確定=${formatLatencyMs(record.completedFromSpeechEndMs)} ` +
-                    `描画完了=${formatLatencyMs(record.renderMs)}`
-                  );
-                  setLatencyRecords(prev => prev.map(r => (r.itemId === record.itemId ? { ...record } : r)));
-                }));
-              }
-              // ローカルドラフトの置き換え: 確定到着時点までのローカル確定分とinterimを破棄し、
-              // 直後500msに遅れて届くローカル確定も同一発話分とみなして抑制する。
-              // （v1の単純方式: ローカル確定とOpenAI確定の到着順が前後する競合は完全には防げない）
-              if (draftFinalsRef.current.length > 0 || draftInterimRef.current) {
-                draftFinalsRef.current = [];
-                draftInterimRef.current = '';
-                draftSuppressUntilRef.current = performance.now() + 500;
-                updateDraftText();
-              }
-            }
-            // Server already applies force line break processing
-            setText(prev => prev + message.text + ' ');
-            // Clear pending text only if it matches the completed item
-            if (pendingItemIdRef.current === message.item_id || !message.item_id) {
-              setPendingText('');
-              pendingItemIdRef.current = null;
-            }
-            break;
+        try {
+          const message: WebSocketMessage = JSON.parse(event.data);
+          console.log('[WebSocket] 📨 Received message:', message.type, message);
 
-          case 'transcription_delta':
-            // Accumulate partial transcription for "recognition in progress" display
-            console.log('[Transcription Delta] 🔄 Partial text:', message.delta);
-            // 遅延測定: 発話ごとの初回delta受信時刻を記録
-            {
-              const record = resolveUtteranceRecord(message.item_id);
-              if (record && record.firstDeltaMs === undefined) {
-                record.firstDeltaMs = performance.now() - record.speechCapturedAt;
-                console.log(`[Latency] 🔄 発話開始→初回テキスト: ${formatLatencyMs(record.firstDeltaMs)} (item=${record.itemId}, basis=${record.basis})`);
-              }
-            }
-            // Track the item_id for this pending transcription
-            if (message.item_id && pendingItemIdRef.current !== message.item_id) {
-              // New item started, reset pending text
-              setPendingText(message.delta);
-              pendingItemIdRef.current = message.item_id;
-            } else {
-              // Continue accumulating for same item
-              setPendingText(prev => prev + message.delta);
-            }
-            break;
+          switch (message.type) {
+            case 'auto_proofread_started':
+              setAutoProofreadStatus(`🪄 校正中...（${message.paragraphs ?? '-'}段落・${message.chars ?? '-'}文字）`);
+              break;
 
-          case 'dummy_audio_started':
-            console.log('[Dummy Audio] 🎵 Started sending dummy audio:', message.filename, 'total:', message.totalSeconds, 'seconds');
-            setIsDummyAudioSending(true);
-            setDummyAudioProgress({ currentSeconds: 0, totalSeconds: message.totalSeconds || 0 });
-            break;
+            case 'auto_proofread_completed':
+              setAutoProofreadStatus(`✅ 校正完了: ${message.paragraphs ?? '-'}段落に整理（${new Date().toLocaleTimeString('ja-JP')}）`);
+              break;
 
-          case 'dummy_audio_progress':
-            console.log('[Dummy Audio] 📊 Progress:', message.currentSeconds.toFixed(2), '/', message.totalSeconds.toFixed(2), 'seconds');
-            setDummyAudioProgress({ currentSeconds: message.currentSeconds, totalSeconds: message.totalSeconds });
-            break;
+            case 'auto_proofread_error':
+              setAutoProofreadStatus(`❌ 校正エラー: ${message.error ?? '不明なエラー'}`);
+              break;
 
-          case 'dummy_audio_completed':
-            console.log('[Dummy Audio] ✅ Dummy audio processing completed');
-
-            // Log final transcription text
-            console.log('[Dummy Audio] 📝 Final transcription text:');
-            console.log('====== START OF TRANSCRIPTION ======');
-            console.log(text);
-            console.log('====== END OF TRANSCRIPTION ======');
-            console.log(`[Dummy Audio] 📊 Total characters: ${text.length}, Total words: ${text.split(/\s+/).filter(word => word.length > 0).length}`);
-
-            setIsDummyAudioSending(false);
-            setDummyAudioProgress(null);
-            // Stop recording state when dummy audio is completed
-            setIsRecording(false);
-            setPendingText(''); // Clear pending text on completion
-            break;
-            
-          case 'speech_started':
-            setIsSpeaking(true);
-            console.log('[Speech Detection] 🎤 Speech started');
-            // 遅延測定: audio_start_ms（バッファ上の発話開始位置）からキャプチャ時刻を逆引き
-            if (typeof message.audio_start_ms === 'number' && message.item_id) {
-              const receivedAt = performance.now();
-              const capturedAt = captureTimeAtPosition(message.audio_start_ms);
-              if (capturedAt !== null) {
-                utteranceMapRef.current.set(message.item_id, {
-                  itemId: message.item_id,
-                  basis: 'vad',
-                  speechCapturedAt: capturedAt,
-                  vadDetectMs: receivedAt - capturedAt,
-                });
-                console.log(`[Latency] 🎤 発話開始→VAD検出: ${formatLatencyMs(receivedAt - capturedAt)} (item=${message.item_id}, audio_start_ms=${message.audio_start_ms})`);
-                // この発話に属するローカル立ち上がり候補は消費済みとして破棄
-                const startMs = message.audio_start_ms;
-                voiceOnsetQueueRef.current = voiceOnsetQueueRef.current.filter(o => o.positionMs > startMs);
-              }
-            }
-            break;
-            
-          case 'speech_stopped':
-            setIsSpeaking(false);
-            const silenceGapMs = message.silence_gap_ms || 0;
-            const silenceThresholdMs = message.silence_threshold_ms || vadSilenceDuration;
-            console.log(`[Speech Detection] 🔇 Speech stopped (silence: ${silenceGapMs}ms, threshold: ${silenceThresholdMs}ms)`);
-
-            // 遅延測定: 発話終了位置（audio_end_ms）のキャプチャ時刻を記録
-            if (typeof message.audio_end_ms === 'number' && message.item_id) {
-              const record = utteranceMapRef.current.get(message.item_id);
-              const endCapturedAt = captureTimeAtPosition(message.audio_end_ms);
-              if (record && endCapturedAt !== null) {
-                record.speechEndCapturedAt = endCapturedAt;
-              }
-            }
-
-            // Insert marker if speech break detection is enabled (for local display)
-            // Only insert if actual silence gap exceeds threshold
-            if (message.marker && silenceGapMs >= silenceThresholdMs) {
-              // ⏎は改行のみ追加（改行記号自体なのでマーカー表示不要）
-              // それ以外（↩️, 🔄, 📝など）はマーカー+改行
-              if (message.marker === '⏎') {
-                setText(prev => prev + '\n');
-                console.log(`[Speech Break] Added newline (silence: ${silenceGapMs}ms >= threshold: ${silenceThresholdMs}ms)`);
-              } else {
-                setText(prev => prev + ' ' + message.marker + '\n');
-                console.log(`[Speech Break] Added marker '${message.marker}' (silence: ${silenceGapMs}ms >= threshold: ${silenceThresholdMs}ms)`);
-              }
-            } else if (message.marker) {
-              // Silence gap below threshold - skip marker insertion (waiting for delayed paragraph_break)
-              console.log(`[Speech Break] ⏳ Waiting for delayed paragraph break (${silenceGapMs}ms < ${silenceThresholdMs}ms)`);
-            }
-            break;
-
-          case 'paragraph_break':
-            // Delayed paragraph break from server (after silence threshold reached)
-            if (message.marker) {
-              // ⏎は改行のみ追加（改行記号自体なのでマーカー表示不要）
-              // それ以外（↩️, 🔄, 📝など）はマーカー+改行
-              if (message.marker === '⏎') {
-                setText(prev => prev + '\n');
-                console.log(`[Paragraph Break] Added delayed newline`);
-              } else {
-                setText(prev => prev + ' ' + message.marker + '\n');
-                console.log(`[Paragraph Break] Added delayed marker '${message.marker}'`);
-              }
-            }
-            break;
-
-          case 'auto_proofread_started':
-            setAutoProofreadStatus(`🪄 校正中...（${message.paragraphs ?? '-'}段落・${message.chars ?? '-'}文字）`);
-            break;
-
-          case 'auto_proofread_completed':
-            setAutoProofreadStatus(`✅ 校正完了: ${message.paragraphs ?? '-'}段落に整理（${new Date().toLocaleTimeString('ja-JP')}）`);
-            break;
-
-          case 'auto_proofread_error':
-            setAutoProofreadStatus(`❌ 校正エラー: ${message.error ?? '不明なエラー'}`);
-            break;
-
-          case 'error':
-          case 'transcription_error':
-            setError(message.error);
-            setIsDummyAudioSending(false);
-            // Stop recording state when error occurs
-            setIsRecording(false);
-            setPendingText(''); // Clear pending text on error
-            console.error('[WebSocket] ❌ Error:', message.error);
-            break;
-            
-          default:
-            console.log('[WebSocket] ❓ Unknown message type:', message);
+            default:
+              console.log('[WebSocket] ❓ Unknown message type:', message);
+          }
+        } catch (err) {
+          console.error('[WebSocket] ❌ Error parsing message:', err, 'Raw data:', event.data);
         }
-      } catch (err) {
-        console.error('[WebSocket] ❌ Error parsing message:', err, 'Raw data:', event.data);
-      }
-    };
+      };
 
       ws.onerror = (error) => {
         console.error('[WebSocket] ❌ Connection error:', error);
-        setError('WebSocket connection failed');
+        setError('共有ドキュメントへの中継接続に失敗しました');
         setIsConnected(false);
-        setIsConnecting(false);
         reject(new Error('WebSocket connection failed'));
       };
 
       ws.onclose = (event) => {
         console.log('[WebSocket] 🔌 Connection closed:', event.code, event.reason);
         setIsConnected(false);
-        setIsConnecting(false);
-        setIsRecording(false);
         // 接続確立前にクローズされた場合はreject
         if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
           reject(new Error(`WebSocket closed: ${event.code} ${event.reason}`));
         }
       };
     }); // Promise終了
-  }, [getCurrentPrompt, currentSessionId, transcriptionModel, speechBreakDetection, breakMarker, vadEnabled, vadThreshold, vadSilenceDuration, vadPrefixPadding, paragraphBreakThreshold, audioBufferSize, batchMultiplier, forceLineBreakAtPeriod, captureTimeAtPosition, resolveUtteranceRecord, updateDraftText, autoProofread, rewriteModel]);
+  }, [currentSessionId, forceLineBreakAtPeriod, autoProofread]);
 
   const disconnectWebSocket = useCallback(() => {
-    // 自動切断タイマーをクリア
-    if (autoDisconnectTimerRef.current) {
-      clearTimeout(autoDisconnectTimerRef.current);
-      autoDisconnectTimerRef.current = null;
-      console.log('[Auto-disconnect] ⏰ Cleared auto-disconnect timer');
-    }
     if (websocketRef.current) {
       console.log('[WebSocket] 🔌 Disconnecting WebSocket');
       websocketRef.current.close();
       websocketRef.current = null;
     }
     setIsConnected(false);
-  }, []);
-
-  // 自動切断タイマーを開始
-  const startAutoDisconnectTimer = useCallback(() => {
-    // 既存のタイマーをクリア
-    if (autoDisconnectTimerRef.current) {
-      clearTimeout(autoDisconnectTimerRef.current);
-    }
-
-    console.log(`[Auto-disconnect] ⏰ Starting auto-disconnect timer (${autoDisconnectDelay} seconds)`);
-
-    autoDisconnectTimerRef.current = setTimeout(() => {
-      console.log('[Auto-disconnect] ⏰ Auto-disconnect timer expired, disconnecting...');
-      disconnectWebSocket();
-    }, autoDisconnectDelay * 1000);
-  }, [autoDisconnectDelay, disconnectWebSocket]);
-
-  // 自動切断タイマーをクリア（録音再開時など）
-  const clearAutoDisconnectTimer = useCallback(() => {
-    if (autoDisconnectTimerRef.current) {
-      clearTimeout(autoDisconnectTimerRef.current);
-      autoDisconnectTimerRef.current = null;
-      console.log('[Auto-disconnect] ⏰ Cleared auto-disconnect timer');
-    }
-  }, []);
-
-  // VADパラメータとパラグラフ区切り設定をサーバーに送信する関数（接続中に設定変更を反映）
-  const sendVadParamsToServer = useCallback((params: {
-    enabled?: boolean;
-    threshold?: number;
-    silence_duration_ms?: number; // VAD発話終了判定時間
-    prefix_padding_ms?: number;
-    paragraph_break_threshold_ms?: number; // パラグラフ区切り判定時間
-  }) => {
-    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
-      console.log('[VAD Settings] ⚠️ WebSocket not connected, settings will be applied on next connection');
-      return false;
-    }
-
-    const message = {
-      type: 'set_vad_params',
-      ...params
-    };
-
-    websocketRef.current.send(JSON.stringify(message));
-    console.log('[VAD Settings] 🎛️ Sent VAD params to server:', params);
-
-    // フィードバックメッセージを表示
-    setSettingsUpdateMessage('設定を更新しました');
-    setTimeout(() => setSettingsUpdateMessage(''), 3000);
-
-    return true;
-  }, []);
-
-  // AI再編モデルをサーバーに送信する関数
-  const sendRewriteModelToServer = useCallback((model: string) => {
-    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
-      console.log('[Rewrite Settings] ⚠️ WebSocket not connected, settings will be applied on next connection');
-      return false;
-    }
-
-    const message = {
-      type: 'set_auto_rewrite',
-      model: model
-    };
-
-    websocketRef.current.send(JSON.stringify(message));
-    console.log('[Rewrite Settings] 🤖 Sent rewrite model to server:', model);
-
-    setSettingsUpdateMessage('AI再編モデルを更新しました');
-    setTimeout(() => setSettingsUpdateMessage(''), 3000);
-
-    return true;
   }, []);
 
   // 句点で強制改行設定をサーバーに送信する関数
@@ -1133,18 +568,18 @@ export default function RealtimeClient() {
   // Audio streaming functions
   const startAudioStream = useCallback(async () => {
     try {
-      console.log('[Audio] 🎵 Starting audio stream... source:', audioSource, 'engine:', recognitionEngine);
+      console.log('[Audio] 🎵 Starting audio stream (オンデバイス認識)... source:', audioSource);
 
-      // ローカル主認識モードはオンデバイス認識が利用可能であることが前提
-      if (recognitionEngine === 'local' && localAsrStatus !== 'available') {
+      // オンデバイス認識が利用可能であることが前提
+      if (localAsrStatus !== 'available') {
         // 状態に応じて、インストールボタンの場所まで具体的に案内する
         if (localAsrStatus === 'downloadable') {
-          setError('オンデバイス認識には日本語の言語パックが必要です。この画面左下「音声入力からの文字起こし」セクション内の「認識エンジン」欄（⚡オンデバイス／☁️OpenAIの切替ボタンのすぐ下）にある青い「インストール」ボタンを押して言語パック（約60MB）を導入してください。または「認識エンジン」を「OpenAI transcribe」に切り替えてください。');
+          setError('オンデバイス認識には日本語の言語パックが必要です。「音声入力からの文字起こし」セクション内の「オンデバイス認識」欄にある「インストール」ボタンを押して言語パック（約60MB）を導入してください。');
         } else if (localAsrStatus === 'downloading') {
-          setError('言語パックをインストール中です（数分かかる場合があります）。完了までお待ちください。急ぐ場合は「認識エンジン」を「OpenAI transcribe」に切り替えてください。');
+          setError('言語パックをインストール中です（数分かかる場合があります）。完了までお待ちください。');
         } else {
           // unsupported / unavailable / checking
-          setError('このブラウザではオンデバイス認識が利用できません（Chrome 139以降が必要）。「音声入力からの文字起こし」セクションの「認識エンジン」欄で「☁️OpenAI transcribe」に切り替えてください。');
+          setError('このブラウザではオンデバイス認識が利用できません。Chrome 139以降でこのページを開いてください。');
         }
         return;
       }
@@ -1202,330 +637,22 @@ export default function RealtimeClient() {
       }
       console.log('[Audio] ✅ Media stream obtained');
 
-      // ローカル主認識モード: AudioContext/OpenAIへの音声送信は不要。
-      // オンデバイス認識にストリームを直接入力して文字起こしする（APIコストなし）
-      if (recognitionEngine === 'local') {
-        primaryStreamRef.current = stream;
-        recordingStateRef.current = true;
-        recordingStartTimeRef.current = Date.now();
-        setRecordingElapsedTime(0);
-        recordingTimerRef.current = setInterval(() => {
-          setRecordingElapsedTime((Date.now() - recordingStartTimeRef.current) / 1000);
-        }, 100);
-        setIsRecording(true);
-        startLocalDraftRecognition(stream, true);
-        console.log('[Audio] ✅ ローカル主認識モードで開始（OpenAIへの音声送信なし）');
-        return;
-      }
-
-      // Enhanced AudioContext compatibility check
-      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AudioContextClass) {
-        throw new Error('AudioContext not supported in this browser');
-      }
-
-      // Create AudioContext for processing (don't force sample rate, let browser decide)
-      console.log('[Audio] 🔧 Creating AudioContext...');
-      const audioContext = new AudioContextClass();
-      audioContextRef.current = audioContext;
-      console.log('[Audio] ✅ AudioContext created, sample rate:', audioContext.sampleRate);
-
-      const source = audioContext.createMediaStreamSource(stream);
-      console.log('[Audio] 🔌 Media stream source created');
-
-      // For now, use ScriptProcessor directly to avoid AudioWorklet cache issues
-      // TODO: Re-enable AudioWorklet once cache issues are resolved
-      console.warn('[Audio] ⚠️ Using ScriptProcessor for audio processing (AudioWorklet temporarily disabled due to cache issues)');
-      
-      // Use ScriptProcessor
-      if (!audioContext.createScriptProcessor) {
-        throw new Error('Audio processing not supported in this browser');
-      }
-      
-      const processor = audioContext.createScriptProcessor(audioBufferSize, 1, 1);
-      processorRef.current = processor;
-      console.log(`[Audio] 🔧 ScriptProcessor created with ${audioBufferSize} buffer size`);
-      
-      let audioChunkCount = 0;
-      let lastSendTime = 0;          // For timing analysis
-      let sendCount = 0;             // Count of actually sent chunks
-      let skipCount = 0;             // Count of skipped chunks (silent)
-      const timingLog: Array<{timestamp: number; interval: number; type: 'sent' | 'skipped'; samples: number}> = [];
-
-      processor.onaudioprocess = (event) => {
-        audioChunkCount++;
-        
-        // Log more chunks to debug
-        if (audioChunkCount <= 20) {
-          console.log(`[Audio Processing] 🔄 Event fired! Chunk #${audioChunkCount}`);
-          console.log(`[Audio Processing] 📊 Recording state: ${recordingStateRef.current}, WebSocket ready: ${websocketRef.current?.readyState === WebSocket.OPEN}`);
-        }
-        
-        if (!recordingStateRef.current) {
-          console.log(`[Audio Processing] ⏸️ Skipping chunk #${audioChunkCount} - recording state is false`);
-          return;
-        }
-        
-        if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
-          // WebSocket未接続時は静かにスキップ（ログ出力しない）
-          return;
-        }
-
-        const inputBuffer = event.inputBuffer;
-        const inputData = inputBuffer.getChannelData(0);
-        
-        // Log every chunk for first 20, then every 20th
-        if (audioChunkCount <= 20 || audioChunkCount % 20 === 0) {
-          console.log(`[Audio Processing] 🎵 Processing chunk #${audioChunkCount}, buffer length: ${inputData.length}, sample rate: ${inputBuffer.sampleRate}`);
-          
-          // Check if there's actual audio data
-          const audioLevel = Math.max(...Array.from(inputData).map(Math.abs));
-          const avgLevel = Array.from(inputData).reduce((sum, val) => sum + Math.abs(val), 0) / inputData.length;
-          console.log(`[Audio Processing] 📊 Audio level: max=${audioLevel.toFixed(4)}, avg=${avgLevel.toFixed(4)} (0=silence, 1=max)`);
-          
-          // Log some raw sample values
-          if (audioChunkCount <= 5) {
-            console.log(`[Audio Processing] 🔍 First 10 samples:`, Array.from(inputData.slice(0, 10)).map(v => v.toFixed(4)));
-          }
-          
-          // Alert if we're getting silence
-          if (audioLevel < 0.001) {
-            console.warn(`[Audio Processing] ⚠️ Very low audio level detected! Check microphone.`);
-          }
-        }
-        
-        // Convert to 16-bit PCM at 24kHz (required by OpenAI Realtime API)
-        let processedData = inputData;
-        
-        // Resample from whatever rate to 24kHz
-        const targetSampleRate = 24000;
-        const sourceSampleRate = inputBuffer.sampleRate;
-        
-        if (sourceSampleRate !== targetSampleRate) {
-          const resampleRatio = targetSampleRate / sourceSampleRate;
-          const outputLength = Math.floor(inputData.length * resampleRatio);
-          const resampledData = new Float32Array(outputLength);
-          
-          for (let i = 0; i < outputLength; i++) {
-            const sourceIndex = i / resampleRatio;
-            const index = Math.floor(sourceIndex);
-            const fraction = sourceIndex - index;
-            
-            if (index + 1 < inputData.length) {
-              // Linear interpolation
-              resampledData[i] = inputData[index] * (1 - fraction) + inputData[index + 1] * fraction;
-            } else {
-              resampledData[i] = inputData[index] || 0;
-            }
-          }
-          processedData = resampledData;
-        }
-        
-        const pcm16 = floatTo16BitPCM(processedData);
-        const base64Audio = arrayBufferToBase64(pcm16.buffer as ArrayBuffer);
-
-        // Log audio data size and validation
-        if (audioChunkCount <= 5 || audioChunkCount % 20 === 0) {
-          console.log(`[Audio Processing] 📦 PCM16 samples: ${pcm16.length}, Base64 size: ${base64Audio.length} chars`);
-          console.log(`[Audio Processing] 🔍 Sample rate conversion: ${sourceSampleRate}Hz -> ${targetSampleRate}Hz, samples: ${inputData.length} -> ${processedData.length}`);
-          
-          // Log first few PCM16 values
-          if (audioChunkCount <= 3) {
-            console.log(`[Audio Processing] 🎯 First 10 PCM16 values:`, Array.from(pcm16.slice(0, 10)));
-          }
-        }
-
-        // Check for actual audio content before sending
-        const maxPcmValue = Math.max(...Array.from(pcm16).map(Math.abs));
-
-        // 遅延測定: 無音→有音の立ち上がりをローカル発話開始候補として記録
-        // （VADイベントが来ない経路＝タブキャプチャの定期コミット等のフォールバック基準）
-        const captureNow = performance.now();
-        const chunkDurationMs = (pcm16.length / 24000) * 1000;
-        const isVoicedChunk = maxPcmValue >= 100;
-        if (isVoicedChunk && !lastChunkVoicedRef.current) {
-          // チャンク内で最初に閾値を超えたサンプル位置まで補間して立ち上がり時刻を求める
-          let firstVoicedIndex = 0;
-          for (let i = 0; i < pcm16.length; i++) {
-            if (Math.abs(pcm16[i]) >= 100) {
-              firstVoicedIndex = i;
-              break;
-            }
-          }
-          const onsetOffsetMs = (firstVoicedIndex / 24000) * 1000;
-          const pendingMs = accumulatedMetaRef.current.reduce((sum, m) => sum + (m.samples / 24000) * 1000, 0);
-          voiceOnsetQueueRef.current.push({
-            positionMs: sentAudioTotalMsRef.current + pendingMs + onsetOffsetMs,
-            capturedAt: captureNow - (chunkDurationMs - onsetOffsetMs),
-          });
-          if (voiceOnsetQueueRef.current.length > 50) {
-            voiceOnsetQueueRef.current.shift();
-          }
-        }
-        lastChunkVoicedRef.current = isVoicedChunk;
-
-        // Skip silent audio chunks if enabled (threshold: 100 for 16-bit PCM)
-        if (skipSilentChunks && maxPcmValue < 100) {
-          skipCount++;
-          const now = performance.now();
-          const interval = lastSendTime > 0 ? now - lastSendTime : 0;
-          timingLog.push({timestamp: now, interval, type: 'skipped', samples: processedData.length});
-
-          if (audioChunkCount <= 10 || audioChunkCount % 50 === 0) {
-            console.warn(`[Audio Processing] ⚠️ Skipping silent chunk #${audioChunkCount}: max PCM=${maxPcmValue}`);
-          }
-          return; // Don't send silent audio
-        }
-
-        // Batch accumulation logic
-        accumulatedAudioRef.current.push(pcm16);
-        // 遅延測定: 蓄積チャンクのキャプチャ時刻を音声データと対で記録
-        accumulatedMetaRef.current.push({ samples: pcm16.length, capturedAt: captureNow });
-
-        // Check if we have accumulated enough batches
-        if (accumulatedAudioRef.current.length >= batchMultiplier) {
-          // Merge accumulated audio chunks into one
-          const totalSamples = accumulatedAudioRef.current.reduce((sum, arr) => sum + arr.length, 0);
-          const mergedPcm16 = new Int16Array(totalSamples);
-          let offset = 0;
-          for (const chunk of accumulatedAudioRef.current) {
-            mergedPcm16.set(chunk, offset);
-            offset += chunk.length;
-          }
-
-          // Clear accumulated buffer
-          accumulatedAudioRef.current = [];
-
-          // 遅延測定: 送信する音声のバッファ位置範囲とキャプチャ時刻を元帳に記録
-          {
-            let ledgerPositionMs = sentAudioTotalMsRef.current;
-            for (const meta of accumulatedMetaRef.current) {
-              const metaDurationMs = (meta.samples / 24000) * 1000;
-              sentAudioLedgerRef.current.push({
-                startMs: ledgerPositionMs,
-                endMs: ledgerPositionMs + metaDurationMs,
-                capturedAt: meta.capturedAt,
-              });
-              ledgerPositionMs += metaDurationMs;
-            }
-            sentAudioTotalMsRef.current = ledgerPositionMs;
-            accumulatedMetaRef.current = [];
-            // 元帳の肥大化防止（直近分のみ保持）
-            if (sentAudioLedgerRef.current.length > 3000) {
-              sentAudioLedgerRef.current.splice(0, sentAudioLedgerRef.current.length - 2000);
-            }
-          }
-
-          // Convert merged audio to base64
-          const mergedBase64Audio = arrayBufferToBase64(mergedPcm16.buffer as ArrayBuffer);
-
-          // Send audio chunk to WebSocket
-          try {
-            const now = performance.now();
-            const interval = lastSendTime > 0 ? now - lastSendTime : 0;
-            lastSendTime = now;
-            sendCount++;
-
-            // Record timing for analysis
-            timingLog.push({timestamp: now, interval, type: 'sent', samples: totalSamples});
-
-            websocketRef.current.send(JSON.stringify({
-              type: 'audio_chunk',
-              audio: mergedBase64Audio
-            }));
-
-            // Log with detailed timing info every 10th sent chunk
-            if (sendCount % 10 === 0 || sendCount <= 5) {
-              console.log(`[Timing Analysis] 📤 SENT #${sendCount} | interval: ${interval.toFixed(1)}ms | samples: ${totalSamples} (${batchMultiplier}バッチ統合) | max PCM: ${maxPcmValue} | skipped: ${skipCount}`);
-            }
-          } catch (sendError) {
-            console.error(`[WebSocket] ❌ Failed to send audio chunk #${audioChunkCount}:`, sendError);
-          }
-        } else {
-          // Log accumulation progress
-          if (audioChunkCount <= 10 || audioChunkCount % 50 === 0) {
-            console.log(`[Audio Processing] 📦 Accumulating batch ${accumulatedAudioRef.current.length}/${batchMultiplier}`);
-          }
-        }
-      };
-
-      // Create a gain node to prevent audio feedback while still allowing processing
-      const gainNode = audioContext.createGain();
-      gainNode.gain.value = 0; // Mute the output to prevent feedback
-      
-      // Critical: ScriptProcessor needs to be connected to destination to fire events
-      source.connect(processor);
-      processor.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-      console.log('[Audio] 🔗 Audio pipeline connected');
-      
-      // Additional diagnostics
-      console.log('[Audio] 🔍 AudioContext state:', audioContext.state);
-      console.log('[Audio] 🔍 MediaStream active:', stream.active);
-      console.log('[Audio] 🔍 MediaStream tracks:', stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled, readyState: t.readyState })));
-      
-      // CRITICAL: Resume AudioContext if suspended (required by browsers after user gesture)
-      if (audioContext.state === 'suspended') {
-        console.log('[Audio] 🔄 Resuming suspended AudioContext...');
-        try {
-          await audioContext.resume();
-          console.log('[Audio] ✅ AudioContext resumed, new state:', audioContext.state);
-        } catch (resumeError) {
-          console.error('[Audio] ❌ Failed to resume AudioContext:', resumeError);
-        }
-      }
-      
-      // Force AudioContext to start processing immediately
-      console.log('[Audio] 🎯 Final AudioContext state:', audioContext.state);
-      if (audioContext.state !== 'running') {
-        console.warn('[Audio] ⚠️ AudioContext is not running!');
-        throw new Error('AudioContext failed to start. State: ' + audioContext.state);
-      }
-
-      // Set recording state immediately for audio processing
+      // オンデバイス認識にストリームを直接入力して文字起こしする（APIコストなし・音声の外部送信なし）
+      primaryStreamRef.current = stream;
       recordingStateRef.current = true;
-
-      // Start recording timer
       recordingStartTimeRef.current = Date.now();
       setRecordingElapsedTime(0);
       recordingTimerRef.current = setInterval(() => {
-        const elapsed = (Date.now() - recordingStartTimeRef.current) / 1000;
-        setRecordingElapsedTime(elapsed);
+        setRecordingElapsedTime((Date.now() - recordingStartTimeRef.current) / 1000);
       }, 100);
-
       setIsRecording(true);
-      console.log('[Audio] ✅ Audio streaming started successfully');
-
-      // OpenAIモード: ローカルドラフト認識を並行起動（オンデバイス認識が利用可能な場合のみ）
-      if (localDraftEnabled && localAsrStatus === 'available') {
-        startLocalDraftRecognition(stream, false);
-      }
-
-      // タブキャプチャモード: 定期的にaudio_commitを送信してVAD無音検出を補助
-      if (audioSource === 'tab-capture') {
-        const commitInterval = 5000; // 5秒ごとにコミット
-        console.log(`[Audio] 🖥️ Tab capture mode: auto-commit every ${commitInterval}ms`);
-        tabCaptureCommitTimerRef.current = setInterval(() => {
-          if (websocketRef.current?.readyState === WebSocket.OPEN && recordingStateRef.current) {
-            websocketRef.current.send(JSON.stringify({ type: 'audio_commit' }));
-            console.log('[Audio] 🖥️ Tab capture: periodic audio_commit sent');
-          }
-        }, commitInterval);
-      }
-
-      // Test audio processing after a short delay
-      setTimeout(() => {
-        console.log('[Audio] 🧪 Testing audio processing after 2 seconds...');
-        console.log('[Audio] 🔍 Current AudioContext state:', audioContext.state);
-        console.log('[Audio] 🔍 Current recording state:', isRecording);
-        console.log('[Audio] 🔍 MediaStream still active:', stream.active);
-      }, 2000);
-
+      startLocalDraftRecognition(stream);
+      console.log('[Audio] ✅ オンデバイス認識で開始（音声の外部送信なし）');
     } catch (err) {
       console.error('[Audio] ❌ Error starting audio stream:', err);
       setError(err instanceof Error ? err.message : 'Failed to start audio stream');
     }
-  }, [isRecording, floatTo16BitPCM, arrayBufferToBase64, selectedDeviceId, audioBufferSize, batchMultiplier, skipSilentChunks, audioSource, recognitionEngine, localDraftEnabled, localAsrStatus, startLocalDraftRecognition]);
+  }, [selectedDeviceId, audioSource, localAsrStatus, startLocalDraftRecognition]);
 
   const stopAudioStream = useCallback(() => {
     console.log('[Audio] 🛑 Stopping audio stream...');
@@ -1533,18 +660,8 @@ export default function RealtimeClient() {
     // Stop recording state immediately
     recordingStateRef.current = false;
 
-    // ローカルドラフト認識を停止
+    // オンデバイス認識を停止
     stopLocalDraftRecognition();
-
-    // Clear accumulated audio buffer
-    accumulatedAudioRef.current = [];
-    accumulatedMetaRef.current = [];
-
-    // タブキャプチャ用定期コミットタイマーをクリア
-    if (tabCaptureCommitTimerRef.current) {
-      clearInterval(tabCaptureCommitTimerRef.current);
-      tabCaptureCommitTimerRef.current = null;
-    }
 
     // Stop recording timer
     if (recordingTimerRef.current) {
@@ -1553,131 +670,61 @@ export default function RealtimeClient() {
     }
     setRecordingElapsedTime(0);
 
-    // Stop audio processing
-    if (processorRef.current) {
-      console.log('[Audio] 🔌 Disconnecting audio processor');
-      // If it's an AudioWorkletNode, send stop message
-      if ('port' in processorRef.current && processorRef.current.port) {
-        processorRef.current.port.postMessage({ type: 'stop' });
-      }
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    
-    if (audioContextRef.current) {
-      console.log('[Audio] 🔧 Closing AudioContext');
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-
     // タブキャプチャストリームの停止
     if (tabCaptureStreamRef.current) {
       tabCaptureStreamRef.current.getTracks().forEach(t => t.stop());
       tabCaptureStreamRef.current = null;
     }
 
-    // ローカル主認識モードのストリーム停止
+    // オンデバイス認識に入力していたストリームを停止
     if (primaryStreamRef.current) {
       primaryStreamRef.current.getTracks().forEach(t => t.stop());
       primaryStreamRef.current = null;
     }
 
-    // Don't commit on stop - let the server handle remaining buffer automatically
-    // The server will commit when it has enough audio or on timer
-    console.log('[Audio] 📤 Stopping - server will handle remaining buffer');
-
     setIsRecording(false);
-    setIsSpeaking(false);
-    setPendingText(''); // Clear pending text when stopping
     console.log('[Audio] ✅ Audio stream stopped successfully');
   }, [stopLocalDraftRecognition]);
-
-  // Function to send status messages to collaborative document
-  // Note: Simplified to console.log only to avoid SSR issues with Yjs dynamic import
-  const sendStatusToCollaboration = useCallback((message: string) => {
-    if (!currentSessionId) {
-      return;
-    }
-    // Log status message - collaborative document updates are handled by server
-    console.log('[Hocuspocus Status]', message);
-  }, [currentSessionId]);
 
   // Main control functions
   const startRecording = useCallback(async () => {
     console.log('[Recording] 🎙️ Start recording requested');
 
-    // 自動切断タイマーをクリア（録音再開時）
-    clearAutoDisconnectTimer();
-
-    // Send detailed start notification to collaborative document
-    const currentTime = new Date().toLocaleString('ja-JP');
-    const currentPrompt = getCurrentPrompt();
-    const promptModeText = promptMode === 'custom' ? 'カスタム' : 'プリセット';
-    const promptName = promptMode === 'preset'
-      ? PROMPT_PRESETS.find(p => p.id === selectedPromptPreset)?.name || 'なし'
-      : 'カスタムプロンプト';
-
-    const statusMessage = `
-📝 文字起こし開始 (${currentTime})
-🎤 音声認識モデル: ${transcriptionModel}
-💬 プロンプト設定: ${promptModeText} - ${promptName}
-${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
-    
-    sendStatusToCollaboration(statusMessage);
-    
-    if (!isConnected && !isConnecting) {
-      console.log('[Recording] 🔗 Not connected, connecting WebSocket first...');
+    // 共有ドキュメント中継チャネルを確立してからオンデバイス認識を開始する。
+    // 認識した確定テキストはこのチャネル経由で共有ドキュメントへ転送される
+    if (!isConnected) {
+      console.log('[Recording] 🔗 Not connected, connecting relay channel first...');
       try {
         await connectWebSocket();
-        console.log('[Recording] ✅ WebSocket connected, starting audio stream');
+        console.log('[Recording] ✅ Relay channel connected, starting audio stream');
         startAudioStream();
       } catch (err) {
-        console.error('[Recording] ❌ Failed to connect WebSocket:', err);
-        setError('WebSocket接続に失敗しました');
+        console.error('[Recording] ❌ Failed to connect relay channel:', err);
+        setError('共有ドキュメントへの中継接続に失敗しました');
       }
-    } else if (isConnecting) {
-      console.log('[Recording] ⏳ Connection already in progress, waiting...');
-      // 接続中の場合は何もしない（接続完了後に再度ボタンを押してもらう）
     } else {
       console.log('[Recording] 🚀 Already connected, starting audio stream immediately');
       startAudioStream();
     }
-  }, [isConnected, isConnecting, connectWebSocket, startAudioStream, sendStatusToCollaboration, transcriptionModel, promptMode, selectedPromptPreset, getCurrentPrompt, clearAutoDisconnectTimer]);
+  }, [isConnected, connectWebSocket, startAudioStream]);
 
   const stopRecording = useCallback(() => {
     console.log('[Recording] ⏹️ Stop recording requested');
-
-    // Log final transcription text
-    console.log('[Recording] 📝 Final transcription text:');
-    console.log('====== START OF TRANSCRIPTION ======');
-    console.log(text);
-    console.log('====== END OF TRANSCRIPTION ======');
-    console.log(`[Recording] 📊 Total characters: ${text.length}, Total words: ${text.split(/\s+/).filter(word => word.length > 0).length}`);
-
-    // Send detailed stop notification to collaborative document
-    const currentTime = new Date().toLocaleString('ja-JP');
-    const statusMessage = `
-⏹️ 文字起こし終了 (${currentTime})
-🎤 使用モデル: ${transcriptionModel}`;
-
-    sendStatusToCollaboration(statusMessage);
-
+    console.log(`[Recording] 📊 Total characters: ${text.length}`);
     stopAudioStream();
-
-    // 自動切断タイマーを開始（接続は維持し、一定時間後に自動切断）
-    startAutoDisconnectTimer();
-  }, [stopAudioStream, sendStatusToCollaboration, transcriptionModel, text, startAutoDisconnectTimer]);
+  }, [stopAudioStream, text]);
 
   const clearText = useCallback(() => {
     console.log('[UI] 🧹 Clearing transcription text');
     setText("");
     setError(null);
 
-    // Clear audio buffer
+    // 共有ドキュメント側の未確定（ドラフト）表示もクリアする
     if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-      console.log('[Audio] 🗑️ Clearing server audio buffer');
+      console.log('[UI] 🗑️ Clearing draft on collaborative document');
       websocketRef.current.send(JSON.stringify({
-        type: 'clear_audio_buffer'
+        type: 'local_pending',
+        text: ''
       }));
     }
   }, []);
@@ -1809,101 +856,19 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
     }
   }, [sessionIdInput]);
 
-  // Load recordings from IndexedDB
-  const loadLocalStorageRecordings = useCallback(async () => {
-    try {
-      console.log('[IndexedDB] Loading recordings from IndexedDB...');
-      const recordings = await getAllRecordings();
-      setLocalStorageRecordings(recordings);
-      console.log('[IndexedDB] Loaded', recordings.length, 'recordings:', recordings.map((r: AudioRecording) => ({ id: r.id, name: r.name })));
-      if (recordings.length > 0 && !selectedRecordingId) {
-        setSelectedRecordingId(recordings[0].id);
-        console.log('[IndexedDB] Auto-selected first recording:', recordings[0].id);
-      }
-    } catch (error) {
-      console.error('[IndexedDB] Error loading recordings:', error);
-      setLocalStorageRecordings([]);
-    }
-  }, [selectedRecordingId]);
-
-  // Send dummy audio from localStorage
-  const sendDummyAudio = useCallback(async () => {
-    // Check if recording is selected first
-    const recording = localStorageRecordings.find(rec => rec.id === selectedRecordingId);
-    if (!recording) {
-      setError('選択された録音が見つかりません。録音データ作成画面で録音を作成してください。');
-      return;
-    }
-
-    // 自動切断タイマーをクリア
-    clearAutoDisconnectTimer();
-
-    // Connect WebSocket if not connected (same as startRecording)
-    if (!isConnected && !isConnecting) {
-      console.log('[Dummy Audio] 🔗 Not connected, connecting WebSocket first...');
-      try {
-        await connectWebSocket();
-        console.log('[Dummy Audio] ✅ WebSocket connected, starting dummy audio send');
-      } catch (err) {
-        console.error('[Dummy Audio] ❌ Failed to connect WebSocket:', err);
-        setError('WebSocket接続に失敗しました');
-        return;
-      }
-    } else if (isConnecting) {
-      console.log('[Dummy Audio] ⏳ Connection already in progress, please wait...');
-      setError('接続中です。しばらくお待ちください。');
-      return;
-    }
-
-    setIsDummyAudioSending(true);
-    setError(null);
-
-    // Start recording state for transcription UI
-    setIsRecording(true);
-
-    console.log('[Dummy Audio] 🎵 Sending localStorage recording:', recording.name, 'interval:', dummySendInterval, 'ms');
-    websocketRef.current?.send(JSON.stringify({
-      type: 'send_dummy_audio_data',
-      audioData: recording.data,
-      name: recording.name,
-      sendInterval: dummySendInterval
-    }));
-  }, [isConnected, isConnecting, connectWebSocket, localStorageRecordings, selectedRecordingId, dummySendInterval, clearAutoDisconnectTimer]);
-
-  // Stop dummy audio sending
-  const stopDummyAudio = useCallback(() => {
-    console.log('[Dummy Audio] 🛑 Stopping dummy audio sending');
-
-    // Send stop message to server
-    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-      websocketRef.current.send(JSON.stringify({
-        type: 'stop_dummy_audio'
-      }));
-    }
-
-    // Reset states
-    setIsDummyAudioSending(false);
-    setDummyAudioProgress(null);
-    setIsRecording(false);
-    setPendingText(''); // Clear pending text when stopping
-  }, []);
-
-  // Initialize/cleanup Hocuspocus connection for test functionality
+  // Initialize/cleanup Hocuspocus connection for collaborative document delivery
   const initializeHocuspocusClient = useCallback(() => {
     if (!currentSessionId || hocuspocusProviderRef.current) {
       return; // Already initialized or no session
     }
 
-    console.log('[Hocuspocus Test Client] Initializing for session:', currentSessionId);
+    console.log('[Hocuspocus Client] Initializing for session:', currentSessionId);
 
     // Dynamic import both yjs and HocuspocusProvider to avoid SSR localStorage issues
     Promise.all([
       import('yjs'),
       import('@hocuspocus/provider')
     ]).then(([Y, { HocuspocusProvider }]) => {
-      // Store yjs module ref for later use
-      yjsModuleRef.current = Y;
-
       // Create Y.Doc
       const ydoc = new Y.Doc();
       hocuspocusDocRef.current = ydoc;
@@ -1923,24 +888,24 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       hocuspocusProviderRef.current = provider;
 
       provider.on('connect', () => {
-        console.log('[Hocuspocus Test Client] Connected to collaborative session');
+        console.log('[Hocuspocus Client] Connected to collaborative session');
       });
 
       provider.on('disconnect', () => {
-        console.log('[Hocuspocus Test Client] Disconnected from collaborative session');
+        console.log('[Hocuspocus Client] Disconnected from collaborative session');
       });
 
       provider.on('error', (error: unknown) => {
-        console.error('[Hocuspocus Test Client] Error:', error);
+        console.error('[Hocuspocus Client] Error:', error);
       });
     }).catch((error) => {
-      console.error('[Hocuspocus Test Client] Failed to load yjs/HocuspocusProvider:', error);
+      console.error('[Hocuspocus Client] Failed to load yjs/HocuspocusProvider:', error);
     });
   }, [currentSessionId]);
 
   const cleanupHocuspocusClient = useCallback(() => {
     if (hocuspocusProviderRef.current) {
-      console.log('[Hocuspocus Test Client] Cleaning up connection');
+      console.log('[Hocuspocus Client] Cleaning up connection');
       hocuspocusProviderRef.current.disconnect();
       hocuspocusProviderRef.current.destroy();
       hocuspocusProviderRef.current = null;
@@ -1949,131 +914,6 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       hocuspocusDocRef.current = null;
     }
   }, []);
-
-  // Test text send function - send directly to Hocuspocus document as a client
-  const sendTestText = useCallback(() => {
-    if (!currentSessionId) {
-      setError('セッションIDが設定されていません。先に共同校正セッションを作成してください。');
-      return;
-    }
-
-    // Initialize Hocuspocus client if not already done
-    initializeHocuspocusClient();
-
-    if (!hocuspocusDocRef.current || !hocuspocusProviderRef.current) {
-      setError('Hocuspocusクライアントが初期化されていません。');
-      return;
-    }
-
-    const provider = hocuspocusProviderRef.current;
-    
-    // Check if provider is connected, if not, wait for connection
-    const sendWhenReady = () => {
-      const testTexts = [
-        'テスト送信1: リアルタイム音声認識からの統合テストです。',
-        'テスト送信2: このテキストは共同校正画面に表示されるはずです。',
-        'テスト送信3: Hocuspocusサーバー経由で同期されます。',
-        'テスト送信4: 複数のユーザーがリアルタイムで確認できます。'
-      ];
-
-      const randomText = testTexts[Math.floor(Math.random() * testTexts.length)];
-      
-      try {
-        // Check if yjs module is loaded
-        const Y = yjsModuleRef.current;
-        if (!Y) {
-          console.error('[Hocuspocus Test Client] Yjs module not loaded yet');
-          return;
-        }
-
-        // Add text to Hocuspocus document as a collaborative client using TipTap-compatible format
-        const fieldName = `content-${currentSessionId}`;
-
-        // TipTap Collaboration uses XmlFragment, not Text
-        const fragment = hocuspocusDocRef.current!.getXmlFragment(fieldName);
-
-        // Add text to existing paragraph or create new one if needed
-        const hasContent = fragment.length > 0;
-
-        if (hasContent) {
-          // Get the last element in the fragment
-          const lastElement = fragment.get(fragment.length - 1);
-
-          if (lastElement && lastElement instanceof Y.XmlElement && lastElement.nodeName === 'paragraph') {
-            // Add text to the existing last paragraph
-            const existingTextNode = lastElement.get(0);
-            if (existingTextNode && existingTextNode instanceof Y.XmlText) {
-              // Append text with space to existing text node
-              existingTextNode.insert(existingTextNode.length, ` ${randomText}`);
-            } else {
-              // Create new text node in existing paragraph
-              const newTextNode = new Y.XmlText();
-              newTextNode.insert(0, ` ${randomText}`);
-              lastElement.insert(lastElement.length, [newTextNode]);
-            }
-          } else {
-            // Last element is not a paragraph, create new paragraph
-            const newParagraph = new Y.XmlElement('paragraph');
-            const newTextNode = new Y.XmlText();
-            newTextNode.insert(0, ` ${randomText}`);
-            newParagraph.insert(0, [newTextNode]);
-            fragment.insert(fragment.length, [newParagraph]);
-          }
-        } else {
-          // No content yet, create first paragraph
-          const newParagraph = new Y.XmlElement('paragraph');
-          const newTextNode = new Y.XmlText();
-          newTextNode.insert(0, randomText);
-          newParagraph.insert(0, [newTextNode]);
-          fragment.insert(0, [newParagraph]);
-        }
-        
-        console.log('[Hocuspocus Test Client] Text sent to collaborative document as paragraph:', randomText);
-        console.log('[Hocuspocus Test Client] Fragment length after insert:', fragment.length);
-        console.log('[Hocuspocus Test Client] Fragment content preview:', fragment.toString().substring(0, 100) + '...');
-        
-        // Also add to local display for immediate feedback
-        setText(prev => prev + randomText + ' ');
-        
-        // Clear any previous errors
-        setError(null);
-      } catch (error) {
-        console.error('[Hocuspocus Test Client] Error sending text:', error);
-        setError('テキストの送信に失敗しました。');
-      }
-    };
-
-    // Always wait for connection to ensure reliable sending
-    console.log('[Hocuspocus Test Client] Setting up connection listener for test text sending');
-    
-    // Try to send immediately first, if that fails, wait for connection
-    try {
-      sendWhenReady();
-      console.log('[Hocuspocus Test Client] Text sent immediately (provider was ready)');
-    } catch (error) {
-      console.log('[Hocuspocus Test Client] Immediate send failed, waiting for connection...', error);
-      
-      // Wait for connection and then send
-      const onConnect = () => {
-        console.log('[Hocuspocus Test Client] Connection established, sending test text');
-        provider.off('connect', onConnect);
-        try {
-          sendWhenReady();
-        } catch (retryError) {
-          console.error('[Hocuspocus Test Client] Failed to send after connection:', retryError);
-          setError('テキストの送信に失敗しました。');
-        }
-      };
-      
-      provider.on('connect', onConnect);
-      
-      // Timeout after 5 seconds if connection doesn't happen
-      setTimeout(() => {
-        provider.off('connect', onConnect);
-        setError('Hocuspocus接続タイムアウトです。共同校正セッションが開いているか確認してください。');
-      }, 5000);
-    }
-  }, [currentSessionId, initializeHocuspocusClient]);
 
   // Initialize Hocuspocus when session changes
   useEffect(() => {
@@ -2088,8 +928,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
   useEffect(() => {
     console.log('[Component] 🎬 RealtimeClient component mounted, loading audio devices...');
     getAudioDevices();
-    loadLocalStorageRecordings();
-  }, [getAudioDevices, loadLocalStorageRecordings]);
+  }, [getAudioDevices]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -2102,28 +941,22 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
   }, [stopAudioStream, disconnectWebSocket, cleanupHocuspocusClient]);
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-canvas">
       {/* Header - editorと同様の構造 */}
-      <header className="bg-white shadow-sm border-b">
+      <header className="bg-surface border-b border-hairline">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-2xl font-bold text-gray-900">リアルタイム文字起こし</h1>
-              <p className="text-sm text-gray-600 mt-1">OpenAI Realtime APIを使用した音声認識</p>
+              <h1 className="text-2xl font-light text-ink">リアルタイム文字起こし</h1>
+              <p className="text-sm text-body mt-1">オンデバイス音声認識（Chrome・端末内処理）</p>
             </div>
             <div className="flex items-center space-x-3">
-              <div className="text-xs text-gray-400">
+              <div className="text-xs text-muted">
                 v{packageJson.version}
               </div>
               <a
-                href={`${getBasePath()}/dummy-recorder`}
-                className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
-              >
-                録音データ作成
-              </a>
-              <a
                 href={`${getBasePath()}/manual.html`}
-                className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
                 target="_blank"
                 rel="noopener noreferrer"
               >
@@ -2137,471 +970,44 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="space-y-6">
 
-        {/* Transcription Model Selection & Prompt Settings - Side by Side */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left: 音声認識設定 */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-medium text-gray-900 mb-4">
-              音声認識設定
-            </h3>
-
-            {/* Transcription Model Selection */}
-            <div className="mb-6">
-              <label htmlFor="transcription-model-select" className="block text-sm font-medium text-gray-700 mb-2">
-                音声認識モデル:
-              </label>
-              <select
-                id="transcription-model-select"
-                value={transcriptionModel}
-                onChange={(e) => setTranscriptionModel(e.target.value)}
-                disabled={isRecording || isConnected}
-                className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option value="whisper-1">
-                  Whisper-1 (従来モデル)
-                </option>
-                <option value="gpt-4o-mini-transcribe">
-                  GPT-4o Mini Transcribe (軽量・高速)
-                </option>
-                <option value="gpt-4o-transcribe">
-                  GPT-4o Transcribe (高精度)
-                </option>
-              </select>
-            </div>
-
-            {/* 句点で強制改行 */}
-            <div className="mb-6">
-              <label className="flex items-center">
-                <input
-                  type="checkbox"
-                  checked={forceLineBreakAtPeriod}
-                  onChange={(e) => {
-                    const newValue = e.target.checked;
-                    setForceLineBreakAtPeriod(newValue);
-                    // 接続中なら即座にサーバーに送信
-                    if (isConnected) {
-                      sendForceLineBreakToServer(newValue);
-                    }
-                  }}
-                  className="mr-2 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                />
-                <span className="text-sm text-gray-700">句点で強制改行（。の後に改行を追加）</span>
-              </label>
-            </div>
-
-            {/* Transcription Prompt Settings */}
-            <h4 className="text-md font-medium text-gray-800 mb-3 pt-3 border-t border-gray-200">
-              文字起こしプロンプト設定
-            </h4>
-          
-          {/* Prompt Mode Selection */}
-          <div className="mb-4">
-            <div className="flex space-x-4">
-              <label className="flex items-center">
-                <input
-                  type="radio"
-                  value="preset"
-                  checked={promptMode === 'preset'}
-                  onChange={(e) => setPromptMode(e.target.value as 'preset' | 'custom')}
-                  disabled={isRecording || isConnected}
-                  className="mr-2"
-                />
-                プリセット使用
-              </label>
-              <label className="flex items-center">
-                <input
-                  type="radio"
-                  value="custom"
-                  checked={promptMode === 'custom'}
-                  onChange={(e) => setPromptMode(e.target.value as 'preset' | 'custom')}
-                  disabled={isRecording || isConnected}
-                  className="mr-2"
-                />
-                カスタムプロンプト
-              </label>
-            </div>
-          </div>
-
-          {/* Preset Selection */}
-          {promptMode === 'preset' && (
-            <div className="mb-4">
-              <label htmlFor="prompt-preset-select" className="block text-sm font-medium text-gray-700 mb-2">
-                プリセット選択:
-              </label>
-              <select
-                id="prompt-preset-select"
-                value={selectedPromptPreset}
-                onChange={(e) => setSelectedPromptPreset(e.target.value)}
-                disabled={isRecording || isConnected}
-                className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                {PROMPT_PRESETS.map((preset) => (
-                  <option key={preset.id} value={preset.id}>
-                    {preset.name} - {preset.description}
-                  </option>
-                ))}
-              </select>
-              <div className="mt-2 p-3 bg-gray-50 rounded-md">
-                <p className="text-sm text-gray-600">
-                  <strong>プロンプト内容:</strong>
-                </p>
-                <p className="text-sm text-gray-700 mt-1">
-                  {getCurrentPrompt() || 'プロンプトなし'}
-                </p>
-              </div>
-            </div>
-          )}
-
-            {/* Custom Prompt Input */}
-            {promptMode === 'custom' && (
-              <div className="mb-4">
-                <label htmlFor="custom-prompt" className="block text-sm font-medium text-gray-700 mb-2">
-                  カスタムプロンプト:
-                </label>
-                <textarea
-                  id="custom-prompt"
-                  value={customPrompt}
-                  onChange={(e) => setCustomPrompt(e.target.value)}
-                  disabled={isRecording || isConnected}
-                  rows={4}
-                  className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                  placeholder="文字起こしをどのように処理するかの指示を入力してください..."
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  例: 「フィラーを除去し、敬語を使った読みやすい文章に変換してください」
-                </p>
-              </div>
-            )}
-
-            <p className="text-xs text-gray-500 mt-4">
-              ※ モデル・プロンプト設定は接続前にのみ変更可能です
-            </p>
-          </div>
-
-          {/* Right: VAD設定 */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-medium text-gray-900 mb-4">
-              音声区間検出（VAD設定）
-            </h3>
-
-            {/* VAD Enable/Disable */}
-            <div className="mb-4">
-              <label className="flex items-center">
-                <input
-                  type="checkbox"
-                  checked={vadEnabled}
-                  onChange={(e) => {
-                    const newValue = e.target.checked;
-                    setVadEnabled(newValue);
-                    // 接続中なら即座にサーバーに送信
-                    if (isConnected) {
-                      sendVadParamsToServer({ enabled: newValue });
-                    }
-                  }}
-                  disabled={isRecording}
-                  className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
-                />
-                <span className="text-sm font-medium text-gray-700">
-                  VAD（音声区間検出）を有効にする
-                </span>
-              </label>
-              <p className="text-xs text-gray-500 mt-1 ml-6">
-                VADを有効にすると音声区間が自動検出されます。
-              </p>
-            </div>
-
-            {/* Speech Break Detection (sub-option of VAD) */}
-            {vadEnabled && (
-              <div className="mb-4 ml-6 p-3 bg-white rounded-md border border-gray-300">
-                <label className="flex items-center">
-                  <input
-                    type="checkbox"
-                    checked={speechBreakDetection}
-                    onChange={(e) => setSpeechBreakDetection(e.target.checked)}
-                    disabled={isRecording}
-                    className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
-                  />
-                  <span className="text-sm font-medium text-gray-700">
-                    パラグラフ検出マーカーを挿入
-                  </span>
-                </label>
-                <p className="text-xs text-gray-500 mt-1 ml-6">
-                  指定時間以上の無音を検出してマーカー文字を挿入します
-                </p>
-
-                {speechBreakDetection && (
-                  <div className="mt-3 ml-6">
-                    <label htmlFor="break-marker" className="block text-xs font-medium text-gray-600 mb-1">
-                      区切りマーカー:
-                    </label>
-                    <select
-                      id="break-marker"
-                      value={breakMarker}
-                      onChange={(e) => setBreakMarker(e.target.value)}
-                      disabled={isRecording}
-                      className="block w-32 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                    >
-                      <option value="⏎">⏎ (改行)</option>
-                      <option value="↩️">↩️ (改行絵文字)</option>
-                      <option value="🔄">🔄 (更新)</option>
-                      <option value="📝">📝 (メモ)</option>
-                    </select>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className={`grid grid-cols-1 md:grid-cols-3 gap-4 ${!vadEnabled ? 'opacity-50' : ''}`}>
-              {/* Threshold */}
-              <div>
-                <label htmlFor="vad-threshold" className="block text-xs font-medium text-gray-600 mb-1 flex items-center">
-                  検出感度 (Threshold):
-                  <span className="ml-1 relative group">
-                    <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                    <span className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-72 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                      音声として検出する最小の音量レベル。<br/><br/>
-                      <strong>低い値 (0.1-0.3):</strong> 小さな音でも「有音」と検出。<br/>
-                      → 無音区間が短くなる（無音検出されにくい）<br/><br/>
-                      <strong>高い値 (0.7-0.9):</strong> 明確な発話のみ「有音」と検出。<br/>
-                      → 無音区間が長くなる（無音検出されやすい）<br/><br/>
-                      <strong>推奨:</strong> 静かな環境=0.3-0.5、ノイズ環境=0.5-0.7
-                    </span>
-                  </span>
-                </label>
-                <input
-                  id="vad-threshold"
-                  type="number"
-                  min="0.1"
-                  max="1.0"
-                  step="0.1"
-                  value={vadThreshold}
-                  onChange={(e) => {
-                    const newValue = parseFloat(e.target.value);
-                    setVadThreshold(newValue);
-                    if (isConnected) {
-                      sendVadParamsToServer({ threshold: newValue });
-                    }
-                  }}
-                  disabled={!vadEnabled || isRecording}
-                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  0.1-1.0 (低いほど敏感)
-                </p>
-              </div>
-
-              {/* VAD Silence Duration - OpenAI speech_stopped detection */}
-              <div>
-                <label htmlFor="vad-silence" className="block text-xs font-medium text-gray-600 mb-1 flex items-center">
-                  VAD発話終了判定 (ms):
-                  <span className="ml-1 relative group">
-                    <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                    <span className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-72 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                      OpenAI VADが発話終了(speech_stopped)を発火する無音時間。<br/><br/>
-                      <strong>短い (200-500ms):</strong> 短い間で発話区切り検知<br/>
-                      <strong>長い (1000-3000ms):</strong> 長い間を許容
-                    </span>
-                  </span>
-                </label>
-                <input
-                  id="vad-silence"
-                  type="number"
-                  min="200"
-                  max="3000"
-                  step="100"
-                  value={vadSilenceDuration}
-                  onChange={(e) => {
-                    const newValue = parseInt(e.target.value);
-                    setVadSilenceDuration(newValue);
-                    if (isConnected) {
-                      sendVadParamsToServer({ silence_duration_ms: newValue });
-                    }
-                  }}
-                  disabled={!vadEnabled || isRecording}
-                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  200-3000ms (VAD有効時のみ)
-                </p>
-              </div>
-
-              {/* Paragraph Break Threshold - independent from VAD */}
-              <div>
-                <label htmlFor="paragraph-break-threshold" className="block text-xs font-medium text-gray-600 mb-1 flex items-center">
-                  パラグラフ区切り判定 (ms):
-                  <span className="ml-1 relative group">
-                    <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                    <span className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 w-72 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                      この時間以上の無音があった場合のみ、区切りマーカーを挿入します。<br/><br/>
-                      VAD発話終了判定とは独立した設定です。<br/><br/>
-                      <strong>例:</strong> VAD=500ms, パラグラフ=3000ms の場合<br/>
-                      → 500ms無音でspeech_stopped発火<br/>
-                      → 実際の無音が3000ms未満ならマーカー挿入なし<br/>
-                      → 3000ms以上ならマーカー挿入
-                    </span>
-                  </span>
-                </label>
-                <input
-                  id="paragraph-break-threshold"
-                  type="number"
-                  min="500"
-                  max="10000"
-                  step="500"
-                  value={paragraphBreakThreshold}
-                  onChange={(e) => {
-                    const newValue = parseInt(e.target.value);
-                    setParagraphBreakThreshold(newValue);
-                    if (isConnected) {
-                      sendVadParamsToServer({ paragraph_break_threshold_ms: newValue });
-                    }
-                  }}
-                  disabled={!speechBreakDetection || isRecording}
-                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  500-10000ms (音声区間検出時のみ)
-                </p>
-              </div>
-
-              {/* Prefix Padding */}
-              <div>
-                <label htmlFor="vad-padding" className="block text-xs font-medium text-gray-600 mb-1 flex items-center">
-                  開始余裕時間 (ms):
-                  <span className="ml-1 relative group">
-                    <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                    <span className="absolute right-0 bottom-full mb-2 w-72 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                      発話開始と判定された時点より前の音声をどれだけ含めるか。<br/><br/>
-                      <strong>短い (100-200ms):</strong> 発話開始直前のみ。冒頭が切れる可能性あり<br/><br/>
-                      <strong>長い (500-1000ms):</strong> 発話前の音も含む。冒頭が切れにくいがノイズも入りやすい
-                    </span>
-                  </span>
-                </label>
-                <input
-                  id="vad-padding"
-                  type="number"
-                  min="100"
-                  max="1000"
-                  step="50"
-                  value={vadPrefixPadding}
-                  onChange={(e) => {
-                    const newValue = parseInt(e.target.value);
-                    setVadPrefixPadding(newValue);
-                    if (isConnected) {
-                      sendVadParamsToServer({ prefix_padding_ms: newValue });
-                    }
-                  }}
-                  disabled={!vadEnabled || isRecording}
-                  className="block w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  100-1000ms
-                </p>
-              </div>
-            </div>
-
-            <div className="mt-3 flex items-center justify-between">
-              <div className="text-xs text-blue-600">
-                <strong>推奨:</strong> 高精度は終了時間3000ms、区切り重視は500ms
-              </div>
-              <button
-                onClick={() => {
-                  setVadThreshold(0.5);
-                  setVadSilenceDuration(600);
-                  setVadPrefixPadding(300);
-                  setSkipSilentChunks(false);
-                  setAudioBufferSize(2048);
-                  setBatchMultiplier(1);
-                  // 接続中なら全パラメータを送信
-                  if (isConnected) {
-                    sendVadParamsToServer({
-                      threshold: 0.5,
-                      silence_duration_ms: 600,
-                      prefix_padding_ms: 300
-                    });
-                  }
-                }}
-                disabled={!vadEnabled || isRecording}
-                className="px-3 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-              >
-                デフォルトに戻す
-              </button>
-            </div>
-
-            {/* 設定更新フィードバックメッセージ */}
-            {settingsUpdateMessage && (
-              <div className="mt-2 p-2 bg-green-100 text-green-700 text-sm rounded-md">
-                {settingsUpdateMessage}
-              </div>
-            )}
-
-            {/* AI再編モデル設定 */}
-            <div className="mt-6 pt-4 border-t border-gray-200">
-              <h4 className="text-sm font-medium text-gray-700 mb-2">AI再編モデル</h4>
-              <select
-                value={rewriteModel}
-                onChange={(e) => {
-                  const newModel = e.target.value;
-                  setRewriteModel(newModel);
-                  sendRewriteModelToServer(newModel);
-                }}
-                className="block w-full px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option value="gpt-4.1-mini">GPT-4.1 Mini（高速・低コスト）</option>
-                <option value="gpt-4.1">GPT-4.1（高精度）</option>
-                <option value="gpt-4o-mini">GPT-4o Mini</option>
-                <option value="gpt-4o">GPT-4o</option>
-              </select>
-              <p className="text-xs text-gray-500 mt-1">
-                共同校正画面でのAI再編に使用するモデル
-              </p>
-            </div>
-          </div>
-        </div>
-
         {/* Connection Status & Session Management - Side by Side */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Connection Status - 改善された接続状態インジケータ */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <h3 className="text-lg font-medium text-gray-900 mb-4">
-              OpenAI Realtime API 接続状態
+          {/* Connection Status - 共有ドキュメント中継チャネルの接続状態 */}
+          <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
+            <h3 className="text-lg font-light text-ink mb-4">
+              共有ドキュメントへの中継接続
             </h3>
             <div className="space-y-4">
-              {/* 接続状態インジケータ（4状態: 未接続/接続中/接続済み/エラー） */}
-              <div className={`p-4 rounded-lg border-2 ${
-                error ? 'bg-red-50 border-red-300' :
-                isConnecting ? 'bg-yellow-50 border-yellow-300' :
-                isConnected ? 'bg-green-50 border-green-300' :
-                'bg-gray-50 border-gray-300'
+              {/* 接続状態インジケータ（3状態: 未接続/接続済み/エラー） */}
+              <div className={`p-4 rounded-lg border ${
+                error ? 'bg-error/10 border-error/40' :
+                isConnected ? 'bg-success/10 border-success/40' :
+                'bg-surface-soft border-hairline'
               }`}>
                 <div className="flex items-center space-x-3">
-                  <div className={`w-4 h-4 rounded-full ${
-                    error ? 'bg-red-500 animate-pulse' :
-                    isConnecting ? 'bg-yellow-500 animate-pulse' :
-                    isConnected ? 'bg-green-500' :
-                    'bg-gray-400'
+                  <div className={`w-3 h-3 rounded-full ${
+                    error ? 'bg-error animate-pulse' :
+                    isConnected ? 'bg-success' :
+                    'bg-muted-soft'
                   }`}></div>
                   <div>
-                    <span className={`text-lg font-medium ${
-                      error ? 'text-red-800' :
-                      isConnecting ? 'text-yellow-800' :
-                      isConnected ? 'text-green-800' :
-                      'text-gray-600'
+                    <span className={`text-lg font-normal ${
+                      error ? 'text-error' :
+                      isConnected ? 'text-success' :
+                      'text-muted'
                     }`}>
                       {error ? 'エラー' :
-                       isConnecting ? '接続中...' :
                        isConnected ? '接続済み' :
                        '未接続'}
                     </span>
                     <p className={`text-sm ${
-                      error ? 'text-red-600' :
-                      isConnecting ? 'text-yellow-600' :
-                      isConnected ? 'text-green-600' :
-                      'text-gray-500'
+                      error ? 'text-error' :
+                      isConnected ? 'text-body' :
+                      'text-muted'
                     }`}>
                       {error ? error :
-                       isConnecting ? 'OpenAI Realtime APIに接続しています...' :
-                       isConnected ? '音声入力の準備ができました' :
-                       '「音声入力で文字起こし」または「録音データで文字起こし」で自動接続します'}
+                       isConnected ? '認識結果を共有ドキュメントへ配信できます' :
+                       '「録音開始」で自動的に接続されます'}
                     </p>
                   </div>
                 </div>
@@ -2612,36 +1018,28 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 <div className="flex items-center justify-center">
                   <button
                     onClick={disconnectWebSocket}
-                    className="px-4 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors"
+                    className="px-4 py-2 text-sm bg-surface text-error border border-error/50 rounded-lg hover:bg-error/10 transition-colors"
                   >
                     接続を切断
                   </button>
                 </div>
               )}
 
-              {/* 自動切断の説明 */}
-              <p className="text-xs text-gray-500 text-center">
-                {isConnected
-                  ? `音声入力停止後${autoDisconnectDelay}秒で自動切断されます`
-                  : '音声入力開始時に自動的に接続され、停止後に自動切断されます'}
+              <p className="text-xs text-muted text-center">
+                オンデバイス認識の確定テキストは、この中継接続を通じて共有ドキュメント（校正画面）へ送られます。音声は端末内で処理され、外部へは送信されません。
               </p>
-
-              {/* 60分セッション制限の注意 */}
-              <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
-                <span className="font-medium">注意:</span> OpenAI Realtime APIは1セッション最大60分です。60分を超えると自動切断されます。再度「音声入力で文字おこし」を押して再接続してください。
-              </div>
             </div>
           </div>
 
           {/* Session Management */}
-          <div className="bg-white p-6 rounded-lg shadow-md">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">
+          <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
+          <h3 className="text-lg font-light text-ink mb-4">
             共同校正セッション管理
           </h3>
-          
+
           {/* Current Session Display */}
           <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
+            <label className="block text-sm font-medium text-body mb-2">
               現在のセッションID:
             </label>
             {isEditingSessionId ? (
@@ -2650,32 +1048,32 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   type="text"
                   value={sessionIdInput}
                   onChange={(e) => setSessionIdInput(e.target.value)}
-                  className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                  className="flex-1 px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
                   placeholder="セッションIDを入力..."
                 />
                 <button
                   onClick={saveSessionId}
-                  className="px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                  className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active"
                 >
                   保存
                 </button>
                 <button
                   onClick={cancelEditSessionId}
-                  className="px-4 py-2 text-sm bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400"
+                  className="px-4 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft"
                 >
                   キャンセル
                 </button>
               </div>
             ) : (
               <div className="flex items-center space-x-2">
-                <div className="flex-1 px-3 py-2 bg-gray-50 border border-gray-200 rounded-md">
-                  <span className="text-gray-700">
+                <div className="flex-1 px-3 py-2 bg-surface-soft border border-hairline rounded-md">
+                  <span className="text-body">
                     {currentSessionId || 'セッションが作成されていません'}
                   </span>
                 </div>
                 <button
                   onClick={editSessionId}
-                  className="px-4 py-2 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                  className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active"
                 >
                   変更
                 </button>
@@ -2685,7 +1083,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
           {/* Connect to Session */}
           <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
+            <label className="block text-sm font-medium text-body mb-2">
               セッションに接続:
             </label>
             <div className="flex space-x-2">
@@ -2693,7 +1091,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 value={existingSessionInput}
                 onChange={(e) => setExistingSessionInput(e.target.value)}
                 onFocus={fetchSessions}
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                className="flex-1 px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
               >
                 <option value="">セッションを選択...</option>
                 <option value="__new__">＋ 新しいセッションを作成</option>
@@ -2706,7 +1104,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               <button
                 onClick={fetchSessions}
                 disabled={isLoadingSessions}
-                className="px-3 py-2 text-sm bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300 disabled:opacity-50"
+                className="px-3 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft disabled:opacity-50"
                 title="一覧を更新"
               >
                 ↻
@@ -2714,32 +1112,32 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               <button
                 onClick={connectToExistingSession}
                 disabled={!existingSessionInput.trim()}
-                className="px-4 py-2 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed"
               >
                 接続
               </button>
             </div>
             {activeSessions.length === 0 && !isLoadingSessions && (
-              <p className="text-xs text-gray-500 mt-1">アクティブなセッションがありません</p>
+              <p className="text-xs text-muted mt-1">アクティブなセッションがありません</p>
             )}
           </div>
 
           {/* Session Status */}
           {currentSessionId && isConnected && (
             <div className="space-y-3">
-              <div className="p-3 bg-green-50 border border-green-200 rounded-md">
+              <div className="p-3 bg-success/10 border border-success/40 rounded-md">
                 <div className="flex items-center space-x-2">
-                  <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                  <span className="text-sm font-medium text-green-800">
+                  <div className="w-2.5 h-2.5 bg-success rounded-full"></div>
+                  <span className="text-sm font-medium text-success">
                     セッション接続中: {currentSessionId}
                   </span>
                 </div>
               </div>
-              
+
               {/* Share Session URL */}
-              <div className="p-3 bg-blue-50 border border-blue-200 rounded-md">
+              <div className="p-3 bg-celadon-soft border border-celadon/30 rounded-md">
                 <div className="flex items-center justify-between">
-                  <div className="text-sm text-blue-700">
+                  <div className="text-sm text-celadon-active">
                     このURLを共有して他の人を招待
                   </div>
                   <button
@@ -2754,55 +1152,46 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                         button.textContent = originalText;
                       }, 2000);
                     }}
-                    className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                    className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded hover:bg-celadon-active transition-colors"
                   >
                     URLをコピー
                   </button>
                 </div>
-                <div className="mt-2 text-xs text-blue-600 font-mono">
+                <div className="mt-2 text-xs text-celadon-active font-mono">
                   {typeof window !== 'undefined' && `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`}
                 </div>
               </div>
             </div>
           )}
-          
+
           {/* Create/Open Session Button */}
           <div className="flex justify-center space-x-4">
             <button
               onClick={createOrOpenEditingSession}
-              className="px-6 py-3 rounded-lg font-medium text-white bg-green-600 hover:bg-green-700 transition-colors"
+              className="px-6 py-3 rounded-lg font-medium bg-celadon text-on-celadon hover:bg-celadon-active transition-colors"
             >
               {currentSessionId ? '共同校正セッションを開く' : '共同校正セッションの作成'}
-            </button>
-            
-            <button
-              onClick={sendTestText}
-              disabled={!currentSessionId}
-              className="px-6 py-3 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
-              title={!currentSessionId ? "セッションIDを設定してください" : "テスト文字列を共同校正セッションに送信"}
-            >
-              テスト文字列送信
             </button>
           </div>
           </div>
         </div>
 
-        {/* Controls - 2 Column Layout */}
-        <div className={`p-6 rounded-lg transition-colors ${
+        {/* Controls */}
+        <div className={`p-6 rounded-lg border transition-colors ${
           isRecording
-            ? "bg-red-50 border-2 border-red-200"
-            : "bg-white"
+            ? "bg-celadon-soft border-celadon/30"
+            : "bg-surface border-hairline shadow-sm"
         }`}>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="max-w-2xl mx-auto">
             {/* Main Recording Controls */}
-            <div className="space-y-4 bg-white p-4 rounded-lg shadow-sm">
-              <h4 className="text-md font-medium text-gray-900 text-center">
+            <div className="space-y-4 bg-surface p-4 rounded-lg border border-hairline shadow-sm">
+              <h4 className="text-md font-medium text-ink text-center">
                 音声入力からの文字起こし
               </h4>
 
               {/* Audio Source Selection */}
               <div className="px-4">
-                <label className="block text-sm font-medium text-gray-700 mb-2">
+                <label className="block text-sm font-medium text-body mb-2">
                   音声ソース:
                 </label>
                 <div className="flex gap-2">
@@ -2812,8 +1201,8 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                     disabled={isRecording}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
                       audioSource === 'microphone'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                        ? 'bg-celadon text-on-celadon'
+                        : 'bg-surface-soft text-body hover:bg-celadon-soft'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
                     <span>🎤</span> マイク
@@ -2824,82 +1213,56 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                     disabled={isRecording}
                     className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
                       audioSource === 'tab-capture'
-                        ? 'bg-purple-600 text-white'
-                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                        ? 'bg-celadon text-on-celadon'
+                        : 'bg-surface-soft text-body hover:bg-celadon-soft'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
                     <span>🖥️</span> タブ音声キャプチャ
                   </button>
                 </div>
                 {audioSource === 'tab-capture' && (
-                  <p className="text-xs text-gray-500 mt-1">
+                  <p className="text-xs text-muted mt-1">
                     開始時にタブ選択ダイアログが表示されます。「タブの音声も共有」を有効にしてください。
                   </p>
                 )}
 
-                {/* 認識エンジン選択 */}
-                <div className="mt-3 p-2 bg-gray-50 rounded-md border border-gray-200">
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    認識エンジン:
+                {/* オンデバイス認識ステータス */}
+                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
+                  <label className="block text-sm font-medium text-body mb-1">
+                    オンデバイス認識:
                   </label>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setRecognitionEngine('local')}
-                      disabled={isRecording}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                        recognitionEngine === 'local'
-                          ? 'bg-green-600 text-white'
-                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                      } disabled:opacity-50 disabled:cursor-not-allowed`}
-                    >
-                      <span>⚡</span> オンデバイス（無料・低遅延）
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRecognitionEngine('openai')}
-                      disabled={isRecording}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                        recognitionEngine === 'openai'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                      } disabled:opacity-50 disabled:cursor-not-allowed`}
-                    >
-                      <span>☁️</span> OpenAI transcribe（高精度）
-                    </button>
-                  </div>
-                  <div className="mt-1 text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+                  <div className="mt-1 text-xs text-muted flex items-center gap-2 flex-wrap">
                     {localAsrStatus === 'checking' && <span>オンデバイス認識の対応状況を確認中...</span>}
-                    {localAsrStatus === 'unsupported' && <span>オンデバイス認識はこのブラウザで非対応です（Chrome 139以降が必要）。OpenAIエンジンを使用してください</span>}
-                    {localAsrStatus === 'unavailable' && <span>日本語のオンデバイス認識は利用できません。OpenAIエンジンを使用してください</span>}
+                    {localAsrStatus === 'unsupported' && <span className="text-warning">このブラウザでは利用できません。Chrome 139以降でこのページを開いてください</span>}
+                    {localAsrStatus === 'unavailable' && <span className="text-warning">日本語のオンデバイス認識が利用できません。Chrome 139以降でお試しください</span>}
                     {localAsrStatus === 'downloadable' && (
                       <>
-                        <span>言語パック（約60MB）が未インストール</span>
+                        <span>日本語の言語パック（約60MB）が未インストール</span>
                         <button
                           onClick={installLocalAsr}
                           disabled={isRecording}
-                          className="px-2 py-0.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                          className="px-2 py-0.5 text-xs bg-celadon text-on-celadon rounded hover:bg-celadon-active disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           インストール
                         </button>
                       </>
                     )}
                     {localAsrStatus === 'downloading' && <span>言語パックをインストール中...（数分かかる場合があります）</span>}
-                    {localAsrStatus === 'available' && recognitionEngine === 'local' && (
-                      <span className="text-green-600">
-                        ✓ Chromeオンデバイス認識で文字起こしします（音声の外部送信なし・APIコストなし）。認識途中のテキストは薄色で表示されます
+                    {localAsrStatus === 'available' && (
+                      <span className="text-success">
+                        ✓ Chromeオンデバイス認識で文字起こしします（音声の外部送信なし）。認識途中のテキストは薄色で表示されます
                       </span>
                     )}
                   </div>
-                  {recognitionEngine === 'local' && localAsrStatus === 'available' && (
-                    <div className="mt-2 flex items-center gap-2 text-xs text-gray-700 flex-wrap">
+                  {localAsrStatus === 'available' && (
+                    <div className="mt-2 flex items-center gap-2 text-xs text-body flex-wrap">
                       <label htmlFor="force-finalize-select" className="font-medium">部分確定間隔:</label>
                       <select
                         id="force-finalize-select"
                         value={localForceFinalizeSec}
                         onChange={(e) => setLocalForceFinalizeSec(parseInt(e.target.value))}
                         disabled={isRecording}
-                        className="px-2 py-0.5 border border-gray-300 rounded text-xs disabled:bg-gray-100"
+                        className="px-2 py-0.5 border border-hairline rounded text-xs disabled:bg-surface-soft focus:outline-none focus:ring-2 focus:ring-celadon"
                       >
                         <option value="3">3秒</option>
                         <option value="5">5秒</option>
@@ -2907,28 +1270,36 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                         <option value="10">10秒</option>
                         <option value="0">なし（自然な区切りのみ）</option>
                       </select>
-                      <span className="text-gray-500">
+                      <span className="text-muted">
                         話が続いていても、この間隔で安定した前半部分を順次確定します（揺れやすい末尾は未確定のまま残ります）
                       </span>
                     </div>
                   )}
-                  {recognitionEngine === 'openai' && (
-                    <label className="mt-2 flex items-center gap-2 text-xs font-medium text-gray-700">
-                      <input
-                        type="checkbox"
-                        checked={localDraftEnabled}
-                        onChange={(e) => setLocalDraftEnabled(e.target.checked)}
-                        disabled={isRecording || localAsrStatus !== 'available'}
-                        className="rounded"
-                      />
-                      ⚡ ローカルドラフト表示（話している最中の薄色暫定表示。確定テキストで置き換え）
-                    </label>
-                  )}
+                </div>
+
+                {/* 句点で強制改行 */}
+                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
+                  <label className="flex items-center gap-2 text-sm font-medium text-body">
+                    <input
+                      type="checkbox"
+                      checked={forceLineBreakAtPeriod}
+                      onChange={(e) => {
+                        const newValue = e.target.checked;
+                        setForceLineBreakAtPeriod(newValue);
+                        // 接続中なら即座にサーバーへ通知
+                        if (isConnected) {
+                          sendForceLineBreakToServer(newValue);
+                        }
+                      }}
+                      className="rounded accent-celadon"
+                    />
+                    句点で強制改行（。の後に改行を追加）
+                  </label>
                 </div>
 
                 {/* 自動校正設定 */}
-                <div className="mt-3 p-2 bg-gray-50 rounded-md border border-gray-200">
-                  <label className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
+                  <label className="flex items-center gap-2 text-sm font-medium text-body">
                     <input
                       type="checkbox"
                       checked={autoProofread}
@@ -2943,17 +1314,16 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                           }));
                         }
                       }}
-                      className="rounded"
+                      className="rounded accent-celadon"
                     />
                     🪄 自動校正（誤字修正＋パラグラフ整理）
                   </label>
-                  <p className="mt-1 ml-6 text-xs text-gray-500">
+                  <p className="mt-1 ml-6 text-xs text-muted">
                     ONにすると、認識テキストはAI校正（誤字修正・句読点補完・段落分け）を経てから校正画面に確定反映されます。
                     校正前のテキストはグレーの未確定表示のまま見えます（100文字以上たまり次第・最短15秒間隔で処理、録音停止後は残りも自動処理）。
-                    モデル: {rewriteModel}
                   </p>
                   {autoProofreadStatus && (
-                    <p className="mt-1 ml-6 text-xs text-purple-600">{autoProofreadStatus}</p>
+                    <p className="mt-1 ml-6 text-xs text-celadon-active">{autoProofreadStatus}</p>
                   )}
                 </div>
               </div>
@@ -2961,7 +1331,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
               {/* Audio Input Device Selection */}
               {audioSource === 'microphone' && (
               <div className="px-4">
-                <label htmlFor="device-select" className="block text-sm font-medium text-gray-700 mb-2">
+                <label htmlFor="device-select" className="block text-sm font-medium text-body mb-2">
                   音声入力デバイス:
                 </label>
                 <select
@@ -2969,7 +1339,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   value={selectedDeviceId}
                   onChange={(e) => setSelectedDeviceId(e.target.value)}
                   disabled={isRecording}
-                  className="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+                  className="block w-full px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon disabled:bg-surface-soft"
                 >
                   {audioDevices.length === 0 ? (
                     <option value="">デバイスを読み込み中...</option>
@@ -2985,252 +1355,45 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   <button
                     onClick={getAudioDevices}
                     disabled={isRecording}
-                    className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-3 py-1 text-xs bg-surface text-ink border border-hairline hover:bg-surface-soft rounded disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     デバイス更新
                   </button>
-                  <p className="text-xs text-gray-500">
+                  <p className="text-xs text-muted">
                     {audioDevices.length} 個のデバイス
                   </p>
                 </div>
               </div>
               )}
 
-              {/* Audio Processing Settings */}
-              <div className="px-4 pt-3 border-t border-gray-200">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Audio Buffer Size */}
-                  <div>
-                    <label htmlFor="buffer-size-select" className="block text-xs font-medium text-gray-700 mb-1">
-                      バッファサイズ:
-                      <span className="ml-1 relative group">
-                        <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                        <span className="absolute left-0 bottom-full mb-2 w-64 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                          音声処理1回あたりのデータ量（サンプル数）。<br/><br/>
-                          <strong>小さい値 (256-1024):</strong> 細かい処理単位。CPU負荷高<br/><br/>
-                          <strong>大きい値 (8192-16384):</strong> 粗い処理単位。CPU負荷低、安定<br/><br/>
-                          ※レイテンシはバッファ×バッチで決まります
-                        </span>
-                      </span>
-                    </label>
-                    <select
-                      id="buffer-size-select"
-                      value={audioBufferSize}
-                      onChange={(e) => setAudioBufferSize(parseInt(e.target.value))}
-                      disabled={isRecording}
-                      className="w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
-                    >
-                      <option value="256">256 (~5ms)</option>
-                      <option value="512">512 (~11ms)</option>
-                      <option value="1024">1024 (~21ms)</option>
-                      <option value="2048">2048 (~43ms)</option>
-                      <option value="4096">4096 (~85ms)</option>
-                      <option value="8192">8192 (~171ms)</option>
-                      <option value="16384">16384 (~341ms)</option>
-                    </select>
-                  </div>
-
-                  {/* Batch Multiplier */}
-                  <div>
-                    <label htmlFor="batch-multiplier-select" className="block text-xs font-medium text-gray-700 mb-1">
-                      バッチ数:
-                      <span className="ml-1 relative group">
-                        <span className="cursor-help text-blue-500 hover:text-blue-700">?</span>
-                        <span className="absolute right-0 bottom-full mb-2 w-64 p-2 bg-gray-800 text-white text-xs rounded shadow-lg opacity-0 group-hover:opacity-100 transition-opacity z-50 pointer-events-none whitespace-normal">
-                          何回分のバッファを蓄積してから送信するか。<br/><br/>
-                          <strong>1 (即時):</strong> 毎回送信。通信回数多<br/><br/>
-                          <strong>8-16:</strong> バランス型。推奨<br/><br/>
-                          <strong>32-64:</strong> まとめて送信。通信回数少<br/><br/>
-                          ※レイテンシはバッファ×バッチで決まります
-                        </span>
-                      </span>
-                    </label>
-                    <select
-                      id="batch-multiplier-select"
-                      value={batchMultiplier}
-                      onChange={(e) => setBatchMultiplier(parseInt(e.target.value))}
-                      disabled={isRecording}
-                      className="w-full px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
-                    >
-                      <option value="1">1 (即時)</option>
-                      <option value="2">2</option>
-                      <option value="4">4</option>
-                      <option value="8">8</option>
-                      <option value="16">16</option>
-                      <option value="32">32</option>
-                      <option value="64">64</option>
-                    </select>
-                  </div>
-                </div>
-                <div className="mt-2">
-                  <p className="text-xs text-gray-600">
-                    送信間隔: <span className="font-medium">{((audioBufferSize * batchMultiplier) / 24000 * 1000).toFixed(0)}ms</span> ({audioBufferSize} × {batchMultiplier} ÷ 24000 × 1000)
-                  </p>
-                </div>
-              </div>
-
-              {/* Silent Chunk Skip */}
-              <div className="px-4">
-                <label className="flex items-center">
-                  <input
-                    type="checkbox"
-                    checked={skipSilentChunks}
-                    onChange={(e) => setSkipSilentChunks(e.target.checked)}
-                    disabled={isRecording}
-                    className="mr-2 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
-                  />
-                  <span className="text-sm font-medium text-gray-700">
-                    無音チャンクをスキップ
-                  </span>
-                </label>
-                <p className="text-xs text-gray-500 mt-1 ml-6">
-                  無効（推奨）: 高精度　/ 有効: 帯域節約
-                </p>
-              </div>
-
               {/* Start/Stop Button */}
               <div className="flex justify-center pt-2">
                 <button
-                  onClick={isRecording && !isDummyAudioSending ? stopRecording : startRecording}
-                  disabled={isConnecting || isDummyAudioSending}
-                  className={`px-6 py-3 rounded-lg font-medium text-white transition-colors ${
-                    isRecording && !isDummyAudioSending
-                      ? "bg-red-600 hover:bg-red-700"
-                      : isConnecting
-                        ? "bg-yellow-600 cursor-wait"
-                        : "bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  onClick={isRecording ? stopRecording : startRecording}
+                  className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+                    isRecording
+                      ? "bg-surface text-error border border-error/50 hover:bg-error/10"
+                      : "bg-celadon text-on-celadon hover:bg-celadon-active"
                   }`}
                 >
-                  {isConnecting
-                    ? "接続中..."
-                    : isRecording && !isDummyAudioSending
-                      ? "音声入力を停止"
-                      : "音声入力で文字起こし"}
+                  {isRecording ? "録音を停止" : "録音開始"}
                 </button>
               </div>
 
               {/* Recording Status Display */}
-              {isRecording && !isDummyAudioSending && (
-                <div className="flex flex-col items-center justify-center space-y-2 text-blue-600 pt-3">
+              {isRecording && (
+                <div className="flex flex-col items-center justify-center space-y-2 text-celadon-active pt-3">
                   <div className="flex items-center space-x-2">
-                    <div className="w-3 h-3 bg-blue-600 rounded-full animate-pulse"></div>
-                    <span className="font-medium">Streaming Audio...</span>
+                    <div className="w-3 h-3 bg-celadon rounded-full animate-pulse"></div>
+                    <span className="font-medium">認識中...</span>
                   </div>
                   <div className="flex items-center space-x-2">
-                    <span className="text-2xl font-bold tabular-nums">
+                    <span className="text-2xl font-light tabular-nums text-ink">
                       {Math.floor(recordingElapsedTime / 60).toString().padStart(2, '0')}:
                       {Math.floor(recordingElapsedTime % 60).toString().padStart(2, '0')}
                     </span>
-                    <span className="text-sm text-gray-500">経過</span>
+                    <span className="text-sm text-muted">経過</span>
                   </div>
-                </div>
-              )}
-            </div>
-
-            {/* Dummy Audio Controls */}
-            <div className="space-y-4 bg-white p-4 rounded-lg shadow-sm">
-              <h4 className="text-md font-medium text-gray-900 text-center">
-                録音データからの文字起こし
-              </h4>
-
-              {/* Settings */}
-              <div className="space-y-4 px-4">
-                {/* Recording Selection */}
-                <div className="space-y-2">
-                  <label htmlFor="dummy-recording-select" className="block text-sm font-medium text-gray-700">
-                    録音データ:
-                  </label>
-                  <div className="flex items-center space-x-2">
-                    <select
-                      id="dummy-recording-select"
-                      value={selectedRecordingId}
-                      onChange={(e) => setSelectedRecordingId(e.target.value)}
-                      disabled={isDummyAudioSending || isRecording}
-                      className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
-                    >
-                      {localStorageRecordings.length === 0 ? (
-                        <option value="">録音データがありません</option>
-                      ) : (
-                        localStorageRecordings.map((recording) => {
-                          const sizeKB = (recording.data.length * 0.75 / 1024).toFixed(1);
-                          // Calculate duration from PCM data size if not available
-                          // Base64 length * 0.75 = bytes, bytes / 2 = samples (16-bit), samples / 24000 = seconds
-                          const duration = recording.duration || (recording.data.length * 0.75 / 2 / 24000);
-                          return (
-                            <option key={recording.id} value={recording.id}>
-                              {recording.name} ({duration.toFixed(1)}秒, {sizeKB}KB)
-                            </option>
-                          );
-                        })
-                      )}
-                    </select>
-                    <button
-                      onClick={loadLocalStorageRecordings}
-                      disabled={isDummyAudioSending || isRecording}
-                      className="px-3 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-50 transition-colors"
-                    >
-                      更新
-                    </button>
-                  </div>
-                </div>
-
-                {/* Send Interval */}
-                <div className="flex items-center space-x-2">
-                  <label htmlFor="dummy-send-interval" className="text-sm font-medium text-gray-700">
-                    送信間隔:
-                  </label>
-                  <input
-                    id="dummy-send-interval"
-                    type="number"
-                    min="10"
-                    max="500"
-                    step="10"
-                    value={dummySendInterval}
-                    onChange={(e) => setDummySendInterval(Math.max(10, Math.min(500, parseInt(e.target.value) || 50)))}
-                    disabled={isDummyAudioSending || isRecording}
-                    className="w-20 px-2 py-1 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100 text-center"
-                  />
-                  <span className="text-sm text-gray-500">ms</span>
-                </div>
-              </div>
-
-              {/* Start/Stop Button */}
-              <div className="flex justify-center pt-2">
-                <button
-                  onClick={isDummyAudioSending ? stopDummyAudio : sendDummyAudio}
-                  disabled={isConnecting || (isRecording && !isDummyAudioSending) || (!isDummyAudioSending && localStorageRecordings.length === 0)}
-                  className={`px-6 py-3 text-sm font-medium rounded-lg transition-colors ${
-                    isDummyAudioSending
-                      ? "bg-red-600 hover:bg-red-700 text-white"
-                      : isConnecting || (isRecording && !isDummyAudioSending) || localStorageRecordings.length === 0
-                      ? "bg-gray-400 cursor-not-allowed text-gray-200"
-                      : "bg-orange-600 hover:bg-orange-700 text-white"
-                  }`}
-                >
-                  {isDummyAudioSending ? '録音データからの文字起こしの停止' : '録音データで文字起こし'}
-                </button>
-              </div>
-
-              {/* Progress Display */}
-              {isDummyAudioSending && (
-                <div className="flex flex-col items-center justify-center space-y-2 text-orange-600">
-                  <div className="flex items-center space-x-2">
-                    <div className="w-4 h-4 border-2 border-orange-600 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="text-sm font-medium">録音データを送信中...</span>
-                  </div>
-                  {dummyAudioProgress && (
-                    <div className="flex flex-col items-center space-y-1">
-                      <span className="text-lg font-bold">
-                        {dummyAudioProgress.currentSeconds.toFixed(1)}秒 / {dummyAudioProgress.totalSeconds.toFixed(1)}秒
-                      </span>
-                      <div className="w-64 h-2 bg-gray-200 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-orange-500 transition-all duration-200"
-                          style={{ width: `${(dummyAudioProgress.currentSeconds / dummyAudioProgress.totalSeconds) * 100}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>
@@ -3239,11 +1402,11 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
         {/* Error Display */}
         {error && (
-          <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+          <div className="p-4 bg-error/10 border border-error/40 rounded-lg">
             <div className="flex">
               <div className="ml-3">
-                <h3 className="text-sm font-medium text-red-800">Error</h3>
-                <div className="mt-2 text-sm text-red-700">
+                <h3 className="text-sm font-medium text-error">エラー</h3>
+                <div className="mt-2 text-sm text-error">
                   {error}
                 </div>
               </div>
@@ -3252,23 +1415,23 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
         )}
 
         {/* Transcription Output */}
-        <div className="bg-white p-6 rounded-lg shadow-md">
+        <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
           <div className="flex justify-between items-center mb-4">
-            <h2 className="text-lg font-medium text-gray-900">
+            <h2 className="text-lg font-light text-ink">
               文字起こし結果
             </h2>
             <div className="flex gap-2">
               <button
                 onClick={copyText}
                 disabled={!text}
-                className="px-4 py-2 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+                className="px-4 py-2 rounded-lg font-medium bg-celadon text-on-celadon hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
               >
                 📋 コピー
               </button>
               <button
                 onClick={() => setShowClearConfirmDialog(true)}
-                disabled={isRecording || isDummyAudioSending || !text}
-                className="px-4 py-2 rounded-lg font-medium text-white bg-red-500 hover:bg-red-600 disabled:bg-red-200 disabled:cursor-not-allowed transition-colors"
+                disabled={isRecording || !text}
+                className="px-4 py-2 rounded-lg font-medium bg-surface text-error border border-error/50 hover:bg-error/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
                 テキストをクリア
               </button>
@@ -3283,120 +1446,50 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                 transcriptAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
               }
             }}
-            className="h-[300px] min-h-[160px] resize-y overflow-y-auto p-4 border border-gray-300 rounded-md bg-gray-50"
+            className="h-[300px] min-h-[160px] resize-y overflow-y-auto p-4 border border-hairline rounded-md bg-surface-soft"
           >
             {(text || (isRecording && draftText)) ? (
-              <p className="text-gray-900 whitespace-pre-wrap leading-relaxed">
+              <p className="text-ink whitespace-pre-wrap leading-relaxed">
                 {text}
-                {/* ローカルドラフト（オンデバイス認識の暫定テキスト。確定テキスト到着で置き換わる） */}
+                {/* オンデバイス認識の暫定テキスト（薄色表示。確定すると本文に取り込まれる） */}
                 {isRecording && draftText && (
-                  <span className="text-gray-400">{draftText}</span>
+                  <span className="text-muted-soft">{draftText}</span>
                 )}
               </p>
             ) : (
-              <p className="text-gray-500 italic">
-                Start streaming to see real-time transcription...
+              <p className="text-muted italic">
+                録音を開始すると、ここに文字起こしが表示されます...
               </p>
             )}
-            {/* 音声検出中表示（isSpeakingがtrueの間は常に表示） */}
-            {(isRecording || isDummyAudioSending) && isSpeaking && (
+            {/* 認識中表示（オンデバイス認識の暫定テキストがある間だけ表示） */}
+            {isRecording && draftText && (
               <div className="flex items-center space-x-1 mt-2">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                <span className="text-green-600 text-sm font-medium">検出中</span>
-              </div>
-            )}
-            {/* 認識中表示（pendingTextがある場合のみ表示） */}
-            {(isRecording || isDummyAudioSending) && pendingText && (
-              <div className="flex items-start space-x-2 mt-1">
-                <span className="text-gray-500 text-sm">認識中:</span>
-                <span className="text-gray-400 italic">{pendingText}</span>
+                <div className="w-2 h-2 bg-celadon rounded-full animate-pulse"></div>
+                <span className="text-celadon-active text-sm font-medium">認識中</span>
               </div>
             )}
           </div>
           {text && (
-            <div className="mt-4 text-sm text-gray-600">
-              Characters: {text.length} | Words: {text.split(/\s+/).filter(word => word.length > 0).length}
+            <div className="mt-4 text-sm text-body">
+              文字数: {text.length}
             </div>
           )}
         </div>
 
-        {/* 遅延測定パネル */}
-        {latencyRecords.length > 0 && (
-          <div className="bg-white p-6 rounded-lg shadow-md">
-            <div className="flex justify-between items-center mb-3">
-              <h3 className="text-lg font-medium text-gray-900">
-                ⏱️ 遅延測定（音声キャプチャ → 文字起こし表示）
-              </h3>
-              <button
-                onClick={() => setLatencyRecords([])}
-                className="px-3 py-1 rounded-md text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors"
-              >
-                クリア
-              </button>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-gray-700">
-                <thead>
-                  <tr className="border-b border-gray-300 text-xs text-gray-500">
-                    <th className="py-1 pr-3 text-left">#</th>
-                    <th className="py-1 pr-3 text-left">基準</th>
-                    <th className="py-1 pr-3 text-right">VAD検出</th>
-                    <th className="py-1 pr-3 text-right">初回テキスト</th>
-                    <th className="py-1 pr-3 text-right">確定テキスト</th>
-                    <th className="py-1 pr-3 text-right">発話終了→確定</th>
-                    <th className="py-1 pr-3 text-right">描画完了</th>
-                    <th className="py-1 text-left">テキスト</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...latencyRecords].reverse().map((record, index) => (
-                    <tr key={`${record.itemId}-${index}`} className="border-b border-gray-100">
-                      <td className="py-1 pr-3 text-gray-400">{latencyRecords.length - index}</td>
-                      <td className="py-1 pr-3">{record.basis === 'vad' ? 'VAD' : 'ローカル'}</td>
-                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.vadDetectMs)}</td>
-                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.firstDeltaMs)}</td>
-                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.completedMs)}</td>
-                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.completedFromSpeechEndMs)}</td>
-                      <td className="py-1 pr-3 text-right font-mono">{formatLatencyMs(record.renderMs)}</td>
-                      <td className="py-1 text-gray-500 truncate max-w-[200px]">{record.text}</td>
-                    </tr>
-                  ))}
-                  <tr className="font-medium bg-gray-50">
-                    <td className="py-1 pr-3" colSpan={2}>平均（{latencyRecords.length}件）</td>
-                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.vadDetectMs)}</td>
-                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.firstDeltaMs)}</td>
-                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.completedMs)}</td>
-                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.completedFromSpeechEndMs)}</td>
-                    <td className="py-1 pr-3 text-right font-mono">{averageLatencyMs(latencyRecords, r => r.renderMs)}</td>
-                    <td className="py-1"></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <p className="mt-3 text-xs text-gray-500">
-              「発話開始」はタブ音声がブラウザに取り込まれた時刻（キャプチャ時刻）基準。動画の実再生とのズレはOSのキャプチャ遅延（数十ms程度）のみ。<br/>
-              基準=VAD: OpenAIのspeech_started位置（audio_start_ms）から逆引き ／ 基準=ローカル: クライアント側の無音→有音立ち上がり検出（VADイベントが来ない経路のフォールバック）
-            </p>
-          </div>
-        )}
-
         {/* Instructions */}
-        <div className="bg-blue-50 p-6 rounded-lg border border-blue-200">
-          <h3 className="text-lg font-medium text-blue-900 mb-3">
+        <div className="bg-celadon-soft p-6 rounded-lg border border-celadon/30">
+          <h3 className="text-lg font-light text-celadon-active mb-3">
             使い方
           </h3>
-          <ol className="list-decimal list-inside space-y-2 text-blue-800">
-            <li>音声認識モデルとVAD設定を調整（オプション）</li>
-            <li>「音声入力で文字起こし」をクリック（自動的に接続されます）</li>
-            <li>マイクへのアクセスを許可し、自然に話す</li>
-            <li>リアルタイムで文字起こしが表示される</li>
-            <li>終了時は「文字起こしの停止」をクリック</li>
+          <ol className="list-decimal list-inside space-y-2 text-body">
+            <li>音声ソース（マイク／タブ音声）を選ぶ</li>
+            <li>「録音開始」をクリック（共有ドキュメントへ自動接続されます）</li>
+            <li>マイクまたはタブ音声へのアクセスを許可し、自然に話す</li>
+            <li>端末内のオンデバイス認識でリアルタイムに文字起こしが表示される</li>
+            <li>終了時は「録音を停止」をクリック</li>
           </ol>
-          <div className="mt-4 text-sm text-blue-700">
-            <strong>自動接続について:</strong> 音声入力開始時に自動的にOpenAI APIに接続し、停止後{autoDisconnectDelay}秒で自動切断されます。
-          </div>
-          <div className="mt-2 text-sm text-blue-600">
-            <strong>料金目安:</strong> 約$0.06-0.24/分（バッチ処理より高い）
+          <div className="mt-4 text-sm text-body">
+            <strong className="font-medium">オンデバイス認識について:</strong> 音声はChromeの端末内エンジンで処理され、外部サーバーへは送信されません。初回利用時は日本語の言語パック（約60MB）のインストールが必要です。Chrome 139以降が必要です。
           </div>
         </div>
         </div>
@@ -3404,18 +1497,18 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
 
       {/* テキストクリア確認ダイアログ */}
       {showClearConfirmDialog && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-md mx-4 shadow-xl">
-            <h3 className="text-lg font-bold text-gray-900 mb-4">
+        <div className="fixed inset-0 bg-surface-ink/40 flex items-center justify-center z-50">
+          <div className="bg-surface rounded-lg p-6 max-w-md mx-4 border border-hairline shadow-sm">
+            <h3 className="text-lg font-medium text-ink mb-4">
               テキストをクリアしますか？
             </h3>
-            <p className="text-gray-600 mb-6">
+            <p className="text-body mb-6">
               この操作は取り消せません。すべての文字起こしテキストが削除されます。
             </p>
             <div className="flex justify-end space-x-3">
               <button
                 onClick={() => setShowClearConfirmDialog(false)}
-                className="px-4 py-2 rounded-lg font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 transition-colors"
+                className="px-4 py-2 rounded-lg font-medium text-ink bg-surface border border-hairline hover:bg-surface-soft transition-colors"
               >
                 キャンセル
               </button>
@@ -3424,7 +1517,7 @@ ${currentPrompt ? `📋 プロンプト内容: "${currentPrompt}"` : ''}`;
                   clearText();
                   setShowClearConfirmDialog(false);
                 }}
-                className="px-4 py-2 rounded-lg font-medium text-white bg-red-500 hover:bg-red-600 transition-colors"
+                className="px-4 py-2 rounded-lg font-medium text-on-celadon bg-error hover:opacity-90 transition-colors"
               >
                 クリアする
               </button>
