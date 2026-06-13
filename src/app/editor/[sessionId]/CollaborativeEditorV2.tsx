@@ -15,6 +15,7 @@ import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
+import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState } from '@/lib/browserLlm';
 import ShortcutHelpModal from './ShortcutHelpModal';
 
 // Custom UserUnderline Mark - スキーマ互換のため残すが、視覚効果はなし
@@ -130,18 +131,7 @@ function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[]
     }
   });
 }
-// Chrome 内蔵 Prompt API（Gemini Nano・オンデバイス）。Node では使えずブラウザ専用。型は最小限で定義する。
-interface NanoPromptSession { prompt: (input: string) => Promise<string>; destroy?: () => void; }
-interface NanoPromptMonitor { addEventListener: (type: string, cb: (e: { loaded?: number; total?: number }) => void) => void; }
-interface NanoLanguageModel {
-  availability: () => Promise<'unavailable' | 'downloadable' | 'downloading' | 'available'>;
-  create: (opts: { initialPrompts?: { role: string; content: string }[]; monitor?: (m: NanoPromptMonitor) => void }) => Promise<NanoPromptSession>;
-}
-const getNanoLanguageModel = (): NanoLanguageModel | null => {
-  if (typeof self === 'undefined') return null;
-  const w = self as unknown as { LanguageModel?: NanoLanguageModel; ai?: { languageModel?: NanoLanguageModel } };
-  return w.LanguageModel || w.ai?.languageModel || null;
-};
+// オンデバイスLLM（Gemini Nano / Phi 等）の検出・DLゲートは @/lib/browserLlm に集約（録音画面と共有）。
 // AI編集の校正用システムプロンプト（サーバの /api/rewrite と同一。OpenAI/Nano 双方で使う）
 const buildRewriteSystemPrompt = (prompt: string): string => `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
 
@@ -211,7 +201,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [userCount, setUserCount] = useState(1);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingText, setPendingText] = useState(''); // Recognition in progress text
-  const [protectedTailParas, setProtectedTailParas] = useState(0); // AI再補正で上書きされる末尾段落数（編集禁止＋青字）
+  const [protectedTailChars, setProtectedTailChars] = useState(0); // AI再補正で上書きされる末尾文字数（編集禁止＋青字）
   const [changeHistory, setChangeHistory] = useState<ChangeEntry[]>([]);
   const [showHistory, setShowHistory] = useState(true);
   const lastContentRef = useRef<string>('');
@@ -234,6 +224,36 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const selectRewriteEngine = (engine: 'openai' | 'nano') => {
     setRewriteEngine(engine);
     try { window.localStorage.setItem('collarecox-rewrite-engine', engine); } catch { /* localStorage不可時は無視 */ }
+  };
+  // オンデバイスLLM（Gemini Nano 等）の対応状態。マウント時に検出し、対応時のみ nano を選べるようにする。
+  const [browserLlm, setBrowserLlm] = useState<BrowserLlmState>('unsupported');
+  const [nanoPreparing, setNanoPreparing] = useState(false); // モデルDL/準備中フラグ
+  const [nanoDlProgress, setNanoDlProgress] = useState<number | null>(null); // DL進捗(%)
+  useEffect(() => {
+    let alive = true;
+    probeBrowserLlm().then((s) => {
+      if (!alive) return;
+      setBrowserLlm(s);
+      // 未対応なのに保存値が 'nano' の場合は openai に矯正（ラジオが消えて未選択状態になるのを防ぐ）
+      if (s === 'unsupported' && rewriteEngine === 'nano') selectRewriteEngine('openai');
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // nano を選んだ瞬間にモデルDLを確認し、完了するまで確定させない（完了後に nano へ切替）。失敗時はフォールバックせず openai に戻す。
+  const chooseNanoEngine = async () => {
+    if (rewriteEngine === 'nano' || nanoPreparing) return;
+    setNanoPreparing(true); setNanoDlProgress(null);
+    try {
+      await ensureBrowserLlmReady((loaded) => setNanoDlProgress(Math.round(loaded * 100)));
+      setBrowserLlm('available');
+      selectRewriteEngine('nano');
+    } catch (e) {
+      alert('オンデバイスAIの準備に失敗しました: ' + (e instanceof Error ? e.message : '不明なエラー'));
+      selectRewriteEngine('openai');
+    } finally {
+      setNanoPreparing(false); setNanoDlProgress(null);
+    }
   };
 
   // Markdown Edit states
@@ -648,16 +668,28 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         },
       }),
       // AI再補正で上書きされる末尾領域: 青字＋人による編集(追加/変更/削除)を禁止。
-      // 緑(AI待ち)は別Decorationで、ここは確定黒のうち再補正窓に入る段落のみが対象。
+      // 段落単位ではなく「末尾ちょうど n 文字」を対象にする（段落をまたいで部分的に色付け／ロック）。
+      // 緑(AI待ち)は別Decorationで、ここは確定黒のうち再補正窓に入る末尾文字のみが対象。
       Extension.create({
         name: 'protectedTail',
         addProseMirrorPlugins() {
-          // 末尾から n 個のトップレベルブロックの開始位置（doc座標）
-          const protectedStart = (doc: { childCount: number; child: (i: number) => { nodeSize: number } }, n: number): number => {
-            const startIdx = Math.max(0, doc.childCount - n);
+          // doc 末尾から n テキスト文字ぶんの開始 doc 座標（境界段落の途中になりうる）
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const lockStartPos = (doc: any, n: number): number => {
+            if (n <= 0) return doc.content.size + 1; // ロックなし（番兵: どのステップにも一致しない）
+            let remaining = n;
+            let from = doc.content.size;
             let pos = 0;
-            for (let i = 0; i < startIdx; i++) pos += doc.child(i).nodeSize;
-            return pos;
+            const starts: number[] = [];
+            for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
+            for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
+              const node = doc.child(i);
+              const textLen = node.textContent.length;
+              const nodeStart = starts[i];
+              if (textLen <= remaining) { from = nodeStart + 1; remaining -= textLen; }
+              else { from = nodeStart + 1 + (textLen - remaining); remaining = 0; }
+            }
+            return from;
           };
           return [
             new Plugin({
@@ -676,11 +708,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 if (ySyncMeta?.isChangeOrigin === true || tr.getMeta('addToHistory') === false) return true;
                 const n = (protectedTailKey.getState(state) as number) || 0;
                 if (n <= 0) return true;
-                const from = protectedStart(state.doc, n);
+                const from = lockStartPos(state.doc, n);
                 let blocked = false;
                 tr.steps.forEach((step) => {
                   step.getMap().forEach((oldStart: number, oldEnd: number) => {
-                    if (oldEnd >= from) blocked = true;
+                    // 半開区間: oldEnd===from は保護範囲(from以降)に触れない（文脈側末尾の編集）ので許可。
+                    if (oldEnd > from) blocked = true;
                   });
                 });
                 return !blocked;
@@ -690,19 +723,26 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   const n = (protectedTailKey.getState(state) as number) || 0;
                   if (n <= 0) return DecorationSet.empty;
                   const doc = state.doc;
-                  const total = doc.childCount;
-                  const startIdx = Math.max(0, total - n);
+                  let remaining = n;
                   const decos: Decoration[] = [];
                   let pos = 0;
-                  for (let i = 0; i < total; i++) {
+                  const starts: number[] = [];
+                  for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
+                  // 末尾の段落から遡り、末尾 n 文字ぶんを inline で青字化（境界段落は途中から）
+                  for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
                     const node = doc.child(i);
-                    if (i >= startIdx) {
-                      decos.push(Decoration.node(pos, pos + node.nodeSize, {
-                        style: 'color:#2563eb',
-                        title: 'AI再補正中のため編集できません',
-                      }));
+                    const textLen = node.textContent.length;
+                    const nodeStart = starts[i];
+                    const textStart = nodeStart + 1;
+                    const textEnd = nodeStart + 1 + textLen;
+                    const attrs = { style: 'color:#2563eb', title: 'AI再補正中のため編集できません' };
+                    if (textLen <= remaining) {
+                      if (textLen > 0) decos.push(Decoration.inline(textStart, textEnd, attrs));
+                      remaining -= textLen;
+                    } else {
+                      decos.push(Decoration.inline(textStart + (textLen - remaining), textEnd, attrs));
+                      remaining = 0;
                     }
-                    pos += node.nodeSize;
                   }
                   return DecorationSet.create(doc, decos);
                 },
@@ -840,9 +880,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         if (pending) {
           console.log('[Collaborative Editor V2] 🔤 Pending text:', pending);
         }
-        // AI再補正で上書きされる末尾段落数（編集禁止＋青字の範囲）
-        const pTail = statusMap.get('proofreadTailParas');
-        setProtectedTailParas(typeof pTail === 'number' ? pTail : 0);
+        // AI再補正で上書きされる末尾文字数（編集禁止＋青字の範囲）
+        const pTail = statusMap.get('proofreadTailChars');
+        setProtectedTailChars(typeof pTail === 'number' ? pTail : 0);
       };
 
       // Initial check
@@ -890,12 +930,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     }
   }, [editor, pendingText]);
 
-  // AI再補正で上書きされる末尾段落数を Decoration/filterTransaction へ反映する（青字＋編集禁止）
+  // AI再補正で上書きされる末尾文字数を Decoration/filterTransaction へ反映する（青字＋編集禁止）
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
-    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, protectedTailParas)); }
+    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, protectedTailChars)); }
     catch (e) { console.warn('[Collaborative Editor V2] ⚠️ protectedTail update error:', e); }
-  }, [editor, protectedTailParas]);
+  }, [editor, protectedTailChars]);
 
   // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
   useEffect(() => {
@@ -1096,7 +1136,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Gemini Nano（ブラウザのオンデバイスLLM）でAI編集を実行する。Nodeは関与せず外部送信なし。
   const rewriteWithNano = async (text: string, prompt: string): Promise<string> => {
-    const LM = getNanoLanguageModel();
+    const LM = getBrowserLanguageModel();
     if (!LM) throw new Error('このブラウザはオンデバイスAI(Gemini Nano)に未対応です。Chrome 138+ と chrome://flags の prompt-api 有効化を確認してください');
     const avail = await LM.availability();
     if (avail === 'unavailable') throw new Error('Gemini Nano が利用できません（フラグ未設定・非対応環境・ディスク不足など）');
@@ -1653,7 +1693,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     )}
                   </div>
 
-                  {/* エンジン選択: OpenAI（サーバ）/ Gemini Nano（オンデバイス） */}
+                  {/* エンジン選択: OpenAI（サーバ）/ オンデバイス（ブラウザLLM）。後者は対応ブラウザでのみ表示 */}
                   <div className="mb-2">
                     <label className="block text-sm font-medium text-body-strong mb-2">エンジン</label>
                     <div className="flex items-center gap-4 text-sm text-body">
@@ -1661,25 +1701,29 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                         <input
                           type="radio"
                           name="rewrite-engine"
-                          checked={rewriteEngine === 'openai'}
+                          checked={rewriteEngine === 'openai' || browserLlm === 'unsupported'}
                           onChange={() => selectRewriteEngine('openai')}
                           className="accent-celadon"
                         />
                         OpenAI（サーバ）
                       </label>
-                      <label className="flex items-center gap-1.5 cursor-pointer">
-                        <input
-                          type="radio"
-                          name="rewrite-engine"
-                          checked={rewriteEngine === 'nano'}
-                          onChange={() => selectRewriteEngine('nano')}
-                          className="accent-celadon"
-                        />
-                        オンデバイス（Gemini Nano）
-                      </label>
+                      {browserLlm !== 'unsupported' && (
+                        <label className={`flex items-center gap-1.5 ${nanoPreparing ? 'opacity-60 cursor-wait' : 'cursor-pointer'}`}>
+                          <input
+                            type="radio"
+                            name="rewrite-engine"
+                            checked={rewriteEngine === 'nano'}
+                            disabled={nanoPreparing}
+                            onChange={chooseNanoEngine}
+                            className="accent-celadon"
+                          />
+                          オンデバイス（ブラウザLLM）
+                          {nanoPreparing && <span className="text-xs text-muted">（モデル準備中… {nanoDlProgress ?? 0}%）</span>}
+                        </label>
+                      )}
                     </div>
                     {rewriteEngine === 'nano' && (
-                      <p className="text-xs text-muted mt-1">Chrome内蔵のGemini Nanoで処理（外部送信なし）。要 Chrome 138+ ／ <code>chrome://flags/#prompt-api-for-gemini-nano</code> 有効化 ／ 初回モデルDL。</p>
+                      <p className="text-xs text-muted mt-1">ブラウザ内蔵のオンデバイスLLM（Chrome=Gemini Nano／Edge=Phi 等）で処理（外部送信なし）。選択時にモデルの準備（初回はDL）を確認します。</p>
                     )}
                   </div>
                 </>
@@ -1743,6 +1787,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                         })()}
                       </div>
                     </div>
+                  </div>
+                  {/* 適用前に変換結果を手直しできる編集欄。上の差分プレビューはこの内容に追従する */}
+                  <div className="mt-4">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
+                      適用するテキスト（編集できます）
+                    </label>
+                    <textarea
+                      value={rewriteResult?.rewritten ?? ''}
+                      onChange={(e) => setRewriteResult(rewriteResult ? { ...rewriteResult, rewritten: e.target.value } : null)}
+                      rows={6}
+                      className="w-full p-3 border border-hairline rounded-md text-sm text-body whitespace-pre-wrap focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
+                    />
+                    <p className="mt-1 text-xs text-muted">上の差分プレビューはこの内容に追従します。「適用」でこのテキストを反映します。</p>
                   </div>
                 </>
               )}
