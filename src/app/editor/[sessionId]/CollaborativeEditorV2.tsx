@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { EditorContent, useEditor, Mark, Extension } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
@@ -14,6 +14,7 @@ import { ySyncPluginKey } from 'y-prosemirror';
 import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
 import { getBasePath } from '@/lib/basePath';
+import { addRecentSession } from '@/lib/recentSessions';
 import ShortcutHelpModal from './ShortcutHelpModal';
 
 // Custom UserUnderline Mark - スキーマ互換のため残すが、視覚効果はなし
@@ -55,6 +56,45 @@ const editTrackKey = new PluginKey('editTrack');
 // 確定テキストの直後にグレーで表示し、認識仮説の更新（バックトラック）をその場で反映する。
 // Decorationなので共有ドキュメント本体・編集履歴には一切影響しない
 const pendingTextKey = new PluginKey('pendingTextInline');
+
+// 未確定spanを、そとづけの区切り情報(breaks=改行オフセット配列)で複数行描画する。
+// テキストには \n を埋め込まず、breaksの位置で <br> を挿入して改行表示にする
+// （ProseMirrorのテキストノードでは \n が空白に潰れるため）。
+// 色分け: 先頭から greenLen 文字は緑（オンデバイス確定済・AI校正待ち）、以降はグレー（interim）。
+// breakBeforeFirst=true: 直前に確定テキストがある場合、緑領域の冒頭を必ず行頭から始める
+// （確定文の末尾に続けず <br> で改行する）。
+const PENDING_GREEN = '#3fa874'; // 緑: AI校正待ち（rawBuffer）
+const PENDING_GRAY = '#9ca3af';  // グレー: オンデバイス未確定（interim）
+function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[], greenLen: number, breakBeforeFirst = false) {
+  span.textContent = '';
+  if (!text) return;
+  const green = Math.max(0, Math.min(greenLen || 0, text.length));
+  const cuts = Array.isArray(breaks)
+    ? [...new Set(breaks)].filter((o) => o > 0 && o < text.length).sort((a, b) => a - b)
+    : [];
+  const lines: Array<[number, number]> = [];
+  let s = 0;
+  for (const c of cuts) { lines.push([s, c]); s = c; }
+  lines.push([s, text.length]);
+  const addSeg = (str: string, color: string) => {
+    if (!str) return;
+    const seg = document.createElement('span');
+    seg.style.color = color;
+    seg.textContent = str;
+    span.appendChild(seg);
+  };
+  lines.forEach(([ls, le], i) => {
+    // 行頭の改行: 2行目以降は常に、1行目は直前に確定テキストがあるとき（緑の冒頭を行頭に揃える）。
+    if (i > 0 || breakBeforeFirst) span.appendChild(document.createElement('br'));
+    const gEnd = Math.min(le, green); // この行の緑部分の終端
+    if (gEnd > ls) {
+      addSeg(text.slice(ls, gEnd), PENDING_GREEN);
+      addSeg(text.slice(gEnd, le), PENDING_GRAY);
+    } else {
+      addSeg(text.slice(ls, le), PENDING_GRAY);
+    }
+  });
+}
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -132,6 +172,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   // Force Commit state
   const [isForceCommitPending, setIsForceCommitPending] = useState(false);
 
+  // 閲覧(リードオンリー)モード: URLクエリ ?mode=view のときだけ編集不可。
+  // 既定（mode=edit または未指定）は編集可。共有用の閲覧リンクを想定し、UIトグル・localStorage保存はしない。
+  const [isReadOnly] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('mode') === 'view';
+  });
+
   // Keyboard Shortcuts state
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
 
@@ -172,6 +219,11 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // 校正に参加した配信として履歴に記録（ホームの「最近のセッション」に出る）。
+  useEffect(() => {
+    if (sessionId) addRecentSession(sessionId, 'guest');
+  }, [sessionId]);
 
   // Load user info from localStorage on client side only
   useEffect(() => {
@@ -353,6 +405,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // 認識中（pending）インライン表示のspan要素（使い回してちらつきを防ぐ）
   const pendingSpanRef = useRef<HTMLSpanElement | null>(null);
+  const pendingBreaksRef = useRef<number[]>([]); // 未確定テキストの改行オフセット（そとづけ区切り情報）
+  const pendingGreenLenRef = useRef<number>(0); // 緑(AI校正待ち)で表示する先頭文字数。以降はグレー(interim)
+
+  // 本文スクロール領域: 自動追従スクロール＋手動操作時の停止＋▼ボタンで復帰
+  const editorScrollRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollRef = useRef<boolean>(true); // 自動追従モード（最下部に追従するか）
+  const lastScrollHeightRef = useRef<number>(0); // 直前のscrollHeight（内容が増えたかの判定用）
+  const [showScrollDown, setShowScrollDown] = useState(false); // ▼（最新へ移動）ボタンの表示
   const consumeSpeechAppendSeq = (lastSeenRef: { current: number }): boolean => {
     try {
       const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq') as number | undefined;
@@ -492,6 +552,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   if (doc.lastChild && doc.lastChild.isTextblock) {
                     pos = doc.content.size - 1;
                   }
+                  // 最終ブロックに確定テキストがあるなら、緑の冒頭を行頭に揃えるため先頭で改行する
+                  const lastChild = doc.lastChild;
+                  const breakBeforeFirst = !!(lastChild && lastChild.isTextblock && lastChild.textContent.trim().length > 0);
                   // キーを固定し、span要素を使い回す。テキストの更新はuseEffect側で
                   // 同じ要素のtextContentを直接書き換える（キーにテキストを含めると
                   // 追記のたびにウィジェットDOMが再生成され、表示がちらつくため）
@@ -502,7 +565,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       span.style.color = '#9ca3af';
                       pendingSpanRef.current = span;
                     }
-                    pendingSpanRef.current.textContent = ' ' + text;
+                    renderPendingSpan(pendingSpanRef.current, text, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst);
                     return pendingSpanRef.current;
                   }, { side: 1, key: 'pending-inline' });
                   return DecorationSet.create(doc, [widget]);
@@ -631,6 +694,11 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         console.log('[Collaborative Editor V2] 📊 Transcription status:', transcribing);
 
         // Also update pending text for recognition in progress display
+        // そとづけの区切り情報（改行オフセット）も取り込み、未確定表示を改行する
+        const pBreaks = statusMap.get('pendingBreaks');
+        pendingBreaksRef.current = Array.isArray(pBreaks) ? (pBreaks as number[]) : [];
+        const pGreen = statusMap.get('pendingGreenLen');
+        pendingGreenLenRef.current = typeof pGreen === 'number' ? pGreen : 0;
         const pending = statusMap.get('pendingText') as string;
         setPendingText(pending || '');
         if (pending) {
@@ -663,13 +731,73 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // ウィジェットのDOM要素は使い回しているため、テキストは直接書き換える（ちらつき防止）。
       // Decorationのキーが固定でもこの書き換えで表示は即時更新される
       if (pendingSpanRef.current) {
-        pendingSpanRef.current.textContent = pendingText ? ' ' + pendingText : '';
+        // 直前に確定テキストがあれば緑の冒頭を行頭から始める（描画の都度、現在のdocから判定）
+        const lastChild = editor.state.doc.lastChild;
+        const breakBeforeFirst = !!(lastChild && lastChild.isTextblock && lastChild.textContent.trim().length > 0);
+        renderPendingSpan(pendingSpanRef.current, pendingText, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst);
       }
       editor.view.dispatch(editor.state.tr.setMeta(pendingTextKey, pendingText));
     } catch (error) {
       console.warn('[Collaborative Editor V2] ⚠️ Error updating pending decoration:', error);
     }
   }, [editor, pendingText]);
+
+  // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.setEditable(!isReadOnly);
+  }, [editor, isReadOnly]);
+
+  // ===== 本文スクロール領域の自動追従 =====
+  // 最下部へスクロールし、自動追従モードに戻す
+  const scrollToBottom = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    autoScrollRef.current = true;
+    lastScrollHeightRef.current = el.scrollHeight;
+    setShowScrollDown(false);
+  }, []);
+
+  // 内容増加時: 自動追従中なら最下部へ、停止中なら▼ボタンを出す
+  const handleContentGrow = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    const grew = el.scrollHeight > lastScrollHeightRef.current + 1;
+    if (autoScrollRef.current) {
+      // DOM反映後に確実に最下部へ
+      requestAnimationFrame(() => {
+        const e2 = editorScrollRef.current;
+        if (e2) { e2.scrollTop = e2.scrollHeight; lastScrollHeightRef.current = e2.scrollHeight; }
+      });
+      setShowScrollDown(false);
+    } else {
+      lastScrollHeightRef.current = el.scrollHeight;
+      if (grew) setShowScrollDown(true); // 停止中に末尾が伸びた → ▼を表示
+    }
+  }, []);
+
+  // エディタ更新（リモート追記・ローカル編集・pending反映）で内容増加を検知
+  useEffect(() => {
+    if (!editor) return;
+    editor.on('update', handleContentGrow);
+    return () => { editor.off('update', handleContentGrow); };
+  }, [editor, handleContentGrow]);
+
+  // pending（緑/グレー）の更新でも追従
+  useEffect(() => { handleContentGrow(); }, [pendingText, handleContentGrow]);
+
+  // スクロール操作: 最下部なら自動追従ON、上方向にスクロールしたらOFF
+  const onEditorScroll = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (atBottom) { autoScrollRef.current = true; setShowScrollDown(false); }
+    else { autoScrollRef.current = false; }
+  }, []);
+
+  // 本文クリック（フォーカスがはずれたモード）で自動追従を停止
+  const onEditorMouseDown = useCallback(() => { autoScrollRef.current = false; }, []);
 
   // User registration in Yjs - register/unregister user in the shared users map
   useEffect(() => {
@@ -789,7 +917,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // AI Rewrite - モーダルを開く
   const handleRewrite = () => {
-    if (!editor) return;
+    if (!editor || isReadOnly) return;
 
     // 選択されたテキストを取得
     const { from, to } = editor.state.selection;
@@ -876,7 +1004,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Markdown Edit - 開く
   const handleMarkdownEdit = () => {
-    if (!editor) return;
+    if (!editor || isReadOnly) return;
 
     // 選択範囲のHTMLを取得してMarkdownに変換
     const selectedHtml = getSelectedHtml();
@@ -1064,6 +1192,16 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="bg-surface rounded-lg shadow-sm border border-hairline p-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
+            {/* 閲覧(view)モードの表示。既定(edit)は何も表示しない。URL ?mode=view で有効 */}
+            {isReadOnly && (
+              <span
+                className="px-3 py-1 text-sm rounded-md bg-surface-soft text-muted border border-hairline"
+                title="URLの mode=view により閲覧専用（編集不可）です"
+              >
+                閲覧モード（編集不可）
+              </span>
+            )}
+            {!isReadOnly && (<>
             <button
               onClick={() => editor.chain().focus().toggleBold().run()}
               className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('bold') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
@@ -1096,6 +1234,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               🖍 ハイライト
             </button>
+            </>)}
             <label className="flex items-center space-x-1 text-sm text-body" title="他者の編集を下線で表示">
               <input
                 type="checkbox"
@@ -1130,6 +1269,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               テキストをコピー
             </button>
+            {!isReadOnly && (<>
             <button
               onClick={handleRewrite}
               disabled={isRewriting}
@@ -1145,6 +1285,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               Markdown編集
             </button>
+            </>)}
           </div>
         </div>
       </div>
@@ -1154,9 +1295,40 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="flex gap-4">
         {/* Editor */}
         <div className="flex-1">
-          <div className={`bg-surface rounded-lg shadow-sm border border-hairline min-h-[600px] editor-font-${fontSize}`}>
-            <EditorContent editor={editor} />
-            {/* 手動認識確定ボタン - エディター最下段・右寄せ */}
+          <div className={`bg-surface rounded-lg shadow-sm border border-hairline editor-font-${fontSize}`}>
+            {/* スクロール可能な本文ボックス（末尾自動追従／本文クリックで停止） */}
+            <div className="relative">
+              <div
+                ref={editorScrollRef}
+                onScroll={onEditorScroll}
+                onMouseDown={onEditorMouseDown}
+                className="h-[60vh] min-h-[320px] overflow-y-auto"
+              >
+                <EditorContent editor={editor} />
+                {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration） */}
+                {isTranscribing && !pendingText && (
+                  <div className="px-4 pb-4">
+                    <p className="text-muted italic animate-pulse">
+                      認識中...
+                    </p>
+                  </div>
+                )}
+              </div>
+              {/* ▼ 最新へ移動（自動追従停止中に末尾が伸びたとき表示） */}
+              {showScrollDown && (
+                <button
+                  onClick={scrollToBottom}
+                  title="最新へ移動して自動追従を再開"
+                  aria-label="最新へ移動"
+                  className="absolute bottom-4 right-4 flex h-10 w-10 items-center justify-center rounded-full bg-celadon text-on-celadon shadow-lg ring-1 ring-celadon-active/30 transition-colors hover:bg-celadon-active"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              )}
+            </div>
+            {/* 手動認識確定ボタン - スクロール領域の外・最下段・右寄せ */}
             <div className="px-4 py-2 border-t border-hairline-soft flex justify-end">
               <button
                 onClick={handleForceCommit}
@@ -1171,14 +1343,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
               </button>
             </div>
-            {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration）に変更 */}
-            {isTranscribing && !pendingText && (
-              <div className="px-4 pb-4">
-                <p className="text-muted italic animate-pulse">
-                  認識中...
-                </p>
-              </div>
-            )}
           </div>
         </div>
 
