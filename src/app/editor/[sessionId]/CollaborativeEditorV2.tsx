@@ -61,6 +61,31 @@ const pendingTextKey = new PluginKey('pendingTextInline');
 // AI再補正で上書きされる末尾領域（編集禁止＋青字）用PluginKey
 const protectedTailKey = new PluginKey('protectedTail');
 
+// 利用者マーカー（緑/青の確認待ち領域へ付ける黄色ハイライト）用PluginKey
+const userMarkKey = new PluginKey('userMark');
+// マーカーが暴走的に伸びないよう1マークの最大文字長で丸める（best-effort）
+const USER_MARK_MAX_LEN = 400;
+
+// doc 末尾から n テキスト文字ぶんの開始 doc 座標（境界段落の途中になりうる）。
+// protectedTail（青ロック）と userMark（青領域への自動マーク判定）で共用する。
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const lockStartPos = (doc: any, n: number): number => {
+  if (n <= 0) return doc.content.size + 1; // ロックなし（番兵: どのステップにも一致しない）
+  let remaining = n;
+  let from = doc.content.size;
+  let pos = 0;
+  const starts: number[] = [];
+  for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
+  for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
+    const node = doc.child(i);
+    const textLen = node.textContent.length;
+    const nodeStart = starts[i];
+    if (textLen <= remaining) { from = nodeStart + 1; remaining -= textLen; }
+    else { from = nodeStart + 1 + (textLen - remaining); remaining = 0; }
+  }
+  return from;
+};
+
 // 未確定spanを、そとづけの区切り情報(breaks=改行オフセット配列)で複数行描画する。
 // テキストには \n を埋め込まず、breaksの位置で <br> を挿入して改行表示にする
 // （ProseMirrorのテキストノードでは \n が空白に潰れるため）。
@@ -673,24 +698,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       Extension.create({
         name: 'protectedTail',
         addProseMirrorPlugins() {
-          // doc 末尾から n テキスト文字ぶんの開始 doc 座標（境界段落の途中になりうる）
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const lockStartPos = (doc: any, n: number): number => {
-            if (n <= 0) return doc.content.size + 1; // ロックなし（番兵: どのステップにも一致しない）
-            let remaining = n;
-            let from = doc.content.size;
-            let pos = 0;
-            const starts: number[] = [];
-            for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
-            for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
-              const node = doc.child(i);
-              const textLen = node.textContent.length;
-              const nodeStart = starts[i];
-              if (textLen <= remaining) { from = nodeStart + 1; remaining -= textLen; }
-              else { from = nodeStart + 1 + (textLen - remaining); remaining = 0; }
-            }
-            return from;
-          };
           return [
             new Plugin({
               key: protectedTailKey,
@@ -745,6 +752,107 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     }
                   }
                   return DecorationSet.create(doc, decos);
+                },
+              },
+            }),
+          ];
+        },
+      }),
+      // 利用者マーカー: 緑/青の確認待ち領域をドラッグ選択すると黄色ハイライトを付ける（あとで見直すメモ）。
+      // AI再補正(削除→置換)に対しても from=前寄り / to=後寄り のマッピングで補正後テキストへ広がって残し(best-effort)、
+      // 暴走しないよう1マーク最大USER_MARK_MAX_LEN文字で丸める。Alt+クリックで個別解除。
+      // この校正画面セッション内で保持する(共有docには載せない=他者には出ない・リロードで消える)。
+      Extension.create({
+        name: 'userMark',
+        addProseMirrorPlugins() {
+          type UMark = { id: string; from: number; to: number };
+          return [
+            new Plugin({
+              key: userMarkKey,
+              state: {
+                init: (): UMark[] => [],
+                apply(tr, marks: UMark[], oldState): UMark[] {
+                  const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+                  let mapped: UMark[];
+                  if (tr.docChanged && ySyncMeta?.isChangeOrigin === true) {
+                    // リモートYjs同期(音声追記/AI再補正のdelete→insert)は y-prosemirror が文書全体の
+                    // ReplaceStep を出すことがあり、tr.mapping をそのまま使うとマークが先頭(0..400)へ崩れる。
+                    // 実差分(findDiffStart/findDiffEnd)で「差分前=不変/差分後=シフト/差分内=新差分範囲へ寄せる」。
+                    const oldContent = oldState.doc.content;
+                    const newContent = tr.doc.content;
+                    const dStart = oldContent.findDiffStart(newContent);
+                    if (dStart === null) {
+                      mapped = marks; // 内容差分なし
+                    } else {
+                      const de = oldContent.findDiffEnd(newContent);
+                      const a = de ? de.a : oldState.doc.content.size; // 旧側の差分終端
+                      const b = de ? de.b : tr.doc.content.size;       // 新側の差分終端
+                      const delta = b - a;
+                      const remap = (p: number, isEnd: boolean) => {
+                        if (p <= dStart) return p;            // 差分の前 → 不変
+                        if (p >= a) return p + delta;         // 差分の後ろ → シフト
+                        return isEnd ? b : dStart;            // 差分内 → 終端は新差分末尾へ広げ、始端は差分先頭へ寄せる
+                      };
+                      mapped = marks.map((m) => ({ id: m.id, from: remap(m.from, false), to: remap(m.to, true) }));
+                    }
+                  } else {
+                    // ローカル編集/メタのみ: 精密なマッピング(from=前寄り/to=後寄りで置換後へ広がる)
+                    mapped = marks.map((m) => ({ id: m.id, from: tr.mapping.map(m.from, -1), to: tr.mapping.map(m.to, 1) }));
+                  }
+                  // 暴走防止クランプ + 範囲外/空の除去
+                  const size = tr.doc.content.size;
+                  let next: UMark[] = mapped
+                    .map((m) => ({ id: m.id, from: m.from, to: Math.min(m.to, m.from + USER_MARK_MAX_LEN) }))
+                    .filter((m) => m.from >= 0 && m.from < m.to && m.to <= size);
+                  const action = tr.getMeta(userMarkKey) as { type: string; id?: string; from?: number; to?: number } | undefined;
+                  if (action) {
+                    if (action.type === 'add' && typeof action.from === 'number' && typeof action.to === 'number' && action.from < action.to && action.id) {
+                      next = [...next.filter((m) => m.id !== action.id), { id: action.id, from: action.from, to: action.to }];
+                    } else if (action.type === 'remove') {
+                      next = next.filter((m) => m.id !== action.id);
+                    } else if (action.type === 'clear') {
+                      next = [];
+                    }
+                  }
+                  return next;
+                },
+              },
+              props: {
+                decorations(state) {
+                  const marks = (userMarkKey.getState(state) as UMark[]) || [];
+                  if (marks.length === 0) return DecorationSet.empty;
+                  const size = state.doc.content.size;
+                  const decos = marks
+                    .filter((m) => m.from < m.to && m.to <= size)
+                    .map((m) => Decoration.inline(m.from, m.to, {
+                      class: 'user-mark',
+                      style: 'background-color: rgba(250, 204, 21, 0.45);',
+                      title: 'Alt+クリックでこのマークを解除',
+                    }, { id: m.id }));
+                  return DecorationSet.create(state.doc, decos);
+                },
+                handleDOMEvents: {
+                  // ドラッグ選択を離した時、選択が青(再補正の上書き対象)領域に重なっていれば自動マーク
+                  mouseup(view) {
+                    const { from, to } = view.state.selection;
+                    if (from >= to) return false; // 空選択(クリック)は無視
+                    const n = (protectedTailKey.getState(view.state) as number) || 0;
+                    if (n <= 0) return false;       // 青領域なし→自動マークしない
+                    const lock = lockStartPos(view.state.doc, n);
+                    if (to <= lock) return false;   // 選択が青に重ならない(黒だけ)→マークしない
+                    const id = `m-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+                    view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'add', id, from, to }));
+                    return false; // 既定動作(選択)は妨げない
+                  },
+                },
+                // Alt+クリックでクリック位置のマークを解除
+                handleClick(view, pos, event) {
+                  if (!event.altKey) return false;
+                  const marks = (userMarkKey.getState(view.state) as UMark[]) || [];
+                  const hit = marks.find((m) => pos >= m.from && pos < m.to);
+                  if (!hit) return false;
+                  view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'remove', id: hit.id }));
+                  return true;
                 },
               },
             }),
@@ -1453,6 +1561,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               title="選択したテキストをハイライト"
             >
               🖍 ハイライト
+            </button>
+            <button
+              onClick={() => { if (editor) editor.view.dispatch(editor.state.tr.setMeta(userMarkKey, { type: 'clear' })); }}
+              className="px-3 py-1 text-sm rounded-md transition-colors bg-surface text-ink border border-hairline hover:bg-surface-soft"
+              title="確認マーカー(黄)をすべて消去します。個別に消すにはマーカーをAlt+クリック"
+            >
+              🧹 マーカー消去
             </button>
             </>)}
             <label className="flex items-center space-x-1 text-sm text-body" title="他者の編集を下線で表示">
