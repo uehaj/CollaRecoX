@@ -3,6 +3,10 @@ import OpenAI from "openai";
 
 export const runtime = "nodejs"; // Edge runtime doesn't support Node.js streams
 
+// 音声ファイルの最大サイズ（25MB）。OpenAI 音声APIの上限に合わせ、
+// 認証のないエンドポイントへの過大入力によるコスト/DoS増幅を防ぐ（M-1）。
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -33,6 +37,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // サイズ上限チェック（M-1）
+    if (audioFile.size > MAX_AUDIO_BYTES) {
+      return new Response(
+        JSON.stringify({ error: `Audio file too large (max ${MAX_AUDIO_BYTES} bytes)` }),
+        { status: 413, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     // Call OpenAI transcription API with streaming
     const transcriptionStream = await openai.audio.transcriptions.create({
       file: audioFile,
@@ -52,9 +64,10 @@ export async function POST(req: NextRequest) {
           }
           controller.close();
         } catch (error) {
+          // 詳細はサーバーログのみ。クライアントには汎用メッセージを返す（M-2）
           console.error("Transcription error:", error);
-          const errorData = JSON.stringify({ 
-            error: error instanceof Error ? error.message : "Unknown error" 
+          const errorData = JSON.stringify({
+            error: "Transcription failed"
           }) + "\n";
           controller.enqueue(encoder.encode(errorData));
           controller.close();
@@ -72,14 +85,15 @@ export async function POST(req: NextRequest) {
     });
 
   } catch (error) {
+    // 詳細はサーバーログのみ。クライアントには汎用メッセージを返す（M-2）
     console.error("API route error:", error);
     return new Response(
-      JSON.stringify({ 
-        error: error instanceof Error ? error.message : "Internal server error" 
+      JSON.stringify({
+        error: "Internal server error"
       }),
-      { 
-        status: 500, 
-        headers: { "Content-Type": "application/json" } 
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" }
       }
     );
   }

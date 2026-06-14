@@ -20,6 +20,45 @@ const hostname = '0.0.0.0';
 const sanitizeForLog = (value, maxLength = 100) =>
   String(value).replace(/[\x00-\x1f\x7f]/g, '?').slice(0, maxLength);
 
+// --- WebSocket / CORS のオリジン検証（H-1, H-2） ---------------------------
+// ALLOWED_WS_ORIGINS（カンマ区切り）が設定されていれば、その許可リストで判定する。
+// 未設定時は「リクエストのHostと同一オリジン」または localhost/127.0.0.1 を許可する
+//（=同一オリジンで動く既存クライアントを壊さず、クロスサイト接続のみ拒否する）。
+// Origin ヘッダが無いリクエスト（非ブラウザのネイティブWSクライアント等）は許可する
+//（CSWSH はブラウザ起点の攻撃であり、Origin はブラウザが必ず送るため）。
+const allowedWsOrigins = (process.env.ALLOWED_WS_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const isLocalhostOrigin = (origin) => {
+  try {
+    const { hostname: h } = new URL(origin);
+    return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1';
+  } catch {
+    return false;
+  }
+};
+
+// origin: リクエストの Origin ヘッダ / requestHost: リクエストの Host ヘッダ
+const isOriginAllowed = (origin, requestHost) => {
+  // Origin 無し（非ブラウザ）は許可
+  if (!origin) return true;
+  // 明示的な許可リストが設定されていればそれだけで判定
+  if (allowedWsOrigins.length > 0) return allowedWsOrigins.includes(origin);
+  // デフォルト: 同一ホスト or localhost を許可
+  if (isLocalhostOrigin(origin)) return true;
+  try {
+    const originHost = new URL(origin).host; // host = hostname:port
+    return !!requestHost && originHost === requestHost;
+  } catch {
+    return false;
+  }
+};
+
+// オプションの共有トークン認証（H-2）。設定されている場合のみ強制する（後方互換）。
+const collabAuthToken = process.env.COLLAB_AUTH_TOKEN || '';
+
 // Port
 let port = 8888;
 const portArgIndex = process.argv.findIndex(arg => arg === '-p');
@@ -35,8 +74,21 @@ const handle = app.getRequestHandler();
 
 // Hocuspocus（内蔵サーバなし）
 const hocuspocus = new Hocuspocus({
-  async onAuthenticate({ connection, document, context }) {
-    console.log(`[Hocuspocus] Authentication request for document: ${document?.name || 'unknown'}`);
+  async onAuthenticate({ token, documentName }) {
+    // COLLAB_AUTH_TOKEN が設定されている場合のみ共有トークンを強制する（後方互換, H-2）。
+    // クライアントは HocuspocusProvider の `token` オプションで渡す。
+    console.log(`[Hocuspocus] Authentication request for document: ${sanitizeForLog(documentName || 'unknown')}`);
+    if (collabAuthToken) {
+      if (token !== collabAuthToken) {
+        console.warn('[Hocuspocus] ⛔ Authentication failed: invalid or missing token');
+        throw new Error('Unauthorized');
+      }
+      return true;
+    }
+    // トークン未設定時は従来通り許可するが、運用上の注意としてログに残す
+    if (!dev) {
+      console.warn('[Hocuspocus] ⚠️ COLLAB_AUTH_TOKEN 未設定のため認証なしで接続を許可しています（本番では設定推奨）');
+    }
     return true;
   },
   async onLoadDocument({ documentName }) {
@@ -65,6 +117,15 @@ app.prepare().then(() => {
 
       // /collarecox/api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
       if (parsedUrl.pathname === '/collarecox/api/yjs-sessions') {
+        // セッションID列挙による他人ドキュメントへの到達を防ぐため、
+        // 許可オリジンのみに応答し、ワイルドカード CORS は使わない（H-2）。
+        const origin = req.headers.origin;
+        if (!isOriginAllowed(origin, req.headers.host)) {
+          console.warn(`[HTTP] ⛔ yjs-sessions rejected for disallowed origin: ${sanitizeForLog(origin)}`);
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Forbidden' }));
+          return;
+        }
         const sessions = Array.from(hocuspocus.documents.keys()).map(roomName => {
           const sessionId = roomName.replace('transcribe-editor-v2-', '');
           const doc = hocuspocus.documents.get(roomName);
@@ -74,10 +135,13 @@ app.prepare().then(() => {
             connectionCount: doc?.getConnectionsCount?.() || 0
           };
         });
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        });
+        const headers = { 'Content-Type': 'application/json' };
+        // Origin がある（CORS）場合のみ、許可済みオリジンをエコーバックする
+        if (origin) {
+          headers['Access-Control-Allow-Origin'] = origin;
+          headers['Vary'] = 'Origin';
+        }
+        res.writeHead(200, headers);
         res.end(JSON.stringify({ sessions }));
         return;
       }
@@ -106,12 +170,30 @@ app.prepare().then(() => {
     });
 
     console.log(`[WebSocket] 🔄 UPGRADE EVENT TRIGGERED!`);
-    console.log(`[WebSocket] Request URL: ${request.url}`);
-    console.log(`[WebSocket] Request headers:`, request.headers);
-    
+    console.log(`[WebSocket] Request URL: ${sanitizeForLog(request.url, 200)}`);
+    // 全ヘッダのログ出力は開発時のみ。Authorization/Cookie 等の機微情報はマスクする（L-1）
+    if (dev) {
+      const redactedHeaders = {};
+      for (const [k, v] of Object.entries(request.headers)) {
+        redactedHeaders[k] = /authorization|cookie|sec-websocket-key/i.test(k) ? '[REDACTED]' : v;
+      }
+      console.log(`[WebSocket] Request headers:`, redactedHeaders);
+    }
+
     const { pathname } = parse(request.url);
-    console.log(`[WebSocket] Parsed pathname: ${pathname}`);
-    
+    console.log(`[WebSocket] Parsed pathname: ${sanitizeForLog(pathname, 200)}`);
+
+    // オリジン検証（CSWSH 対策, H-1/H-2）。HMR は Next.js 内部で扱うため対象外。
+    const isAppWsPath =
+      pathname.startsWith('/collarecox/api/yjs-ws') ||
+      pathname === '/collarecox/api/realtime-ws';
+    if (isAppWsPath && !isOriginAllowed(request.headers.origin, request.headers.host)) {
+      console.warn(`[WebSocket] ⛔ Rejected upgrade from disallowed origin: ${sanitizeForLog(request.headers.origin)}`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     if (pathname.startsWith('/collarecox/api/yjs-ws')) {
       console.log('[WebSocket] Processing /collarecox/api/yjs-ws upgrade request');
       try {
@@ -638,16 +720,17 @@ app.prepare().then(() => {
               }
 
               try {
-                const roomName = `transcribe-editor-v2-${message.sessionId}`;
+                // 検証済みの currentSessionId を使う（未検証の message.sessionId は使わない, L-2）
+                const roomName = `transcribe-editor-v2-${currentSessionId}`;
                 const document = hocuspocus.documents.get(roomName);
                 if (document) {
-                  const statusMap = document.getMap(`status-${message.sessionId}`);
+                  const statusMap = document.getMap(`status-${currentSessionId}`);
 
                   // Create observer function and store reference for cleanup
                   forceCommitObserver = (event) => {
                     const forceCommit = statusMap.get('forceCommit');
                     if (forceCommit === true) {
-                      console.log(`[Yjs] 🎤 Force commit requested for session ${message.sessionId}`);
+                      console.log(`[Yjs] 🎤 Force commit requested for session ${sanitizeForLog(currentSessionId)}`);
                       statusMap.set('forceCommit', false); // Reset immediately
 
                       if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
@@ -663,7 +746,7 @@ app.prepare().then(() => {
                   forceCommitStatusMap = statusMap;
 
                   statusMap.observe(forceCommitObserver);
-                  console.log(`[Yjs] 👀 ForceCommit observer set up for session ${message.sessionId}`);
+                  console.log(`[Yjs] 👀 ForceCommit observer set up for session ${sanitizeForLog(currentSessionId)}`);
                 } else {
                   console.log(`[Yjs] ⚠️ Document not found for forceCommit observer: ${roomName}`);
                 }
