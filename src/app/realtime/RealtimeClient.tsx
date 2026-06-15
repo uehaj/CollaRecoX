@@ -165,6 +165,7 @@ export default function RealtimeClient() {
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
   const [showDebugDialog, setShowDebugDialog] = useState<boolean>(false); // 取りこぼし検証ダイアログ
   const [debugDocText, setDebugDocText] = useState<string>(''); // 確定doc本文（取りこぼし比較の対象）
+  const [debugRaw, setDebugRaw] = useState<string>(''); // 生テキスト（共有 raw-<id> Y.Text。校正画面と同一ソース）
   const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
   const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
   // 共同校正画面でのAI再編に使用するモデル（このモデル選択UIは撤去し、サーバ既定に従う）
@@ -886,10 +887,11 @@ export default function RealtimeClient() {
     }
   }, [sentRaw, error]);
 
-  // 取りこぼし検証: 共有docの確定本文(XmlFragment content-<id>)を取り出してダイアログを開く。
-  // 生テキスト(sentRaw)と文字単位diffして、AI校正・自動分割で落ちた文字を可視化する。
+  // 取りこぼし/文字落ち検証: 共有docの確定本文(content-<id>)と、共有の生テキスト(raw-<id> Y.Text)を取り出してダイアログを開く。
+  // 生は校正画面と同一の共有ソース(raw-<id>)を使う（単一の真実源。ローカルのsentRawではなくdoc側を比較）。
   const openDebugDialog = useCallback(async () => {
     let docText = '';
+    let raw = '';
     try {
       const ydoc = hocuspocusDocRef.current;
       if (ydoc && currentSessionId) {
@@ -909,11 +911,14 @@ export default function RealtimeClient() {
           }
         }
         docText = paras.join('\n');
+        // 生テキストは共有 raw Y.Text(校正画面と同一ソース)から取得する。
+        raw = ydoc.getText(`raw-${currentSessionId}`).toString();
       }
     } catch (e) {
-      console.warn('[Debug] 確定doc本文の取得に失敗:', e);
+      console.warn('[Debug] doc/raw の取得に失敗:', e);
     }
     setDebugDocText(docText);
+    setDebugRaw(raw);
     setShowDebugDialog(true);
   }, [currentSessionId]);
 
@@ -1683,20 +1688,20 @@ export default function RealtimeClient() {
             <h3 className="text-lg font-medium text-ink mb-2">
               🔍 取りこぼし検証（生テキスト vs 確定doc・文字単位diff）
             </h3>
-            {!debugDocText ? (
+            {!debugRaw ? (
               <p className="text-body py-6">
-                確定doc本文が取得できませんでした（共有ドキュメント未接続、またはまだAI校正で確定した文章がない可能性があります）。
+                生テキスト(raw)が記録されていません（録音セッションがまだ無い、または共有ドキュメント未接続の可能性があります）。
               </p>
             ) : (
               (() => {
-                // old=確定doc / new=生テキスト。added=生にあってdocに無い(取りこぼし候補)、removed=docにあって生に無い(AI付加/変更)。
-                const parts = Diff.diffChars(debugDocText, sentRaw);
+                // old=確定doc / new=生テキスト(共有raw)。added=生にあってdocに無い(取りこぼし候補)、removed=docにあって生に無い(AI付加/変更)。
+                const parts = Diff.diffChars(debugDocText, debugRaw);
                 const dropped = parts.filter((p) => p.added).reduce((n, p) => n + p.value.length, 0);
                 const aiAdded = parts.filter((p) => p.removed).reduce((n, p) => n + p.value.length, 0);
                 return (
                   <>
                     <div className="text-sm text-body mb-2">
-                      生(認識): <b>{sentRaw.length}</b>字 / 確定doc: <b>{debugDocText.length}</b>字
+                      生(認識): <b>{debugRaw.length}</b>字 / 確定doc: <b>{debugDocText.length}</b>字
                       <span className="ml-3" style={{ color: '#b91c1c' }}>
                         取りこぼし候補(赤): {dropped}字
                       </span>
