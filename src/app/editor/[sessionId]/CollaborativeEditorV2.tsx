@@ -303,6 +303,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Keyboard Shortcuts state
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [showLossDialog, setShowLossDialog] = useState(false); // 文字落ち検証ダイアログ
+  const [lossRaw, setLossRaw] = useState(''); // 生テキスト（共有 raw Y.Text）
+  const [lossDoc, setLossDoc] = useState(''); // 確定doc本文
 
   // AI Rewrite - 定義済みテンプレート
   const promptTemplates = [
@@ -1659,6 +1662,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               テキストをコピー
             </button>
+            <button
+              onClick={() => {
+                // 共有 raw Y.Text(校正前の生テキスト) と 確定doc本文 を取り出して文字落ち検証ダイアログを開く。
+                let raw = '';
+                try { if (ydocRef.current) raw = ydocRef.current.getText(`raw-${sessionId}`).toString(); }
+                catch (e) { console.warn('[Debug] raw取得失敗:', e); }
+                let docText = '';
+                try { if (editor) docText = editor.getText({ blockSeparator: '\n' }); }
+                catch (e) { console.warn('[Debug] doc取得失敗:', e); }
+                setLossRaw(raw); setLossDoc(docText); setShowLossDialog(true);
+              }}
+              title="認識した生テキスト(校正前)と確定docを文字単位で比較し、文字落ちを検出します"
+              className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
+            >
+              🔍 文字落ち検証
+            </button>
             {!isReadOnly && (<>
             <button
               onClick={handleRewrite}
@@ -2110,6 +2129,72 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         isOpen={showShortcutHelp}
         onClose={() => setShowShortcutHelp(false)}
       />
+
+      {/* 文字落ち検証ダイアログ（生テキスト vs 確定doc・文字単位diff） */}
+      {showLossDialog && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
+          onClick={() => setShowLossDialog(false)}
+        >
+          <div
+            className="bg-surface border border-hairline rounded-lg shadow-sm max-w-3xl w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-medium text-ink mb-2">
+              🔍 文字落ち検証（生テキスト vs 確定doc・文字単位diff）
+            </h3>
+            {!lossRaw ? (
+              <p className="text-body py-6">
+                生テキスト(raw)が記録されていません（録音セッションがまだ無い、または旧セッションの可能性があります）。
+              </p>
+            ) : (
+              (() => {
+                // old=確定doc / new=生。added=生にあってdocに無い(文字落ち候補)、removed=docにあって生に無い(AI付加/変更)。
+                const parts = Diff.diffChars(lossDoc, lossRaw);
+                const dropped = parts.filter((p) => p.added).reduce((n, p) => n + p.value.length, 0);
+                const aiAdded = parts.filter((p) => p.removed).reduce((n, p) => n + p.value.length, 0);
+                return (
+                  <>
+                    <div className="text-sm text-body mb-2">
+                      生(認識): <b>{lossRaw.length}</b>字 / 確定doc: <b>{lossDoc.length}</b>字
+                      <span className="ml-3" style={{ color: '#b91c1c' }}>文字落ち候補(赤): {dropped}字</span>
+                      <span className="ml-3" style={{ color: '#2563eb' }}>AI付加/変更(青): {aiAdded}字</span>
+                    </div>
+                    <p className="text-xs text-muted mb-3 leading-relaxed">
+                      赤＝生にあって確定docに無い文字（文字落ち候補）。青＝確定docにあって生に無い文字（AIの整形・かな→漢字・改行等）。
+                      ※「文字単位の厳密diff」のため、AIの言い換え・漢字変換・改行も差分として現れます。
+                    </p>
+                    <div className="flex-1 overflow-y-auto p-3 border border-hairline rounded-md bg-surface-soft whitespace-pre-wrap leading-relaxed text-sm">
+                      {parts.map((p, i) => (
+                        <span
+                          key={i}
+                          style={
+                            p.added
+                              ? { backgroundColor: 'rgba(185,28,28,0.18)', color: '#b91c1c', textDecoration: 'underline' }
+                              : p.removed
+                                ? { backgroundColor: 'rgba(37,99,235,0.12)', color: '#2563eb' }
+                                : undefined
+                          }
+                        >
+                          {p.value}
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                );
+              })()
+            )}
+            <div className="flex justify-end mt-4">
+              <button
+                onClick={() => setShowLossDialog(false)}
+                className="px-4 py-2 rounded-lg font-medium text-ink bg-surface border border-hairline hover:bg-surface-soft transition-colors"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
