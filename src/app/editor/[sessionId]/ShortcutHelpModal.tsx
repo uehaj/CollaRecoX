@@ -116,6 +116,26 @@ export default function ShortcutHelpModal({
             </div>
           </section>
 
+          {/* 確認マーカー */}
+          <section className="mb-6">
+            <h4 className="text-sm font-medium text-body-strong mb-3">
+              確認マーカー（あとで見直す黄色の目印）
+            </h4>
+            <div className="space-y-2">
+              <ShortcutRow
+                keys={['Shift', 'ドラッグ']}
+                description="選択範囲に確認マーカー（黄）を付ける"
+              />
+              <ShortcutRow
+                keys={['右クリック']}
+                description="マーカーのメニュー（メモ入力 / 削除）"
+              />
+            </div>
+            <p className="text-xs text-muted mt-2 px-3 leading-relaxed">
+              マーカーはこの校正画面だけの目印です（他の参加者には表示されず、再読み込みで消えます）。ツールバーの「🧹 マーカー消去」で全削除できます。
+            </p>
+          </section>
+
           {/* 表示 */}
           <section>
             <h4 className="text-sm font-medium text-body-strong mb-3">

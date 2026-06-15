@@ -226,7 +226,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [userCount, setUserCount] = useState(1);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingText, setPendingText] = useState(''); // Recognition in progress text
-  const [protectedTailChars, setProtectedTailChars] = useState(0); // AI再補正で上書きされる末尾文字数（編集禁止＋青字）
+  const [protectedTailChars, setProtectedTailChars] = useState(0); // 青: AI再補正で上書きされる末尾文字数（編集禁止＋青字）
+  const [greenTailChars, setGreenTailChars] = useState(0); // 緑: doc本文に入った校正待ち末尾文字数（編集禁止＋緑字。青の手前=末尾側）
+  const [markMenu, setMarkMenu] = useState<{ x: number; y: number; id: string } | null>(null); // ハイライト右クリックメニュー（クリア/修正入力）
   const [changeHistory, setChangeHistory] = useState<ChangeEntry[]>([]);
   const [showHistory, setShowHistory] = useState(true);
   const lastContentRef = useRef<string>('');
@@ -702,20 +704,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             new Plugin({
               key: protectedTailKey,
               state: {
-                init: () => 0,
+                // {green: 緑(校正待ち)の末尾文字数, blue: 青(再補正の上書き対象)の文字数(緑の手前)}
+                init: () => ({ green: 0, blue: 0 }),
                 apply(tr, prev) {
-                  const meta = tr.getMeta(protectedTailKey);
-                  return typeof meta === 'number' ? meta : prev;
+                  const meta = tr.getMeta(protectedTailKey) as { green?: number; blue?: number } | undefined;
+                  return meta && typeof meta.green === 'number' ? { green: meta.green || 0, blue: meta.blue || 0 } : prev;
                 },
               },
-              // 保護領域への「人による」編集を禁止。リモート(Yjs同期=音声追記/AI再補正)は許可する。
+              // 保護領域(末尾の 緑+青)への「人による」編集を禁止。リモート(Yjs同期=音声追記/AI再補正)は許可する。
               filterTransaction(tr, state) {
                 if (!tr.docChanged) return true;
                 const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
                 if (ySyncMeta?.isChangeOrigin === true || tr.getMeta('addToHistory') === false) return true;
-                const n = (protectedTailKey.getState(state) as number) || 0;
-                if (n <= 0) return true;
-                const from = lockStartPos(state.doc, n);
+                const st = (protectedTailKey.getState(state) as { green: number; blue: number }) || { green: 0, blue: 0 };
+                const total = (st.green || 0) + (st.blue || 0);
+                if (total <= 0) return true;
+                const from = lockStartPos(state.doc, total);
                 let blocked = false;
                 tr.steps.forEach((step) => {
                   step.getMap().forEach((oldStart: number, oldEnd: number) => {
@@ -727,28 +731,32 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
               },
               props: {
                 decorations(state) {
-                  const n = (protectedTailKey.getState(state) as number) || 0;
-                  if (n <= 0) return DecorationSet.empty;
+                  const st = (protectedTailKey.getState(state) as { green: number; blue: number }) || { green: 0, blue: 0 };
+                  if ((st.green || 0) + (st.blue || 0) <= 0) return DecorationSet.empty;
                   const doc = state.doc;
-                  let remaining = n;
-                  const decos: Decoration[] = [];
-                  let pos = 0;
                   const starts: number[] = [];
+                  let pos = 0;
                   for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
-                  // 末尾の段落から遡り、末尾 n 文字ぶんを inline で青字化（境界段落は途中から）
-                  for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
+                  const decos: Decoration[] = [];
+                  // 末尾から: 緑(PENDING_GREEN) → 青(#2563eb) の順に色を割り当てる（段落をまたいで部分的に）。
+                  const segs = [
+                    { remaining: st.green || 0, color: PENDING_GREEN },
+                    { remaining: st.blue || 0, color: '#2563eb' },
+                  ];
+                  let segIdx = 0;
+                  for (let i = doc.childCount - 1; i >= 0 && segIdx < segs.length; i--) {
                     const node = doc.child(i);
-                    const textLen = node.textContent.length;
-                    const nodeStart = starts[i];
-                    const textStart = nodeStart + 1;
-                    const textEnd = nodeStart + 1 + textLen;
-                    const attrs = { style: 'color:#2563eb', title: 'AI再補正中のため編集できません' };
-                    if (textLen <= remaining) {
-                      if (textLen > 0) decos.push(Decoration.inline(textStart, textEnd, attrs));
-                      remaining -= textLen;
-                    } else {
-                      decos.push(Decoration.inline(textStart + (textLen - remaining), textEnd, attrs));
-                      remaining = 0;
+                    let textLen = node.textContent.length;
+                    let segEnd = starts[i] + 1 + textLen; // この段落の末尾(text終端)の doc 座標
+                    while (textLen > 0 && segIdx < segs.length) {
+                      const seg = segs[segIdx];
+                      if (seg.remaining <= 0) { segIdx++; continue; }
+                      const take = Math.min(seg.remaining, textLen);
+                      decos.push(Decoration.inline(segEnd - take, segEnd, { style: `color:${seg.color}` }));
+                      segEnd -= take;
+                      textLen -= take;
+                      seg.remaining -= take;
+                      if (seg.remaining <= 0) segIdx++;
                     }
                   }
                   return DecorationSet.create(doc, decos);
@@ -760,12 +768,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       }),
       // 利用者マーカー: 緑/青の確認待ち領域をドラッグ選択すると黄色ハイライトを付ける（あとで見直すメモ）。
       // AI再補正(削除→置換)に対しても from=前寄り / to=後寄り のマッピングで補正後テキストへ広がって残し(best-effort)、
-      // 暴走しないよう1マーク最大USER_MARK_MAX_LEN文字で丸める。Alt+クリックで個別解除。
+      // 暴走しないよう1マーク最大USER_MARK_MAX_LEN文字で丸める。作成はShift+ドラッグ、解除は右クリック→クリア／ツールバー🧹。
       // この校正画面セッション内で保持する(共有docには載せない=他者には出ない・リロードで消える)。
       Extension.create({
         name: 'userMark',
         addProseMirrorPlugins() {
-          type UMark = { id: string; from: number; to: number };
+          type UMark = { id: string; from: number; to: number; note?: string };
           return [
             new Plugin({
               key: userMarkKey,
@@ -788,23 +796,34 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       const a = de ? de.a : oldState.doc.content.size; // 旧側の差分終端
                       const b = de ? de.b : tr.doc.content.size;       // 新側の差分終端
                       const delta = b - a;
-                      const remap = (p: number, isEnd: boolean) => {
+                      const oldLen = a - dStart; // 旧差分(書き換え前)の長さ
+                      const newLen = b - dStart; // 新差分(書き換え後)の長さ
+                      // 差分内のendpointは、旧差分内の相対位置を新差分へ比例配置する。
+                      // （以前は始端→差分先頭/終端→差分末尾に寄せていたため、書き換えられた緑にマークが
+                      //   付いていると青領域全体へ拡大していた。比例配置でマークの大きさ・位置を概ね保つ。）
+                      const inside = (p: number) => (oldLen <= 0 ? dStart : dStart + Math.round(((p - dStart) / oldLen) * newLen));
+                      const remap = (p: number) => {
                         if (p <= dStart) return p;            // 差分の前 → 不変
                         if (p >= a) return p + delta;         // 差分の後ろ → シフト
-                        return isEnd ? b : dStart;            // 差分内 → 終端は新差分末尾へ広げ、始端は差分先頭へ寄せる
+                        return inside(p);                     // 差分内 → 比例配置（青領域全体へ広げない）
                       };
-                      mapped = marks.map((m) => ({ id: m.id, from: remap(m.from, false), to: remap(m.to, true) }));
+                      mapped = marks.map((m) => {
+                        const nf = remap(m.from);
+                        let nt = remap(m.to);
+                        if (nt <= nf) nt = nf + 1; // 比例で潰れても最低1文字は残す
+                        return { id: m.id, from: nf, to: nt, note: m.note };
+                      });
                     }
                   } else {
                     // ローカル編集/メタのみ: 精密なマッピング(from=前寄り/to=後寄りで置換後へ広がる)
-                    mapped = marks.map((m) => ({ id: m.id, from: tr.mapping.map(m.from, -1), to: tr.mapping.map(m.to, 1) }));
+                    mapped = marks.map((m) => ({ id: m.id, from: tr.mapping.map(m.from, -1), to: tr.mapping.map(m.to, 1), note: m.note }));
                   }
                   // 暴走防止クランプ + 範囲外/空の除去
                   const size = tr.doc.content.size;
                   let next: UMark[] = mapped
-                    .map((m) => ({ id: m.id, from: m.from, to: Math.min(m.to, m.from + USER_MARK_MAX_LEN) }))
+                    .map((m) => ({ id: m.id, from: m.from, to: Math.min(m.to, m.from + USER_MARK_MAX_LEN), note: m.note }))
                     .filter((m) => m.from >= 0 && m.from < m.to && m.to <= size);
-                  const action = tr.getMeta(userMarkKey) as { type: string; id?: string; from?: number; to?: number } | undefined;
+                  const action = tr.getMeta(userMarkKey) as { type: string; id?: string; from?: number; to?: number; note?: string } | undefined;
                   if (action) {
                     if (action.type === 'add' && typeof action.from === 'number' && typeof action.to === 'number' && action.from < action.to && action.id) {
                       next = [...next.filter((m) => m.id !== action.id), { id: action.id, from: action.from, to: action.to }];
@@ -812,6 +831,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       next = next.filter((m) => m.id !== action.id);
                     } else if (action.type === 'clear') {
                       next = [];
+                    } else if (action.type === 'setNote' && action.id) {
+                      next = next.map((m) => (m.id === action.id ? { ...m, note: action.note } : m));
                     }
                   }
                   return next;
@@ -822,37 +843,39 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   const marks = (userMarkKey.getState(state) as UMark[]) || [];
                   if (marks.length === 0) return DecorationSet.empty;
                   const size = state.doc.content.size;
-                  const decos = marks
-                    .filter((m) => m.from < m.to && m.to <= size)
-                    .map((m) => Decoration.inline(m.from, m.to, {
+                  const decos: Decoration[] = [];
+                  for (const m of marks) {
+                    if (!(m.from < m.to && m.to <= size)) continue;
+                    const note = (m.note || '').trim();
+                    decos.push(Decoration.inline(m.from, m.to, {
                       class: 'user-mark',
-                      style: 'background-color: rgba(250, 204, 21, 0.45);',
-                      title: 'Alt+クリックでこのマークを解除',
+                      'data-mark-id': m.id,
+                      style: 'background-color: rgba(250, 204, 21, 0.45);' + (note ? 'border-bottom:2px dotted #ca8a04;' : ''),
                     }, { id: m.id }));
+                    // 修正メモがあればマーク末尾に小さく表示する（編集ロック領域でも残せる注釈）。
+                    if (note) {
+                      decos.push(Decoration.widget(m.to, () => {
+                        const s = document.createElement('span');
+                        s.textContent = ` ✎${note}`;
+                        s.setAttribute('data-mark-id', m.id);
+                        s.style.cssText = 'color:#ca8a04;font-size:0.82em;background:rgba(250,204,21,0.18);border-radius:3px;padding:0 4px;margin:0 2px;white-space:nowrap;';
+                        return s;
+                      }, { side: 1, key: `note-${m.id}-${note}` }));
+                    }
+                  }
                   return DecorationSet.create(state.doc, decos);
                 },
                 handleDOMEvents: {
-                  // ドラッグ選択を離した時、選択が青(再補正の上書き対象)領域に重なっていれば自動マーク
-                  mouseup(view) {
+                  // Shift+ドラッグの時だけ、選択範囲(黒=確定・緑・青いずれでも)にマークを付ける。
+                  // 通常ドラッグは普通の選択（編集目的）として妨げない。解除は右クリックメニュー🗑／ツールバー🧹から。
+                  mouseup(view, event) {
+                    if (!event.shiftKey) return false; // 修飾キー(Shift)無しのドラッグはマークしない
                     const { from, to } = view.state.selection;
-                    if (from >= to) return false; // 空選択(クリック)は無視
-                    const n = (protectedTailKey.getState(view.state) as number) || 0;
-                    if (n <= 0) return false;       // 青領域なし→自動マークしない
-                    const lock = lockStartPos(view.state.doc, n);
-                    if (to <= lock) return false;   // 選択が青に重ならない(黒だけ)→マークしない
+                    if (from >= to) return false; // 空選択(クリック)は無視（マークは範囲選択のみ）
                     const id = `m-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
                     view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'add', id, from, to }));
                     return false; // 既定動作(選択)は妨げない
                   },
-                },
-                // Alt+クリックでクリック位置のマークを解除
-                handleClick(view, pos, event) {
-                  if (!event.altKey) return false;
-                  const marks = (userMarkKey.getState(view.state) as UMark[]) || [];
-                  const hit = marks.find((m) => pos >= m.from && pos < m.to);
-                  if (!hit) return false;
-                  view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'remove', id: hit.id }));
-                  return true;
                 },
               },
             }),
@@ -991,6 +1014,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         // AI再補正で上書きされる末尾文字数（編集禁止＋青字の範囲）
         const pTail = statusMap.get('proofreadTailChars');
         setProtectedTailChars(typeof pTail === 'number' ? pTail : 0);
+        // doc本文に入った校正待ち末尾文字数（編集禁止＋緑字の範囲。青より末尾側）
+        const pGreenDoc = statusMap.get('pendingGreenChars');
+        setGreenTailChars(typeof pGreenDoc === 'number' ? pGreenDoc : 0);
       };
 
       // Initial check
@@ -1038,12 +1064,37 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     }
   }, [editor, pendingText]);
 
-  // AI再補正で上書きされる末尾文字数を Decoration/filterTransaction へ反映する（青字＋編集禁止）
+  // 緑(校正待ち)/青(再補正の上書き対象)の末尾文字数を Decoration/filterTransaction へ反映する（緑字・青字＋編集禁止）
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
-    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, protectedTailChars)); }
+    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, { green: greenTailChars, blue: protectedTailChars })); }
     catch (e) { console.warn('[Collaborative Editor V2] ⚠️ protectedTail update error:', e); }
-  }, [editor, protectedTailChars]);
+  }, [editor, protectedTailChars, greenTailChars]);
+
+  // ハイライト(マーカー)上の右クリックでメニュー(クリア/修正入力)を開く。マーカー以外は通常の右クリック。
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    const dom = editor.view.dom as HTMLElement;
+    const onCtx = (e: MouseEvent) => {
+      const el = (e.target as HTMLElement)?.closest?.('[data-mark-id]') as HTMLElement | null;
+      const id = el?.getAttribute('data-mark-id');
+      if (!id) return;
+      e.preventDefault();
+      setMarkMenu({ x: e.clientX, y: e.clientY, id });
+    };
+    dom.addEventListener('contextmenu', onCtx);
+    return () => dom.removeEventListener('contextmenu', onCtx);
+  }, [editor]);
+
+  // メニューを開いている間: 画面クリック/Escで閉じる。
+  useEffect(() => {
+    if (!markMenu) return;
+    const close = () => setMarkMenu(null);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMarkMenu(null); };
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', onKey);
+    return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey); };
+  }, [markMenu]);
 
   // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
   useEffect(() => {
@@ -1565,7 +1616,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             <button
               onClick={() => { if (editor) editor.view.dispatch(editor.state.tr.setMeta(userMarkKey, { type: 'clear' })); }}
               className="px-3 py-1 text-sm rounded-md transition-colors bg-surface text-ink border border-hairline hover:bg-surface-soft"
-              title="確認マーカー(黄)をすべて消去します。個別に消すにはマーカーをAlt+クリック"
+              title="確認マーカー(黄)をすべて消去します。個別に消すにはマーカーを右クリック→クリア"
             >
               🧹 マーカー消去
             </button>
@@ -1623,6 +1674,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             </>)}
           </div>
         </div>
+        {!isReadOnly && (
+          <div className="mt-2 pt-2 border-t border-hairline text-xs text-muted flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span><kbd className="px-1.5 py-0.5 bg-surface-soft border border-hairline rounded text-ink">Shift</kbd> + ドラッグ で選択範囲に確認マーカー（黄）を付与</span>
+            <span>マーカーを<strong className="font-medium text-body">右クリック</strong>で メモ入力／削除</span>
+            <span>🧹 マーカー消去 で全削除</span>
+            <span className="text-muted-soft">※マーカーはこの校正画面だけの目印（共有されません）</span>
+          </div>
+        )}
       </div>
       </div>
 
@@ -1724,6 +1783,40 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         >
           履歴
         </button>
+      )}
+
+      {/* ハイライト右クリックメニュー（クリア / 修正入力） */}
+      {markMenu && editor && (
+        <div
+          className="fixed z-[60] bg-surface border border-hairline rounded-md shadow-md py-1 text-sm text-body"
+          style={{ left: markMenu.x, top: markMenu.y, minWidth: '160px' }}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            className="block w-full text-left px-3 py-1.5 hover:bg-surface-soft"
+            onClick={() => {
+              const marks = (userMarkKey.getState(editor.state) as Array<{ id: string; note?: string }>) || [];
+              const cur = marks.find((m) => m.id === markMenu.id)?.note || '';
+              const note = window.prompt('修正メモを入力（空欄でメモ削除）', cur);
+              if (note !== null) {
+                editor.view.dispatch(editor.state.tr.setMeta(userMarkKey, { type: 'setNote', id: markMenu.id, note: note.trim() || undefined }));
+              }
+              setMarkMenu(null);
+            }}
+          >
+            ✎ 修正入力
+          </button>
+          <button
+            className="block w-full text-left px-3 py-1.5 hover:bg-surface-soft text-error"
+            onClick={() => {
+              editor.view.dispatch(editor.state.tr.setMeta(userMarkKey, { type: 'remove', id: markMenu.id }));
+              setMarkMenu(null);
+            }}
+          >
+            🗑 クリア（マーカー削除）
+          </button>
+        </div>
       )}
 
       {/* AI Edit Modal */}

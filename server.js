@@ -190,7 +190,8 @@ app.prepare().then(() => {
       lastRunAt: 0,    // 前回実行時刻（最短間隔の制御）
       model: 'gpt-4.1-mini',
       timer: null,     // 定期トリガー（録音停止後の残り分も拾う）
-      rawBuffer: '',   // 校正待ちの生テキスト（自動校正ON時は直接ドキュメントへ書かない）
+      rawBuffer: '',   // 校正待ちの生テキスト（校正入力の源。安定部分は緑としてdoc本文へミラーする）
+      greenChars: 0,   // doc本文へ追記済みの「緑(校正待ち・未校正)」末尾文字数（rawBufferの安定プレフィックスのミラー）
       sentTail: '',    // 送信済み校正テキストの末尾（オーバーラップ文脈用、最大300文字）
       pendingInterim: '',     // クライアントの認識途中テキスト（未確定表示の合成用）
       lastBufferChangeAt: 0,  // バッファ最終更新時刻（停止後の残り全量処理の判定用）
@@ -250,19 +251,25 @@ app.prepare().then(() => {
               }
               autoProofreadState.rawBuffer += message.text;
               autoProofreadState.lastBufferChangeAt = Date.now();
-              // 校正が失敗し続けた場合の安全弁: バッファ過大なら未校正のまま書き出す
-              if (autoProofreadState.rawBuffer.length > 8000) {
-                const degraded = autoProofreadState.rawBuffer.slice(0, 4000);
+              // 安全弁: バッファ過大なら、未同期の先頭(greenChars..4000)を黒(未校正)で書き出し、doc緑はun-green化して4000字打ち切る。
+              // 校正実行中(inFlight)は対象スナップショット(greenChars/rawBuffer)を壊さないよう発火しない（タイムアウト後に次チャンクで拾う）。
+              if (autoProofreadState.rawBuffer.length > 8000 && !autoProofreadState.inFlight) {
+                const unsynced = autoProofreadState.rawBuffer.slice(autoProofreadState.greenChars, 4000);
+                if (unsynced) sendTextToHocuspocusDocument(currentSessionId, unsynced, false);
                 autoProofreadState.rawBuffer = autoProofreadState.rawBuffer.slice(4000);
-                // ポーズ境界も同じ分だけ前方シフトする
+                autoProofreadState.greenChars = 0; // doc緑はun-green(黒)化
                 autoProofreadState.pausePositions = autoProofreadState.pausePositions
                   .map((p) => p - 4000).filter((p) => p > 0);
-                console.warn('[Auto-Proofread] ⚠️ バッファ過大のため4000文字を未校正のまま書き出します');
-                sendTextToHocuspocusDocument(currentSessionId, degraded, false);
+                console.warn('[Auto-Proofread] ⚠️ バッファ過大のため4000文字を未校正のまま確定します');
+                setPendingGreenChars(currentSessionId, 0);
               }
+              // 安定した緑(最後のポーズ/機械改行まで)を doc本文へ追記して実テキスト化する（greenCharsはawait前に同期更新される）。
+              syncStableGreenToDoc(currentSessionId, autoProofreadState)
+                .catch((e) => console.error('[Auto-Proofread] ❌ green sync error:', e));
+              // 校正画面のwidgetは「ライブ末尾(緑・まだdoc未確定)」＋「interim(グレー)」だけを表示する。
               {
-                const pt = autoProofreadState.rawBuffer + autoProofreadState.pendingInterim;
-                setPendingText(currentSessionId, pt, greenDisplayBreaks(autoProofreadState.rawBuffer, autoProofreadState.pausePositions), autoProofreadState.rawBuffer.length);
+                const live = autoProofreadState.rawBuffer.slice(autoProofreadState.greenChars);
+                setPendingText(currentSessionId, live + autoProofreadState.pendingInterim, [], live.length);
               }
               maybeAutoProofread(currentSessionId, clientWs, autoProofreadState)
                 .catch((e) => console.error('[Auto-Proofread] ❌ trigger error:', e));
@@ -295,6 +302,7 @@ app.prepare().then(() => {
               // 既に有効な状態でのエンジン変更等の再送ではバッファ・保護状態を保持する（溜まったテキストの喪失防止）。
               if (!autoProofreadState.timer) {
                 autoProofreadState.rawBuffer = '';
+                autoProofreadState.greenChars = 0;
                 autoProofreadState.sentTail = '';
                 autoProofreadState.pendingInterim = '';
                 autoProofreadState.lastBufferChangeAt = 0;
@@ -304,19 +312,26 @@ app.prepare().then(() => {
                     .catch((e) => console.error('[Auto-Proofread] ❌ timer error:', e));
                 }, 6000);
                 setProofreadTailChars(currentSessionId, 0); // 開始直後は再補正窓なし
+                setPendingGreenChars(currentSessionId, 0);  // 緑なし
               }
-              console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, engine=${autoProofreadState.engine}, バッファ方式)`);
+              console.log(`[Auto-Proofread] 🪄 Enabled (model=${autoProofreadState.model}, engine=${autoProofreadState.engine}, 緑doc化方式)`);
             } else {
               if (autoProofreadState.timer) {
                 clearInterval(autoProofreadState.timer);
                 autoProofreadState.timer = null;
               }
-              // OFF時は校正待ちの生テキストを失わないよう、そのままドキュメントへ書き出す
-              if (autoProofreadState.rawBuffer && currentSessionId) {
-                console.log(`[Auto-Proofread] 📤 無効化に伴いバッファ${autoProofreadState.rawBuffer.length}文字を未校正のまま書き出します`);
-                sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
+              // 安定緑は既にdoc本文にある。doc未確定の「ライブ末尾」だけを未校正で書き出し、doc緑はun-green(黒)に戻す。
+              if (currentSessionId) {
+                const live = autoProofreadState.rawBuffer.slice(autoProofreadState.greenChars);
+                if (live) {
+                  console.log(`[Auto-Proofread] 📤 無効化: ライブ末尾${live.length}文字を未校正で書き出します`);
+                  sendTextToHocuspocusDocument(currentSessionId, live, false);
+                }
                 autoProofreadState.rawBuffer = '';
-                setPendingText(currentSessionId, autoProofreadState.pendingInterim);
+                autoProofreadState.greenChars = 0;
+                autoProofreadState.pausePositions = [];
+                clearPendingText(currentSessionId);
+                setPendingGreenChars(currentSessionId, 0); // doc緑を黒(通常テキスト)に戻す
               }
               console.log('[Auto-Proofread] Disabled');
             setProofreadTailChars(currentSessionId, 0); // 自動校正OFFで保護解除（全文編集可）
@@ -334,15 +349,13 @@ app.prepare().then(() => {
               // 表示用なので上限長で切り詰める（巨大ペイロードの全クライアント配信を防止）
               const interimText = message.text.slice(0, 500);
               autoProofreadState.pendingInterim = interimText;
-              // 自動校正ON時は校正待ちの生バッファも未確定（グレー）として見せる
-              const composite = autoProofreadState.enabled
-                ? autoProofreadState.rawBuffer + interimText
-                : interimText;
-              // そとづけの改行情報（機械分割オフセット）。自動校正ON時のみ算出する。
-              const compositeBreaks = autoProofreadState.enabled
-                ? greenDisplayBreaks(autoProofreadState.rawBuffer, autoProofreadState.pausePositions)
-                : [];
-              setPendingText(currentSessionId, composite, compositeBreaks, autoProofreadState.enabled ? autoProofreadState.rawBuffer.length : 0);
+              // 安定した緑はdoc本文側にあるので、widgetは「ライブ末尾(緑・doc未確定)」＋「interim(グレー)」だけ。
+              if (autoProofreadState.enabled) {
+                const live = autoProofreadState.rawBuffer.slice(autoProofreadState.greenChars);
+                setPendingText(currentSessionId, live + interimText, [], live.length);
+              } else {
+                setPendingText(currentSessionId, interimText, [], 0);
+              }
             }
             break;
 
@@ -389,11 +402,16 @@ app.prepare().then(() => {
         }
         autoProofreadState.pendingProofreads.clear();
       }
-      // 校正待ちバッファが残っていれば未校正のまま書き出す（テキスト喪失防止）
-      if (autoProofreadState.rawBuffer && currentSessionId) {
-        console.log(`[Auto-Proofread] 📤 切断に伴いバッファ${autoProofreadState.rawBuffer.length}文字を未校正のまま書き出します`);
-        sendTextToHocuspocusDocument(currentSessionId, autoProofreadState.rawBuffer, false);
+      // 安定緑は既にdoc本文にある。doc未確定の「ライブ末尾」だけを未校正で書き出し、doc緑はun-green(黒)に戻す。
+      if (currentSessionId) {
+        const live = autoProofreadState.rawBuffer.slice(autoProofreadState.greenChars);
+        if (live) {
+          console.log(`[Auto-Proofread] 📤 切断: ライブ末尾${live.length}文字を未校正のまま書き出します`);
+          sendTextToHocuspocusDocument(currentSessionId, live, false);
+        }
         autoProofreadState.rawBuffer = '';
+        autoProofreadState.greenChars = 0;
+        setPendingGreenChars(currentSessionId, 0); // doc緑を黒(通常テキスト)に戻す
       }
       // 録音者切断で再補正は起きないため保護解除（全文編集可に戻す）
       setProofreadTailChars(currentSessionId, 0);
@@ -734,6 +752,7 @@ app.prepare().then(() => {
   const CONTEXT_CHARS = 80;     // AI補正: 書き換え対象の手前を【文脈】として渡す読み取り専用量（編集可・青字なし）
   const OVERLAP_MAX_PARAS = 12; // AI補正: 書き換え対象として置換する最大段落数（入力サイズ/コストの上限）
   const ONDEVICE_TIMEOUT_MS = 12000; // オンデバイス校正(録音端末のブラウザLLM)の待機上限。超過＝フォールバックせず未校正で続行（stale窓12sに整合）
+  const MAX_GREEN_CHUNK = 1500; // doc本文へミラーする「緑」の最大文字数（=1回の校正対象上限。超過分は次サイクルで処理）
   let _jaWordSegmenter = null;
   function getJaWordSegmenter() {
     if (_jaWordSegmenter === null) {
@@ -923,6 +942,54 @@ app.prepare().then(() => {
     document.transact(() => { statusMap.set('proofreadTailChars', Math.max(0, count | 0)); });
   }
 
+  // doc本文に入っている「緑(校正待ち・未校正)」末尾文字数を共有docへ公開（校正画面の緑色＋編集ロックの範囲）。0で解除。
+  function setPendingGreenChars(sessionId, count) {
+    if (!sessionId) return;
+    const document = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
+    if (!document) return;
+    const statusMap = document.getMap(`status-${sessionId}`);
+    document.transact(() => { statusMap.set('pendingGreenChars', Math.max(0, count | 0)); });
+  }
+
+  // 「安定した緑」(rawBufferの先頭〜最後の機械改行=stableLenまで)を doc本文へ追記して実テキスト化する。
+  // 追記済み量を state.greenChars で追跡し、pendingGreenChars を公開する。
+  // forceAll=true で rawBuffer 全量（ライブ末尾含む）を緑として確定する（録音停止時など）。
+  // bypassInFlight=false の外部呼び出し（local_transcription等）は校正実行中(inFlight)はno-opにして、
+  // 校正の対象スナップショット(greenChars)が await 中に増えてズレるのを防ぐ（緑はrawBufferに溜まり次サイクルでミラー）。
+  async function syncStableGreenToDoc(sessionId, state, forceAll = false, bypassInFlight = false) {
+    if (state.inFlight && !bypassInFlight) return;
+    // 確定済みテキスト(rawBuffer)は全量をdoc本文へ「緑」として出し、選択/ハイライト可能にする。
+    // grey(interim)だけがwidget。1回のミラー量＝1回の校正対象になるため上限MAX_GREEN_CHUNK字でチャンク化（超過は次サイクル）。
+    // forceAll は廃止（常に全量）だが呼び出し互換のため引数は残す。
+    const stableLen = Math.min(state.rawBuffer.length, MAX_GREEN_CHUNK);
+    if (stableLen > state.greenChars) {
+      const fromChars = state.greenChars;
+      const delta = state.rawBuffer.slice(fromChars, stableLen);
+      const pausesInDelta = state.pausePositions
+        .filter((p) => p > fromChars && p < stableLen)
+        .map((p) => p - fromChars);
+      const deltaLines = mechanicalSplit(delta, pausesInDelta);
+      const deltaText = deltaLines.length ? deltaLines.join('\n') : delta;
+      // greenCharsは await の前に同期更新する（呼び出し側がwidget計算で最新値を読めるように）。
+      state.greenChars = stableLen;
+      // 初回の緑は黒の後ろに新段落として、以降は緑の続きとして追記する。
+      await sendTextToHocuspocusDocument(sessionId, deltaText, false, fromChars === 0);
+    }
+    setPendingGreenChars(sessionId, state.greenChars);
+  }
+
+  // 段落をテキスト連結したフラット文字列 flat の [from,to) を取り出し、
+  // 段落境界(paraStarts: フラット上の段落開始オフセットのSet)に改行を入れて返す。
+  function sliceWithBreaks(flat, paraStarts, from, to) {
+    if (to <= from) return '';
+    let out = '';
+    for (let i = from; i < to; i++) {
+      if (i > from && paraStarts.has(i)) out += '\n';
+      out += flat[i];
+    }
+    return out;
+  }
+
   // バッファ方式の自動校正:
   // ローカル認識の確定テキストは（自動校正ON時）直接ドキュメントへは書かず、
   // サーバ側バッファ（state.rawBuffer）に溜める。一定量たまったら、送信済み校正
@@ -941,25 +1008,23 @@ app.prepare().then(() => {
     // 最後の改行より後ろ＝今まさに話している部分なので、AI（結合・修正）にも確定にもかけず、
     // 緑のまま残す。録音停止後など12秒更新がなければ、ライブ末尾も無くなったとみなして全量を確定する。
     const stale = state.lastBufferChangeAt > 0 && now - state.lastBufferChangeAt > 12000;
-    let targetLen;
+    // 確定対象は「安定した緑(最後のポーズ/機械改行まで)」。録音停止後(stale)はライブ末尾も含めて全量を確定する。
     if (stale) {
       if (state.rawBuffer.length < 10) return;
-      targetLen = state.rawBuffer.length;
     } else {
       const breaks = mechanicalBreakOffsets(state.rawBuffer, state.pausePositions, MECH_MAX_LINE);
       if (breaks.length === 0) return; // まだ区切りがない＝全体がライブ末尾。確定しない
-      targetLen = breaks[breaks.length - 1]; // 最後の改行まで（その後ろは緑のまま残す）
-      if (targetLen > MAX_TARGET_CHARS) {
-        // 上限超過時は MAX 以内の最後の改行位置まで（区切りで切る）
-        const within = breaks.filter((b) => b <= MAX_TARGET_CHARS);
-        targetLen = within.length ? within[within.length - 1] : MAX_TARGET_CHARS;
-      }
     }
-    const target = state.rawBuffer.slice(0, targetLen);
 
     state.inFlight = true;
     state.lastRunAt = now;
     try {
+      // 安定した緑(stale時はライブ末尾含む全量)を doc本文へ確実にミラー(bypassInFlight=trueで自分の同期は実行)してから、
+      // その緑(greenChars)を丸ごと確定対象にする。以降のawait中は外部syncがno-opになりgreenCharsは固定される。
+      await syncStableGreenToDoc(sessionId, state, stale, true);
+      const targetLen = state.greenChars; // 校正対象のスナップショット（await中も不変）
+      if (targetLen < 1) return; // 確定すべき緑がない（finallyでinFlight解除）
+      const target = state.rawBuffer.slice(0, targetLen);
       console.log(`[Auto-Proofread] 🪄 校正開始: ${target.length}文字（バッファ${state.rawBuffer.length}文字, model=${state.model}）`);
       if (clientWs.readyState === 1) {
         clientWs.send(JSON.stringify({
@@ -973,50 +1038,39 @@ app.prepare().then(() => {
       const mechLines = mechanicalSplit(target, pausesInTarget);
       const greenSplit = mechLines.length > 0 ? mechLines.join('\n') : target;
 
-      // ② オーバーラップを「文字単位」で既確定テキストから読み戻す（段落しばりなし）：
-      //    (a) 書き換え対象（末尾・ちょうどREWRITE_CHARS字）＝再補正して置換する＝青字＋編集不可。段落をまたいで部分的に取る。
-      //    (b) 文脈（その手前・累計CONTEXT_CHARS字）＝AIに【文脈】として渡すだけで上書きしない＝編集可・青字なし。
-      let windowText = '';            // 書き換え対象テキスト（内部の段落区切りは改行で表す）
-      let deleteCharCount = 0;        // 置換する末尾の文字数（=青/ロック領域の文字数）
+      // ② 青オーバーラップ(再補正の上書き対象=黒の末尾)を読む。doc末尾の緑(greenChars文字=これから置換する緑)を
+      //    スキップしてから、その手前の黒を REWRITE_CHARS 字、さらに手前を文脈 CONTEXT_CHARS 字読む。
+      let windowText = '';            // 青(overlap)テキスト（AI入力用・段落区切りは改行）
+      let blueDeleteChars = 0;        // 置換する青(黒側overlap)の文字数
       let contextBefore = '';
       const proofDoc = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
       if (proofDoc) {
         const proofFragment = proofDoc.getXmlFragment(`content-${sessionId}`);
-        // 末尾から累計REWRITE_CHARS字に達するまで段落を集める（先頭=最古に集めた段落は部分的に窓へ入りうる）
-        const collected = []; // ドキュメント順
-        let sum = 0;
-        let idx = proofFragment.length - 1;
-        for (; idx >= 0 && sum < REWRITE_CHARS; idx--) {
+        // 末尾から (緑 + 青 + 文脈) 文字ぶんの段落を集める
+        const need = state.greenChars + REWRITE_CHARS + CONTEXT_CHARS;
+        const collected = []; let csum = 0; let idx = proofFragment.length - 1;
+        for (; idx >= 0 && csum < need; idx--) {
           const t = getParagraphTextByIndex(proofFragment, idx);
           if (t === null) break; // 段落以外（画像等）に当たったら打ち切り
-          collected.unshift(t);
-          sum += t.length;
+          collected.unshift(t); csum += t.length;
         }
-        // 窓に入らない先頭段落の頭の文字数（=境界段落のうち文脈側に残る分）
-        const over = Math.max(0, sum - REWRITE_CHARS);
-        windowText = collected.map((t, k) => (k === 0 && over > 0) ? t.slice(over) : t).join('\n');
-        deleteCharCount = sum - over; // = min(REWRITE_CHARS, sum)。窓の実文字数（改行は含めない）
-        // (b) 文脈：境界段落の頭(書き換え窓の直前・最大CONTEXT_CHARS字) + さらに手前の段落を累計CONTEXT_CHARS字まで。
-        //     境界段落の頭を丸ごと入れると大段落で数百字に膨らむため、窓の直前ぶんだけに切る。
-        let cacc = 0;
-        if (over > 0) {
-          const headCtx = collected[0].slice(Math.max(0, over - CONTEXT_CHARS), over);
-          contextBefore = headCtx;
-          cacc = headCtx.length;
-        }
-        for (; idx >= 0 && cacc < CONTEXT_CHARS; idx--) {
-          const t = getParagraphTextByIndex(proofFragment, idx);
-          if (t === null) break;
-          contextBefore = t + (contextBefore ? '\n' + contextBefore : '');
-          cacc += t.length;
-        }
+        // 段落をテキスト連結(改行なし)し、段落境界オフセットを記録する。緑のスキップはchar単位で行う。
+        let flat = ''; const paraStarts = new Set();
+        for (const t of collected) { paraStarts.add(flat.length); flat += t; }
+        const total = flat.length;
+        const greenStart = Math.max(0, total - state.greenChars); // 緑が始まるflatオフセット（=青の終端）
+        const blueStart = Math.max(0, greenStart - REWRITE_CHARS);
+        const ctxStart = Math.max(0, blueStart - CONTEXT_CHARS);
+        blueDeleteChars = greenStart - blueStart; // <= REWRITE_CHARS
+        windowText = sliceWithBreaks(flat, paraStarts, blueStart, greenStart);
+        contextBefore = sliceWithBreaks(flat, paraStarts, ctxStart, blueStart);
       }
 
-      // ③ AI補正の入力 = 書き換え対象（既確定・再補正対象の末尾REWRITE_CHARS字）＋新しい緑。
-      const combinedInput = deleteCharCount > 0
+      // ③ AI補正の入力 = 青オーバーラップ(再補正対象の黒) ＋ 新しい緑。
+      const combinedInput = blueDeleteChars > 0
         ? windowText + '\n' + greenSplit
         : greenSplit;
-      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + 書き換え対象${deleteCharCount}字 + 文脈${contextBefore.length}字`);
+      console.log(`[Auto-Proofread] ✂️ 機械分割: 緑${mechLines.length}行 + 青overlap${blueDeleteChars}字 + 文脈${contextBefore.length}字 + doc緑${state.greenChars}字`);
 
       // ④ AI補正: エンジンに応じてサーバOpenAIか録音端末のブラウザLLMに委譲する。
       //    オンデバイスは「外部送信なし」が趣旨のため、失敗時もOpenAIへはフォールバックせず、
@@ -1033,17 +1087,17 @@ app.prepare().then(() => {
             throw new Error('オンデバイス校正の出力が異常な長さ');
           }
         } catch (e) {
-          console.warn('[Auto-Proofread] ⚠️ オンデバイス校正失敗（フォールバックせず未校正で追記）:', e.message);
-          // 録音端末が切断済みなら close ハンドラが全量フラッシュするため、ここでは触らない（二重書き防止）。
+          console.warn('[Auto-Proofread] ⚠️ オンデバイス校正失敗（フォールバックせず未校正のまま確定）:', e.message);
+          // 緑(target)は既にdoc本文にある。これを「未校正のまま確定(黒)」化して前進する（追記しない＝二重書き防止）。
           if (clientWs.readyState === 1) {
-            // 新しい緑（target）を未校正のまま追記し、バッファを前進させる（外部送信はしない）。
-            await sendTextToHocuspocusDocument(sessionId, greenSplit, false);
-            state.rawBuffer = state.rawBuffer.slice(target.length);
-            state.pausePositions = state.pausePositions.map((p) => p - target.length).filter((p) => p > 0);
+            state.rawBuffer = state.rawBuffer.slice(targetLen);
+            state.greenChars = Math.max(0, state.greenChars - targetLen); // =0（targetLen=greenChars）。doc緑は黒テキストとして残る。
+            state.pausePositions = state.pausePositions.map((p) => p - targetLen).filter((p) => p > 0);
             state.sentTail = (state.sentTail + greenSplit.replace(/\n/g, '')).slice(-300);
-            const pt = state.rawBuffer + state.pendingInterim;
-            setPendingText(sessionId, pt, greenDisplayBreaks(state.rawBuffer, state.pausePositions), state.rawBuffer.length);
-            setProofreadTailChars(sessionId, 0); // 未校正で追記＝再補正窓なし。青ロックを解除して編集可に戻す
+            setPendingGreenChars(sessionId, state.greenChars);
+            setProofreadTailChars(sessionId, 0); // 未校正で確定＝再補正窓なし。青ロックを解除して編集可に戻す
+            const live = state.rawBuffer.slice(state.greenChars);
+            setPendingText(sessionId, live + state.pendingInterim, [], live.length);
             clientWs.send(JSON.stringify({ type: 'auto_proofread_warning', error: e.message, chars: target.length }));
           }
           return; // finally で inFlight 解除
@@ -1061,23 +1115,26 @@ app.prepare().then(() => {
       if (newParas.length === 0) return;
       const outText = newParas.join('\n');
 
-      // ⑤ 書き換え対象（末尾ちょうどdeleteCharCount字）を削除し、再補正結果（書き換え対象＋緑）を
-      //    追記して置き換える（単一トランザクション）。対象が空＝初回は実質追記になる。
-      await replaceTailChars(sessionId, deleteCharCount, outText);
+      // ⑤ doc末尾の [緑(targetLen) + 青overlap(blueDeleteChars)] を削除し、再補正結果(黒)を追記して置き換える
+      //    （単一トランザクション）。緑→黒が1回の置換になるので、緑に付けた userMark は補正後テキストへ残る。
+      //    削除量はawait中も不変の targetLen を使う（state.greenChars は通常等しいが、スナップショット固定で安全側に）。
+      await replaceTailChars(sessionId, targetLen + blueDeleteChars, outText);
       state.lastOutEndedSentence = /[。．！？!?]\s*$/.test(outText);
 
-      // 校正済み分をバッファから取り除き、文脈用の送信済み末尾を更新する
-      state.rawBuffer = state.rawBuffer.slice(target.length);
+      // 確定した緑(target)分をrawBufferから取り除く。doc緑は置換済みなので greenChars=0。
+      state.rawBuffer = state.rawBuffer.slice(targetLen);
+      state.greenChars = 0;
       // ポーズ境界も消費分だけ前方シフト（負になったものは破棄）
       state.pausePositions = state.pausePositions
-        .map((p) => p - target.length)
+        .map((p) => p - targetLen)
         .filter((p) => p > 0);
       state.sentTail = (state.sentTail + outText.replace(/\n/g, '')).slice(-300);
+      setPendingGreenChars(sessionId, 0);
 
-      // 校正画面の未確定（グレー）表示を更新（バッファが減ったため）。区切り情報も添える。
+      // 校正画面のwidget表示を更新（ライブ末尾(緑・doc未確定)＋interim(グレー)）。
       {
-        const pt = state.rawBuffer + state.pendingInterim;
-        setPendingText(sessionId, pt, greenDisplayBreaks(state.rawBuffer, state.pausePositions), state.rawBuffer.length);
+        const live = state.rawBuffer.slice(state.greenChars);
+        setPendingText(sessionId, live + state.pendingInterim, [], live.length);
       }
 
       console.log(`[Auto-Proofread] ✅ 校正完了: ${newParas.length}段落を確定/置換（残バッファ${state.rawBuffer.length}文字）`);
