@@ -6,6 +6,7 @@ const { Hocuspocus } = require('@hocuspocus/server'); // ← ここ重要（Serv
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const crypto = require('crypto');
 
 if (!process.env.OPENAI_API_KEY) {
   console.error('❌ ERROR: OPENAI_API_KEY environment variable is required');
@@ -19,6 +20,69 @@ const hostname = '0.0.0.0';
 // （クライアント由来テキストによるログインジェクション・ログ肥大の防止）
 const sanitizeForLog = (value, maxLength = 100) =>
   String(value).replace(/[\x00-\x1f\x7f]/g, '?').slice(0, maxLength);
+
+// --- WebSocket / CORS のオリジン検証（H-1, H-2） ---------------------------
+// ALLOWED_WS_ORIGINS（カンマ区切り）が設定されていれば、その許可リストで判定する。
+// 未設定時は「リクエストのHostと同一オリジン」または localhost/127.0.0.1 を許可する
+//（=同一オリジンで動く既存クライアントを壊さず、クロスサイト接続のみ拒否する）。
+// Origin ヘッダが無いリクエスト（非ブラウザのネイティブWSクライアント等）は許可する
+//（CSWSH はブラウザ起点の攻撃であり、Origin はブラウザが必ず送るため）。
+const allowedWsOrigins = (process.env.ALLOWED_WS_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const isLocalhostOrigin = (origin) => {
+  try {
+    const { hostname: h } = new URL(origin);
+    return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1';
+  } catch {
+    return false;
+  }
+};
+
+// origin: リクエストの Origin ヘッダ / requestHost: リクエストの Host ヘッダ
+const isOriginAllowed = (origin, requestHost) => {
+  // Origin 無し（非ブラウザ）は許可
+  if (!origin) return true;
+  // 明示的な許可リストが設定されていればそれだけで判定
+  if (allowedWsOrigins.length > 0) return allowedWsOrigins.includes(origin);
+  // デフォルト: 同一ホスト or localhost を許可
+  if (isLocalhostOrigin(origin)) return true;
+  try {
+    const originHost = new URL(origin).host; // host = hostname:port
+    return !!requestHost && originHost === requestHost;
+  } catch {
+    return false;
+  }
+};
+
+// オプションの共有トークン認証（H-2）。設定されている場合のみ強制する（後方互換）。
+const collabAuthToken = process.env.COLLAB_AUTH_TOKEN || '';
+
+// --- 配信権(hostToken)の検証 -----------------------------------------------
+// 配信(/api/realtime-ws)は「配信者」だけが行えるべきだが、sessionId は校正リンクで
+// 露出するため、sessionId だけでは配信権の証明にならない。そこで配信には
+// hostToken = HMAC_SHA256(SERVER_SECRET, sessionId) を要求し、サーバーが再計算して照合する。
+// SERVER_SECRET だけ保持すればよくセッションごとの保存が不要（ステートレス・複数プロセス可）。
+// SERVER_SECRET 未設定時は検証をスキップする（開発互換。本番では設定必須）。
+const serverSecret = process.env.SERVER_SECRET || '';
+
+const computeHostToken = (sessionId) =>
+  crypto.createHmac('sha256', serverSecret).update(String(sessionId)).digest('hex');
+
+const verifyHostToken = (sessionId, token) => {
+  if (!serverSecret) return true; // 開発互換: 秘密鍵未設定なら検証しない
+  if (!sessionId || !token) return false;
+  const expected = computeHostToken(sessionId);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(token));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+// ログ用: URL から hostToken の値を伏せる
+const redactTokenInUrl = (url) =>
+  String(url).replace(/([?&]hostToken=)[^&]*/i, '$1[REDACTED]');
 
 // Port
 let port = 8888;
@@ -35,8 +99,21 @@ const handle = app.getRequestHandler();
 
 // Hocuspocus（内蔵サーバなし）
 const hocuspocus = new Hocuspocus({
-  async onAuthenticate({ connection, document, context }) {
-    console.log(`[Hocuspocus] Authentication request for document: ${document?.name || 'unknown'}`);
+  async onAuthenticate({ token, documentName }) {
+    // COLLAB_AUTH_TOKEN が設定されている場合のみ共有トークンを強制する（後方互換, H-2）。
+    // クライアントは HocuspocusProvider の `token` オプションで渡す。
+    console.log(`[Hocuspocus] Authentication request for document: ${sanitizeForLog(documentName || 'unknown')}`);
+    if (collabAuthToken) {
+      if (token !== collabAuthToken) {
+        console.warn('[Hocuspocus] ⛔ Authentication failed: invalid or missing token');
+        throw new Error('Unauthorized');
+      }
+      return true;
+    }
+    // トークン未設定時は従来通り許可するが、運用上の注意としてログに残す
+    if (!dev) {
+      console.warn('[Hocuspocus] ⚠️ COLLAB_AUTH_TOKEN 未設定のため認証なしで接続を許可しています（本番では設定推奨）');
+    }
     return true;
   },
   async onLoadDocument({ documentName }) {
@@ -63,22 +140,12 @@ app.prepare().then(() => {
       const parsedUrl = parse(req.url, true);
       console.log('🔵 [HTTP] Parsed URL:', parsedUrl.pathname);
 
-      // /collarecox/api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
+      // 旧 /collarecox/api/yjs-sessions（全アクティブセッション列挙）は廃止した。
+      // リンクシークレット（ケイパビリティ）モデルでは、セッションは推測不能なIDを
+      // 知る者のみがアクセスできる。全件列挙は他人のセッションを発見可能にするため提供しない。
       if (parsedUrl.pathname === '/collarecox/api/yjs-sessions') {
-        const sessions = Array.from(hocuspocus.documents.keys()).map(roomName => {
-          const sessionId = roomName.replace('transcribe-editor-v2-', '');
-          const doc = hocuspocus.documents.get(roomName);
-          return {
-            sessionId,
-            roomName,
-            connectionCount: doc?.getConnectionsCount?.() || 0
-          };
-        });
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        });
-        res.end(JSON.stringify({ sessions }));
+        res.writeHead(410, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Gone: session enumeration is disabled' }));
         return;
       }
 
@@ -106,12 +173,30 @@ app.prepare().then(() => {
     });
 
     console.log(`[WebSocket] 🔄 UPGRADE EVENT TRIGGERED!`);
-    console.log(`[WebSocket] Request URL: ${request.url}`);
-    console.log(`[WebSocket] Request headers:`, request.headers);
-    
-    const { pathname } = parse(request.url);
-    console.log(`[WebSocket] Parsed pathname: ${pathname}`);
-    
+    console.log(`[WebSocket] Request URL: ${sanitizeForLog(redactTokenInUrl(request.url), 200)}`);
+    // 全ヘッダのログ出力は開発時のみ。Authorization/Cookie 等の機微情報はマスクする（L-1）
+    if (dev) {
+      const redactedHeaders = {};
+      for (const [k, v] of Object.entries(request.headers)) {
+        redactedHeaders[k] = /authorization|cookie|sec-websocket-key/i.test(k) ? '[REDACTED]' : v;
+      }
+      console.log(`[WebSocket] Request headers:`, redactedHeaders);
+    }
+
+    const { pathname, query } = parse(request.url, true);
+    console.log(`[WebSocket] Parsed pathname: ${sanitizeForLog(pathname, 200)}`);
+
+    // オリジン検証（CSWSH 対策, H-1/H-2）。HMR は Next.js 内部で扱うため対象外。
+    const isAppWsPath =
+      pathname.startsWith('/collarecox/api/yjs-ws') ||
+      pathname === '/collarecox/api/realtime-ws';
+    if (isAppWsPath && !isOriginAllowed(request.headers.origin, request.headers.host)) {
+      console.warn(`[WebSocket] ⛔ Rejected upgrade from disallowed origin: ${sanitizeForLog(request.headers.origin)}`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     if (pathname.startsWith('/collarecox/api/yjs-ws')) {
       console.log('[WebSocket] Processing /collarecox/api/yjs-ws upgrade request');
       try {
@@ -132,6 +217,14 @@ app.prepare().then(() => {
       }
     } else if (pathname === '/collarecox/api/realtime-ws') {
       console.log('[WebSocket] Processing /collarecox/api/realtime-ws upgrade request');
+      // 配信権の検証: 配信(音声配信)には hostToken が必要。校正リンク(sessionIdのみ)の
+      // 利用者は hostToken を持たないため配信できない。OpenAI接続を開く前にここで遮断する。
+      if (!verifyHostToken(query.session, query.hostToken)) {
+        console.warn(`[WebSocket] ⛔ Rejected broadcast: invalid/missing hostToken for session ${sanitizeForLog(query.session)}`);
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
       console.log('[WebSocket] Socket readable:', socket.readable);
       console.log('[WebSocket] Socket writable:', socket.writable);
       console.log('[WebSocket] Head length:', head.length);
