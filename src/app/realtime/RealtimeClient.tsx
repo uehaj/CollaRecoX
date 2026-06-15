@@ -12,6 +12,7 @@ import { newSessionId } from '@/lib/sessionId';
 import { createBroadcastSession, getHostToken } from '@/lib/session';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState, type NanoPromptSession } from '@/lib/browserLlm';
 import packageJson from '../../../package.json';
+import * as Diff from 'diff';
 
 // ===== オンデバイス認識（ChromeオンデバイスWeb Speech API） =====
 // Chrome 139+のオンデバイス認識（processLocally）とChrome 135+のMediaStreamTrack入力
@@ -162,6 +163,8 @@ export default function RealtimeClient() {
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
+  const [showDebugDialog, setShowDebugDialog] = useState<boolean>(false); // 取りこぼし検証ダイアログ
+  const [debugDocText, setDebugDocText] = useState<string>(''); // 確定doc本文（取りこぼし比較の対象）
   const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
   const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
   // 共同校正画面でのAI再編に使用するモデル（このモデル選択UIは撤去し、サーバ既定に従う）
@@ -883,6 +886,37 @@ export default function RealtimeClient() {
     }
   }, [sentRaw, error]);
 
+  // 取りこぼし検証: 共有docの確定本文(XmlFragment content-<id>)を取り出してダイアログを開く。
+  // 生テキスト(sentRaw)と文字単位diffして、AI校正・自動分割で落ちた文字を可視化する。
+  const openDebugDialog = useCallback(async () => {
+    let docText = '';
+    try {
+      const ydoc = hocuspocusDocRef.current;
+      if (ydoc && currentSessionId) {
+        const Y = await import('yjs');
+        const fragment = ydoc.getXmlFragment(`content-${currentSessionId}`);
+        const paras: string[] = [];
+        for (let i = 0; i < fragment.length; i++) {
+          const el = fragment.get(i);
+          // XmlElement(段落)内のXmlTextを連結し、段落は改行で結合する（スモークのfragmentTextと同方式）。
+          if (el instanceof Y.XmlElement) {
+            let t = '';
+            for (let j = 0; j < el.length; j++) {
+              const child = el.get(j);
+              if (child instanceof Y.XmlText) t += child.toString();
+            }
+            paras.push(t);
+          }
+        }
+        docText = paras.join('\n');
+      }
+    } catch (e) {
+      console.warn('[Debug] 確定doc本文の取得に失敗:', e);
+    }
+    setDebugDocText(docText);
+    setShowDebugDialog(true);
+  }, [currentSessionId]);
+
   // Generate or retrieve session ID
   const generateSessionId = useCallback(() => {
     if (!currentSessionId) {
@@ -1528,6 +1562,14 @@ export default function RealtimeClient() {
                 📋 コピー
               </button>
               <button
+                onClick={openDebugDialog}
+                disabled={!sentRaw}
+                title="生テキスト(認識結果)と確定doc本文を文字単位で比較し、取りこぼしを検出します"
+                className="px-4 py-2 rounded-lg font-medium bg-surface text-ink border border-hairline hover:bg-surface-soft disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                🔍 取りこぼし検証
+              </button>
+              <button
                 onClick={() => setShowClearConfirmDialog(true)}
                 disabled={isRecording || !sentRaw}
                 className="px-4 py-2 rounded-lg font-medium bg-surface text-error border border-error/50 hover:bg-error/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
@@ -1622,6 +1664,76 @@ export default function RealtimeClient() {
                 className="px-4 py-2 rounded-lg font-medium text-on-celadon bg-error hover:opacity-90 transition-colors"
               >
                 クリアする
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 取りこぼし検証ダイアログ（生テキスト vs 確定doc・文字単位diff） */}
+      {showDebugDialog && (
+        <div
+          className="fixed inset-0 bg-surface-ink/40 flex items-center justify-center z-50"
+          onClick={() => setShowDebugDialog(false)}
+        >
+          <div
+            className="bg-surface rounded-lg p-6 max-w-3xl w-full mx-4 max-h-[85vh] overflow-hidden flex flex-col border border-hairline shadow-sm"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-medium text-ink mb-2">
+              🔍 取りこぼし検証（生テキスト vs 確定doc・文字単位diff）
+            </h3>
+            {!debugDocText ? (
+              <p className="text-body py-6">
+                確定doc本文が取得できませんでした（共有ドキュメント未接続、またはまだAI校正で確定した文章がない可能性があります）。
+              </p>
+            ) : (
+              (() => {
+                // old=確定doc / new=生テキスト。added=生にあってdocに無い(取りこぼし候補)、removed=docにあって生に無い(AI付加/変更)。
+                const parts = Diff.diffChars(debugDocText, sentRaw);
+                const dropped = parts.filter((p) => p.added).reduce((n, p) => n + p.value.length, 0);
+                const aiAdded = parts.filter((p) => p.removed).reduce((n, p) => n + p.value.length, 0);
+                return (
+                  <>
+                    <div className="text-sm text-body mb-2">
+                      生(認識): <b>{sentRaw.length}</b>字 / 確定doc: <b>{debugDocText.length}</b>字
+                      <span className="ml-3" style={{ color: '#b91c1c' }}>
+                        取りこぼし候補(赤): {dropped}字
+                      </span>
+                      <span className="ml-3" style={{ color: '#2563eb' }}>
+                        AI付加/変更(青): {aiAdded}字
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted mb-3 leading-relaxed">
+                      赤＝生にあって確定docに無い文字（取りこぼし候補）。青＝確定docにあって生に無い文字（AIの整形・かな→漢字等）。
+                      ※「文字単位の厳密diff」のため、AIの言い換え・漢字変換も差分として現れます。
+                    </p>
+                    <div className="flex-1 overflow-y-auto p-3 border border-hairline rounded-md bg-surface-soft whitespace-pre-wrap leading-relaxed text-sm">
+                      {parts.map((p, i) => (
+                        <span
+                          key={i}
+                          style={
+                            p.added
+                              ? { backgroundColor: 'rgba(185,28,28,0.18)', color: '#b91c1c', textDecoration: 'underline' }
+                              : p.removed
+                                ? { backgroundColor: 'rgba(37,99,235,0.12)', color: '#2563eb' }
+                                : undefined
+                          }
+                        >
+                          {p.value}
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                );
+              })()
+            )}
+            <div className="flex justify-end mt-4">
+              <button
+                onClick={() => setShowDebugDialog(false)}
+                className="px-4 py-2 rounded-lg font-medium text-ink bg-surface border border-hairline hover:bg-surface-soft transition-colors"
+              >
+                閉じる
               </button>
             </div>
           </div>
