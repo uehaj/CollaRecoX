@@ -95,6 +95,9 @@ export const probeSessionContent = async (
         name: roomName,
         document: ydoc,
       });
+      // プローブはプレゼンスを publish しない（他クライアントの接続数にカウントさせない）。
+      // これにより、最後の1人の離脱確認がプローブ接続で誤って抑止されるのを防ぐ。
+      provider.awareness?.setLocalState(null);
     } catch {
       finish("unknown");
       return;
