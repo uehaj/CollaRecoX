@@ -47,14 +47,14 @@ export default function ShortcutHelpModal({
       aria-modal="true"
     >
       <div
-        className="bg-white rounded-lg shadow-xl max-w-3xl w-full mx-4 max-h-[80vh] overflow-hidden"
+        className="bg-surface border border-hairline rounded-lg shadow-sm max-w-3xl w-full mx-4 max-h-[80vh] overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         {/* ヘッダー */}
-        <div className="p-4 border-b">
+        <div className="p-4 border-b border-hairline">
           <h3
             id="shortcut-help-title"
-            className="text-lg font-medium text-gray-900"
+            className="text-lg font-light text-ink"
           >
             キーボードショートカット
           </h3>
@@ -64,7 +64,7 @@ export default function ShortcutHelpModal({
         <div className="p-6 overflow-y-auto max-h-[60vh]">
           {/* Tiptap標準ショートカット */}
           <section className="mb-6">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">
+            <h4 className="text-sm font-medium text-body-strong mb-3">
               書式設定（Tiptap標準）
             </h4>
             <div className="space-y-2">
@@ -77,16 +77,8 @@ export default function ShortcutHelpModal({
                 description="斜体"
               />
               <ShortcutRow
-                keys={[modifierKey, 'U']}
-                description="下線"
-              />
-              <ShortcutRow
                 keys={[modifierKey, 'Shift', 'X']}
                 description="取り消し線"
-              />
-              <ShortcutRow
-                keys={[modifierKey, 'Shift', 'H']}
-                description="ハイライト"
               />
               <ShortcutRow
                 keys={[modifierKey, 'Z']}
@@ -101,13 +93,13 @@ export default function ShortcutHelpModal({
 
           {/* CollaRecoX独自機能 */}
           <section className="mb-6">
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">
+            <h4 className="text-sm font-medium text-body-strong mb-3">
               CollaRecoX機能
             </h4>
             <div className="space-y-2">
               <ShortcutRow
-                keys={[modifierKey, 'Shift', 'R']}
-                description="AI再編を開く"
+                keys={[modifierKey, 'Shift', 'E']}
+                description="AI編集を開く"
               />
               <ShortcutRow
                 keys={[modifierKey, 'Shift', 'D']}
@@ -126,7 +118,7 @@ export default function ShortcutHelpModal({
 
           {/* 表示 */}
           <section>
-            <h4 className="text-sm font-semibold text-gray-700 mb-3">
+            <h4 className="text-sm font-medium text-body-strong mb-3">
               表示
             </h4>
             <div className="space-y-2">
@@ -141,7 +133,7 @@ export default function ShortcutHelpModal({
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
+            className="px-4 py-2 bg-celadon text-on-celadon rounded-md hover:bg-celadon-active"
           >
             閉じる
           </button>
@@ -162,16 +154,16 @@ function ShortcutRow({
   description: string;
 }) {
   return (
-    <div className="flex items-center justify-between py-2 px-3 hover:bg-gray-50 rounded">
-      <span className="text-sm text-gray-600">{description}</span>
+    <div className="flex items-center justify-between py-2 px-3 hover:bg-surface-soft rounded">
+      <span className="text-sm text-body">{description}</span>
       <div className="flex items-center gap-1">
         {keys.map((key, index) => (
           <span key={index} className="flex items-center">
-            <kbd className="px-2 py-1 text-xs font-semibold text-gray-800 bg-gray-100 border border-gray-300 rounded">
+            <kbd className="px-2 py-1 text-xs font-medium text-ink bg-surface-soft border border-hairline rounded">
               {key}
             </kbd>
             {index < keys.length - 1 && (
-              <span className="mx-1 text-gray-400">+</span>
+              <span className="mx-1 text-muted-soft">+</span>
             )}
           </span>
         ))}
