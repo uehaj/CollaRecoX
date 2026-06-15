@@ -30,7 +30,7 @@ export function useKeyboardShortcuts(options: UseKeyboardShortcutsOptions): void
       key: 'e',
       ctrl: true,
       shift: true,
-      description: 'AI再編を開く',
+      description: 'AI編集を開く',
       handler: () => onRewrite?.(),
       category: 'feature',
     },
