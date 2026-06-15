@@ -9,6 +9,7 @@ type HocuspocusProviderType = any;
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
 import { newSessionId } from '@/lib/sessionId';
+import { createBroadcastSession, getHostToken } from '@/lib/session';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState, type NanoPromptSession } from '@/lib/browserLlm';
 import packageJson from '../../../package.json';
 
@@ -111,9 +112,17 @@ export default function RealtimeClient() {
           setCurrentSessionId(stored);
           console.log('[Session] 🆔 Restored session ID from localStorage:', stored);
         } else {
-          const generatedId = newSessionId();
-          setCurrentSessionId(generatedId);
-          console.log('[Session] 🆔 Auto-generated session ID');
+          // URLにもlocalStorageにも無い＝新規来訪。配信権付きのセッションをサーバーに発行させる。
+          createBroadcastSession()
+            .then(({ sessionId }) => {
+              setCurrentSessionId(sessionId);
+              console.log('[Session] 🆔 Created broadcast session on fresh visit');
+            })
+            .catch((e) => {
+              console.error('[Session] failed to create session on mount:', e);
+              // フォールバック: ローカル生成（配信権なし。SERVER_SECRET未設定の開発時のみ配信可能）
+              setCurrentSessionId(newSessionId());
+            });
         }
       }
     }
@@ -525,11 +534,19 @@ export default function RealtimeClient() {
         return;
       }
 
+      // 配信権の証明として hostToken を付与する。配信者でない（hostToken を持たない）端末は
+      // サーバーが配信WSを 403 で拒否する。
+      const hostToken = getHostToken(currentSessionId);
+      if (!hostToken) {
+        console.warn('[WebSocket] ⚠️ No hostToken for this session — broadcasting will be rejected by server');
+      }
+
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws`;
-      console.log('[WebSocket] 🔗 Connecting (relay channel) to:', wsUrl);
+      const params = new URLSearchParams({ session: currentSessionId, hostToken: hostToken || '' });
+      const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws?${params.toString()}`;
+      console.log('[WebSocket] 🔗 Connecting (relay channel)');
       const ws = new WebSocket(wsUrl);
       websocketRef.current = ws;
 
@@ -638,7 +655,12 @@ export default function RealtimeClient() {
 
       ws.onerror = (error) => {
         console.error('[WebSocket] ❌ Connection error:', error);
-        setError('共有ドキュメントへの中継接続に失敗しました');
+        // hostToken を持たない場合はサーバーが配信を拒否する（配信権なし）。
+        setError(
+          getHostToken(currentSessionId)
+            ? '共有ドキュメントへの中継接続に失敗しました'
+            : 'このセッションの配信権がありません。配信できるのはセッションを作成した配信者だけです。'
+        );
         setIsConnected(false);
         reject(new Error('WebSocket connection failed'));
       };
@@ -891,14 +913,19 @@ export default function RealtimeClient() {
     window.open(editorUrl, '_blank');
   }, [generateSessionId]);
 
-  // 新規セッションを作成して接続する（推測不能なIDを発行）
-  const createNewSession = useCallback(() => {
-    const sessionId = newSessionId();
-    console.log('[Session] 🆕 Created new session');
-    setCurrentSessionId(sessionId);
-    setExistingSessionInput('');
-    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
-      websocketRef.current.send(JSON.stringify({ type: 'set_session_id', sessionId }));
+  // 新規セッションを作成する。サーバーが配信権(hostToken)付きのセッションを発行する。
+  const createNewSession = useCallback(async () => {
+    try {
+      const { sessionId } = await createBroadcastSession();
+      console.log('[Session] 🆕 Created new broadcast session');
+      setCurrentSessionId(sessionId);
+      setExistingSessionInput('');
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({ type: 'set_session_id', sessionId }));
+      }
+    } catch (e) {
+      console.error('[Session] failed to create session:', e);
+      setError('セッションの作成に失敗しました。もう一度お試しください。');
     }
   }, []);
 
