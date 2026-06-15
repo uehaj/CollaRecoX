@@ -332,6 +332,10 @@ app.prepare().then(() => {
               break;
             }
 
+            // 文字落ち検証用: 確定生テキスト(校正前の原文)を共有 Y.Text(raw-<id>) へ追記保存する。
+            // AIの誤字・脱字・取りこぼしを後から突き合わせるための原本。校正ON/OFFどちらでも記録する。
+            appendRawTranscript(currentSessionId, message.text);
+
             // 自動校正ON: 直接ドキュメントへは書かず、校正バッファに溜める。
             // 校正画面には生テキストを未確定（グレー）として見せ続け、
             // AI校正の結果が「確定文」として追記された時点で黒字になる
@@ -514,6 +518,22 @@ app.prepare().then(() => {
       console.error('Client WebSocket error:', error);
     });
   });
+
+  // 文字落ち検証用: 確定した生テキスト(校正前の原文)を共有 Y.Text(raw-<id>) へ追記保存する。
+  // 追記専用なのでYjsの差分同期で軽量。校正ON/OFFどちらでも記録し、校正画面/録音画面から原本として参照できる。
+  function appendRawTranscript(sessionId, text) {
+    if (!sessionId || !text) return;
+    const document = hocuspocus.documents.get(`transcribe-editor-v2-${sessionId}`);
+    if (!document) return;
+    try {
+      document.transact(() => {
+        const raw = document.getText(`raw-${sessionId}`);
+        raw.insert(raw.length, text);
+      });
+    } catch (e) {
+      console.warn('[RawTranscript] append failed:', e);
+    }
+  }
 
   // Function to send text to Hocuspocus document
   // leadingSpace=false: 発話途中からの継続テキスト（部分確定）のため、区切りスペースを入れずに連結する
