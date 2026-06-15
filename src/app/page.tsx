@@ -11,12 +11,8 @@ import {
   relativeTime,
   type RecentSession,
 } from "@/lib/recentSessions";
+import { newSessionId } from "@/lib/sessionId";
 import packageJson from "../../package.json";
-
-/** 新しいセッションIDを生成（既存の /realtime と同形式）。 */
-function newSessionId(): string {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-}
 
 export default function Home() {
   const router = useRouter();

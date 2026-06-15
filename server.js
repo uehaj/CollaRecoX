@@ -115,34 +115,12 @@ app.prepare().then(() => {
       const parsedUrl = parse(req.url, true);
       console.log('🔵 [HTTP] Parsed URL:', parsedUrl.pathname);
 
-      // /collarecox/api/yjs-sessions エンドポイント: アクティブなYjsセッション一覧を返す
+      // 旧 /collarecox/api/yjs-sessions（全アクティブセッション列挙）は廃止した。
+      // リンクシークレット（ケイパビリティ）モデルでは、セッションは推測不能なIDを
+      // 知る者のみがアクセスできる。全件列挙は他人のセッションを発見可能にするため提供しない。
       if (parsedUrl.pathname === '/collarecox/api/yjs-sessions') {
-        // セッションID列挙による他人ドキュメントへの到達を防ぐため、
-        // 許可オリジンのみに応答し、ワイルドカード CORS は使わない（H-2）。
-        const origin = req.headers.origin;
-        if (!isOriginAllowed(origin, req.headers.host)) {
-          console.warn(`[HTTP] ⛔ yjs-sessions rejected for disallowed origin: ${sanitizeForLog(origin)}`);
-          res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Forbidden' }));
-          return;
-        }
-        const sessions = Array.from(hocuspocus.documents.keys()).map(roomName => {
-          const sessionId = roomName.replace('transcribe-editor-v2-', '');
-          const doc = hocuspocus.documents.get(roomName);
-          return {
-            sessionId,
-            roomName,
-            connectionCount: doc?.getConnectionsCount?.() || 0
-          };
-        });
-        const headers = { 'Content-Type': 'application/json' };
-        // Origin がある（CORS）場合のみ、許可済みオリジンをエコーバックする
-        if (origin) {
-          headers['Access-Control-Allow-Origin'] = origin;
-          headers['Vary'] = 'Origin';
-        }
-        res.writeHead(200, headers);
-        res.end(JSON.stringify({ sessions }));
+        res.writeHead(410, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Gone: session enumeration is disabled' }));
         return;
       }
 
