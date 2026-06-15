@@ -6,6 +6,7 @@ const { Hocuspocus } = require('@hocuspocus/server'); // ← ここ重要（Serv
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const crypto = require('crypto');
 
 if (!process.env.OPENAI_API_KEY) {
   console.error('❌ ERROR: OPENAI_API_KEY environment variable is required');
@@ -58,6 +59,30 @@ const isOriginAllowed = (origin, requestHost) => {
 
 // オプションの共有トークン認証（H-2）。設定されている場合のみ強制する（後方互換）。
 const collabAuthToken = process.env.COLLAB_AUTH_TOKEN || '';
+
+// --- 配信権(hostToken)の検証 -----------------------------------------------
+// 配信(/api/realtime-ws)は「配信者」だけが行えるべきだが、sessionId は校正リンクで
+// 露出するため、sessionId だけでは配信権の証明にならない。そこで配信には
+// hostToken = HMAC_SHA256(SERVER_SECRET, sessionId) を要求し、サーバーが再計算して照合する。
+// SERVER_SECRET だけ保持すればよくセッションごとの保存が不要（ステートレス・複数プロセス可）。
+// SERVER_SECRET 未設定時は検証をスキップする（開発互換。本番では設定必須）。
+const serverSecret = process.env.SERVER_SECRET || '';
+
+const computeHostToken = (sessionId) =>
+  crypto.createHmac('sha256', serverSecret).update(String(sessionId)).digest('hex');
+
+const verifyHostToken = (sessionId, token) => {
+  if (!serverSecret) return true; // 開発互換: 秘密鍵未設定なら検証しない
+  if (!sessionId || !token) return false;
+  const expected = computeHostToken(sessionId);
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(token));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+// ログ用: URL から hostToken の値を伏せる
+const redactTokenInUrl = (url) =>
+  String(url).replace(/([?&]hostToken=)[^&]*/i, '$1[REDACTED]');
 
 // Port
 let port = 8888;
@@ -148,7 +173,7 @@ app.prepare().then(() => {
     });
 
     console.log(`[WebSocket] 🔄 UPGRADE EVENT TRIGGERED!`);
-    console.log(`[WebSocket] Request URL: ${sanitizeForLog(request.url, 200)}`);
+    console.log(`[WebSocket] Request URL: ${sanitizeForLog(redactTokenInUrl(request.url), 200)}`);
     // 全ヘッダのログ出力は開発時のみ。Authorization/Cookie 等の機微情報はマスクする（L-1）
     if (dev) {
       const redactedHeaders = {};
@@ -158,7 +183,7 @@ app.prepare().then(() => {
       console.log(`[WebSocket] Request headers:`, redactedHeaders);
     }
 
-    const { pathname } = parse(request.url);
+    const { pathname, query } = parse(request.url, true);
     console.log(`[WebSocket] Parsed pathname: ${sanitizeForLog(pathname, 200)}`);
 
     // オリジン検証（CSWSH 対策, H-1/H-2）。HMR は Next.js 内部で扱うため対象外。
@@ -192,6 +217,14 @@ app.prepare().then(() => {
       }
     } else if (pathname === '/collarecox/api/realtime-ws') {
       console.log('[WebSocket] Processing /collarecox/api/realtime-ws upgrade request');
+      // 配信権の検証: 配信(音声配信)には hostToken が必要。校正リンク(sessionIdのみ)の
+      // 利用者は hostToken を持たないため配信できない。OpenAI接続を開く前にここで遮断する。
+      if (!verifyHostToken(query.session, query.hostToken)) {
+        console.warn(`[WebSocket] ⛔ Rejected broadcast: invalid/missing hostToken for session ${sanitizeForLog(query.session)}`);
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
       console.log('[WebSocket] Socket readable:', socket.readable);
       console.log('[WebSocket] Socket writable:', socket.writable);
       console.log('[WebSocket] Head length:', head.length);
