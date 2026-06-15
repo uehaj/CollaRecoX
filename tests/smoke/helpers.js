@@ -28,7 +28,9 @@ function fragmentText(fragment) {
 
 // 校正画面役: Hocuspocus共有docへ接続し、同期完了まで待つ。
 // 先に接続することで、該当room(transcribe-editor-v2-<id>)のdocがサーバ上に生成される。
-async function connectDoc(sessionId) {
+// options.presence を指定すると awareness にプレゼンスを publish する（実画面相当）。
+// 未指定なら publish しない（棚卸しプローブ相当＝他クライアントの接続数に数えられない）。
+async function connectDoc(sessionId, { presence } = {}) {
   const roomName = `transcribe-editor-v2-${sessionId}`;
   const ydoc = new Y.Doc();
   const provider = new HocuspocusProvider({
@@ -37,6 +39,8 @@ async function connectDoc(sessionId) {
     document: ydoc,
     WebSocketPolyfill: WebSocket,
   });
+  if (presence) provider.awareness?.setLocalStateField('presence', { role: presence });
+  else provider.awareness?.setLocalState(null);
   // 同期完了(synced)を待つ。所定時間で来なければ失敗扱いにする。
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Hocuspocus同期タイムアウト(5s)')), 5000);

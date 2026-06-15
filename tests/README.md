@@ -31,4 +31,5 @@ RUN_AI_SMOKE=1 npm run test:smoke
 | ファイル | 内容 | OpenAI |
 |---|---|---|
 | `relay.test.js` | 認識WS中継 → 共有doc反映、interim(pendingText)反映、確定でのクリア | 不要（自動校正OFF） |
+| `collab-liveness.test.js` | セッション生存確認(alive/empty)、共有docの非永続性、awarenessプレゼンス数による「最後の接続」判定（プローブは非カウント） | 不要 |
 | `autoproofread.test.js` | 自動校正（オーバーラップ）結果の確定追記、文字化け(U+FFFD)非混入の回帰防止 | 必要（`RUN_AI_SMOKE=1` で有効化） |
