@@ -1512,7 +1512,7 @@ export default function RealtimeClient() {
         <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-lg font-light text-ink">
-              文字起こし結果
+              文字起こし結果（自動校正、改行挿入なし）
             </h2>
             <div className="flex gap-2">
               <button
