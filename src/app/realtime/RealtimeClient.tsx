@@ -8,6 +8,8 @@ type YDocType = any;
 type HocuspocusProviderType = any;
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
+import { newSessionId } from '@/lib/sessionId';
+import { createBroadcastSession, getHostToken } from '@/lib/session';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState, type NanoPromptSession } from '@/lib/browserLlm';
 import packageJson from '../../../package.json';
 
@@ -110,9 +112,17 @@ export default function RealtimeClient() {
           setCurrentSessionId(stored);
           console.log('[Session] 🆔 Restored session ID from localStorage:', stored);
         } else {
-          const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-          setCurrentSessionId(newSessionId);
-          console.log('[Session] 🆔 Auto-generated session ID:', newSessionId);
+          // URLにもlocalStorageにも無い＝新規来訪。配信権付きのセッションをサーバーに発行させる。
+          createBroadcastSession()
+            .then(({ sessionId }) => {
+              setCurrentSessionId(sessionId);
+              console.log('[Session] 🆔 Created broadcast session on fresh visit');
+            })
+            .catch((e) => {
+              console.error('[Session] failed to create session on mount:', e);
+              // フォールバック: ローカル生成（配信権なし。SERVER_SECRET未設定の開発時のみ配信可能）
+              setCurrentSessionId(newSessionId());
+            });
         }
       }
     }
@@ -151,8 +161,6 @@ export default function RealtimeClient() {
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
-  const [activeSessions, setActiveSessions] = useState<{sessionId: string, connectionCount: number}[]>([]);
-  const [isLoadingSessions, setIsLoadingSessions] = useState<boolean>(false);
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
   const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
   const [autoProofreadStatus, setAutoProofreadStatus] = useState<string>(''); // 自動校正の状態表示
@@ -526,11 +534,19 @@ export default function RealtimeClient() {
         return;
       }
 
+      // 配信権の証明として hostToken を付与する。配信者でない（hostToken を持たない）端末は
+      // サーバーが配信WSを 403 で拒否する。
+      const hostToken = getHostToken(currentSessionId);
+      if (!hostToken) {
+        console.warn('[WebSocket] ⚠️ No hostToken for this session — broadcasting will be rejected by server');
+      }
+
       // Automatically detect protocol and host
       const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = typeof window !== 'undefined' ? window.location.host : 'localhost:8888';
-      const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws`;
-      console.log('[WebSocket] 🔗 Connecting (relay channel) to:', wsUrl);
+      const params = new URLSearchParams({ session: currentSessionId, hostToken: hostToken || '' });
+      const wsUrl = `${protocol}//${host}${getBasePath()}/api/realtime-ws?${params.toString()}`;
+      console.log('[WebSocket] 🔗 Connecting (relay channel)');
       const ws = new WebSocket(wsUrl);
       websocketRef.current = ws;
 
@@ -639,7 +655,12 @@ export default function RealtimeClient() {
 
       ws.onerror = (error) => {
         console.error('[WebSocket] ❌ Connection error:', error);
-        setError('共有ドキュメントへの中継接続に失敗しました');
+        // hostToken を持たない場合はサーバーが配信を拒否する（配信権なし）。
+        setError(
+          getHostToken(currentSessionId)
+            ? '共有ドキュメントへの中継接続に失敗しました'
+            : 'このセッションの配信権がありません。配信できるのはセッションを作成した配信者だけです。'
+        );
         setIsConnected(false);
         reject(new Error('WebSocket connection failed'));
       };
@@ -865,9 +886,9 @@ export default function RealtimeClient() {
   // Generate or retrieve session ID
   const generateSessionId = useCallback(() => {
     if (!currentSessionId) {
-      const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      setCurrentSessionId(newSessionId);
-      return newSessionId;
+      const generatedId = newSessionId();
+      setCurrentSessionId(generatedId);
+      return generatedId;
     }
     return currentSessionId;
   }, [currentSessionId]);
@@ -892,38 +913,29 @@ export default function RealtimeClient() {
     window.open(editorUrl, '_blank');
   }, [generateSessionId]);
 
-  // アクティブなYjsセッション一覧を取得
-  const fetchSessions = useCallback(async () => {
-    setIsLoadingSessions(true);
+  // 新規セッションを作成する。サーバーが配信権(hostToken)付きのセッションを発行する。
+  const createNewSession = useCallback(async () => {
     try {
-      const res = await fetch(`${getBasePath()}/api/yjs-sessions`);
-      const data = await res.json();
-      setActiveSessions(data.sessions || []);
-    } catch (error) {
-      console.error('Failed to fetch sessions:', error);
-      setActiveSessions([]);
-    } finally {
-      setIsLoadingSessions(false);
+      const { sessionId } = await createBroadcastSession();
+      console.log('[Session] 🆕 Created new broadcast session');
+      setCurrentSessionId(sessionId);
+      setExistingSessionInput('');
+      if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+        websocketRef.current.send(JSON.stringify({ type: 'set_session_id', sessionId }));
+      }
+    } catch (e) {
+      console.error('[Session] failed to create session:', e);
+      setError('セッションの作成に失敗しました。もう一度お試しください。');
     }
   }, []);
 
-  // 初回ロード時にセッション一覧を取得
-  useEffect(() => {
-    fetchSessions();
-  }, [fetchSessions]);
-
   const connectToExistingSession = useCallback(() => {
     if (existingSessionInput.trim()) {
-      let sessionId: string;
-
-      // Handle new session creation
-      if (existingSessionInput === '__new__') {
-        sessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        console.log('[Session] 🆕 Created new session:', sessionId);
-      } else {
-        sessionId = existingSessionInput.trim();
-        console.log('[Session] 🔗 Connected to existing session:', sessionId);
-      }
+      // 入力はセッションID、または /editor/<id> 形式のURL/パスを許容する。
+      // リンクシークレットモデルでは、アクセスにはこのIDを「知っている」ことが必要。
+      const raw = existingSessionInput.trim();
+      const sessionId = raw.split('/editor/').pop()?.split(/[?#]/)[0].trim() || raw;
+      console.log('[Session] 🔗 Connecting to existing session');
 
       setCurrentSessionId(sessionId);
       setExistingSessionInput('');
@@ -1154,27 +1166,20 @@ export default function RealtimeClient() {
               セッションに接続:
             </label>
             <div className="flex space-x-2">
-              <select
+              <input
+                type="text"
                 value={existingSessionInput}
                 onChange={(e) => setExistingSessionInput(e.target.value)}
-                onFocus={fetchSessions}
+                onKeyDown={(e) => { if (e.key === 'Enter') connectToExistingSession(); }}
+                placeholder="共有されたセッションID または リンクを貼り付け"
                 className="flex-1 px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
-              >
-                <option value="">セッションを選択...</option>
-                <option value="__new__">＋ 新しいセッションを作成</option>
-                {activeSessions.map(s => (
-                  <option key={s.sessionId} value={s.sessionId}>
-                    {s.sessionId} ({s.connectionCount}人接続中)
-                  </option>
-                ))}
-              </select>
+              />
               <button
-                onClick={fetchSessions}
-                disabled={isLoadingSessions}
-                className="px-3 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft disabled:opacity-50"
-                title="一覧を更新"
+                onClick={createNewSession}
+                className="px-3 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft whitespace-nowrap"
+                title="推測不能なIDで新しいセッションを作成"
               >
-                ↻
+                ＋ 新規
               </button>
               <button
                 onClick={connectToExistingSession}
@@ -1193,9 +1198,9 @@ export default function RealtimeClient() {
                 </button>
               )}
             </div>
-            {activeSessions.length === 0 && !isLoadingSessions && (
-              <p className="text-xs text-muted mt-1">アクティブなセッションがありません</p>
-            )}
+            <p className="text-xs text-muted mt-1">
+              他の参加者のセッションは一覧表示されません。アクセスには共有されたリンク（ID）が必要です。
+            </p>
           </div>
 
           {/* Session Status */}
