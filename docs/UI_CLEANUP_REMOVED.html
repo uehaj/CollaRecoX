@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI整理・OpenAI接続撤去・白磁テーマ統一 — 削除/変更記録</title>
+<style>
+  :root {
+    --canvas:#f7fafb; --surface:#fff; --surface-soft:#eef3f5;
+    --ink:#16242a; --body:#46555c; --muted:#76858b;
+    --celadon:#3d9aaf; --celadon-active:#2f8094; --celadon-soft:#e3f1f4;
+    --hairline:#e2e8ea; --success:#3fa874; --warning:#dca33a; --error:#d75c4d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--canvas); color:var(--body);
+    font-family:"Geist","Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    font-weight:400; line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:920px; margin:0 auto; padding:48px 24px 96px; }
+  h1 { font-weight:300; font-size:32px; color:var(--ink); letter-spacing:-.4px; margin:0 0 8px; }
+  h2 { font-weight:300; font-size:22px; color:var(--ink); margin:48px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--hairline); }
+  h3 { font-weight:500; font-size:16px; color:var(--ink); margin:24px 0 8px; }
+  .lead { color:var(--muted); font-size:14px; margin-bottom:32px; }
+  .card { background:var(--surface); border:1px solid var(--hairline); border-radius:14px; padding:24px 28px; box-shadow:0 1px 2px rgba(22,36,42,.05); margin:16px 0; }
+  code { font-family:"Geist Mono","JetBrains Mono",ui-monospace,monospace; font-size:13px; background:var(--surface-soft); padding:2px 6px; border-radius:4px; color:var(--celadon-active); }
+  ul { margin:8px 0; padding-left:22px; }
+  li { margin:5px 0; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--hairline); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:12px; letter-spacing:.4px; text-transform:uppercase; }
+  .pill { display:inline-block; font-size:11px; font-weight:600; letter-spacing:.6px; padding:3px 10px; border-radius:9999px; background:var(--celadon-soft); color:var(--celadon-active); }
+  .keep { background:rgba(63,168,116,.12); color:#2f7e57; }
+  .remove { background:rgba(215,92,77,.12); color:#b14a3d; }
+  .warn { background:rgba(220,163,58,.15); color:#a87a22; }
+  .note { background:var(--surface-soft); border-left:3px solid var(--celadon); padding:12px 16px; border-radius:0 8px 8px 0; margin:12px 0; font-size:14px; }
+  .meta { color:var(--muted); font-size:13px; }
+  strong { color:var(--ink); font-weight:500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>UI整理・OpenAI接続撤去・マニュアル簡素化・白磁(Hakuji)テーマ統一</h1>
+  <p class="lead">削除/変更記録 — 2026-06-13(土) 作業。<code>collarecox</code> プロジェクト。<br>
+  本書はユーザー指示「削除したものはなにかをきろく」に基づく一次記録です。</p>
+
+  <div class="card">
+    <h3>確定した4方針（AskUserQuestionで合意）</h3>
+    <table>
+      <tr><th>論点</th><th>決定</th></tr>
+      <tr><td>OpenAI音声認識エンジン</td><td><span class="pill remove">完全撤去</span> 音声認識経路（接続・UI・パイプライン）を撤去</td></tr>
+      <tr><td>エディタのAI再編</td><td><span class="pill keep">残す＋表記中立化</span>「AI編集」へ改名（<code>/api/rewrite</code>・OpenAIは温存）</td></tr>
+      <tr><td>テスト/開発画面</td><td><span class="pill remove">完全削除</span> /dummy-recorder・/tab-capture・開発系UI</td></tr>
+      <tr><td>マニュアル</td><td><span class="pill warn">大幅再編</span> /realtime と /editor の日常操作のみ</td></tr>
+    </table>
+    <div class="note"><strong>重要な切り分け:</strong> 「OpenAI完全撤去」は<strong>音声認識(realtime)経路に限定</strong>。
+    自動校正(<code>maybeAutoProofread</code>→OpenAI chat)とAI編集(<code>/api/rewrite</code>)はOpenAIを使い続ける温存機能のため、
+    <code>OPENAI_API_KEY</code>・<code>openai</code>依存・<code>HttpsProxyAgent</code>は維持。</div>
+  </div>
+
+  <h2>1. 削除したファイル（8件・物理削除）</h2>
+  <p class="meta">バックアップ: <code>/tmp/collarecox-removed-20260613/</code>（パス構造を保持）。git履歴にも残存。</p>
+  <table>
+    <tr><th>ファイル</th><th>理由</th></tr>
+    <tr><td><code>src/app/api/realtime/route.ts</code></td><td>OpenAI realtime設定（音声認識経路）</td></tr>
+    <tr><td><code>src/app/api/transcribe/route.ts</code></td><td>バッチ文字起こし。呼び出し元なし（grep確認）</td></tr>
+    <tr><td><code>src/app/api/audio-processor.js/route.ts</code></td><td>AudioWorklet。呼び出し元なし（grep確認）</td></tr>
+    <tr><td><code>src/app/dummy-recorder/page.tsx</code></td><td>テスト用「録音データ作成」画面</td></tr>
+    <tr><td><code>src/app/tab-capture/page.tsx</code> / <code>TabCaptureClient.tsx</code></td><td>タブ音声キャプチャのテスト画面</td></tr>
+    <tr><td><code>src/app/realtime/MediaRecorderClient.tsx</code></td><td>未import（デッドコード・grep確認）</td></tr>
+    <tr><td><code>src/app/editor/[sessionId]/SimpleEditor.tsx</code></td><td>未import（レガシーテストエディタ・grep確認）</td></tr>
+    <tr><td><code>src/lib/indexedDB.ts</code></td><td>削除機能(録音保存)に伴い孤立。参照ゼロ（grep確認）</td></tr>
+    <tr><td><code>src/app/realtime/audio-processor.js</code></td><td>AudioWorklet processor。route削除に伴い孤立。参照ゼロ（grep確認）</td></tr>
+  </table>
+  <p class="meta">計10ファイル削除（当初8＋レビューで判明した孤立2）。</p>
+
+  <h2>2. server.js — OpenAI realtime接続の撤去（外科的）</h2>
+  <div class="note"><strong>設計判断:</strong> <code>/api/realtime-ws</code> はOpenAIプロキシ専用ではなく、
+  <strong>オンデバイス認識結果・自動校正を共有ドキュメントへ中継する主経路でもある</strong>（<code>local_transcription</code>/<code>set_auto_proofread</code>/<code>local_pending</code> 等）。
+  そのため connectionハンドラ丸ごと削除は破壊的。<strong>OpenAIへの実接続だけを断つ最小影響方針</strong>を採用。</div>
+  <h3>撤去（L293-607のopenaiWsイベントハンドラ群を削除）</h3>
+  <ul>
+    <li><code>new WebSocket('wss://api.openai.com/v1/realtime')</code> 実接続 → <strong>接続を張らないダミー(no-op, readyState=CLOSED)</strong> に置換</li>
+    <li><code>openaiWs.on('open'|'message'|'error'|'close')</code> 4ハンドラ（OpenAI→client/Hocuspocus転送・session設定・"Connected to OpenAI"通知）を削除</li>
+  </ul>
+  <h3>温存（無傷を確認）</h3>
+  <ul>
+    <li>Hocuspocus初期化・<code>/api/yjs-ws</code>・<code>/api/yjs-sessions</code>・HMR・HTTPサーバ起動</li>
+    <li>中継/校正関数 <code>sendTextToHocuspocusDocument</code>(L1225)・<code>setPendingText</code>・<code>clearPendingText</code>・<code>maybeAutoProofread</code>(L1797) — いずれも削除ブロック外で定義・中継ケースから呼び出し</li>
+    <li><code>OPENAI_API_KEY</code>チェック・自動校正/AI編集の <code>callChatCompletion</code>（OpenAI chat completions）</li>
+  </ul>
+  <p class="meta">残存する旧OpenAIプロキシのclientメッセージcase（<code>set_prompt</code>/<code>audio_chunk</code> 等）はクライアントが送らなくなったため<strong>到達不能なデッドコード</strong>であり、ダミーへのno-opとして無害化。深掘り削除は中継ケースと交錯するため最小影響を優先し見送り（要望あれば別タスクで整理可能）。バックアップ: <code>/tmp/collarecox-removed-20260613/server.js.before-openai-surgery</code>。</p>
+
+  <h2>3. /realtime（RealtimeClient.tsx）から撤去したUI/コード</h2>
+  <ul>
+    <li>「OpenAI Realtime API 接続状態」パネル（状態インジケータ/切断ボタン/60分制限警告/料金目安 $0.06-0.24/分/自動接続説明）</li>
+    <li>音声認識モデル選択（Whisper-1/GPT-4o Mini/GPT-4o）、AI再編モデル選択（GPT-4.1系/GPT-4o系）</li>
+    <li>文字起こしプロンプト設定一式（プリセット/カスタム/プレビュー）</li>
+    <li>認識エンジン切替「☁️ OpenAI transcribe」ボタン → <strong>オンデバイスを唯一エンジンに簡素化</strong></li>
+    <li>VAD設定パネル（感度/発話終了判定/パラグラフ区切り/開始余裕）— OpenAIサーバセッション専用で<strong>オンデバイスには無効と判明したため撤去</strong></li>
+    <li>低レベル調整（バッファサイズ/バッチ数/送信間隔/無音チャンクスキップ）</li>
+    <li>AudioContext/ScriptProcessor 音声処理パイプライン一式（PCM16変換・base64送信等）</li>
+    <li>「録音データからの文字起こし」カラム（<code>/api/transcribe</code>を叩く唯一の箇所）、ダミー音声経路</li>
+    <li>「テスト文字列送信」ボタン、遅延測定パネル、自動切断タイマー</li>
+    <li>ヘッダーの「録音データ作成」リンク（/dummy-recorder）</li>
+    <li>未使用symbol約40個（state/ref/関数/型/import）を併せて除去</li>
+  </ul>
+  <p class="meta"><strong>残した中核:</strong> 音声ソース切替（マイク/タブ音声）、オンデバイス認識ステータス＋言語パックインストール、自動校正トグル、入力デバイス選択、録音開始/停止、録音タイマー、共同校正セッション管理（ID/接続/共有URL/開く）、結果コピー/クリア、クリア確認モーダル、句点強制改行、部分確定間隔。<code>/api/realtime-ws</code> 接続は<strong>オンデバイス→共有doc中継として温存</strong>。</p>
+
+  <h2>4. ランディング（page.tsx）/ metadata</h2>
+  <ul>
+    <li>OpenAI/GPT-4o文言を中立化（「オンデバイス音声認識による…」へ）、「APIキーはサーバー側で安全に管理」カード・フッターの<code>.env.local</code>案内を削除</li>
+    <li>/dummy-recorder へのデッドリンクを除去</li>
+    <li><code>layout.tsx</code> metadata を日本語・中立化（タイトル「Collarecox - AI音声文字起こし」）</li>
+  </ul>
+
+  <h2>5. 共同校正エディタ（editor配下）</h2>
+  <ul>
+    <li><span class="pill">改名</span><strong>「AI再編」→「AI編集」</strong>に統一（ボタン/モーダル/ツールチップ/ショートカットヘルプ/alert）。機能・<code>/api/rewrite</code>は温存</li>
+    <li>上部マニュアルバナーと役割重複する<strong>下部「共同校正」説明ボックスを削除</strong>（重複解消）</li>
+    <li><code>UserUnderline</code> Markは<strong>温存</strong>（既存共有ドキュメントのProseMirrorスキーマ整合のため・実下線はDecoration担当）</li>
+    <li>バージョン表示を控えめ（text-muted）に</li>
+  </ul>
+
+  <h2>6. マニュアル（public/manual.html）— 大幅再編</h2>
+  <ul>
+    <li><strong>削除:</strong> 料金目安表、音声認識モデル選択表、「Powered by OpenAI GPT-4o」、録音データ作成/タブキャプチャ/VB-Cable/パラメータ設定（バッファ/バッチ/VAD/プロンプト）セクション、Realtime 60分制限、未使用CSS（.button-example.gray/.green/.keyboard）、dummy-recorder.png参照</li>
+    <li><strong>再構成:</strong> 概要・クイックスタート（モデル選択ステップ削除）・共同校正の使い方（AI編集/Markdown/ハイライト/変更履歴）・自動改行/自動校正・トラブルシューティングに集約</li>
+    <li>「AI再編」→「AI編集」改名、OpenAI色を中立化</li>
+  </ul>
+
+  <h2>7. 全体テーマ — Hakuji（白磁）に統一</h2>
+  <p><code>src/app/globals.css</code> の Tailwind v4 <code>@theme</code> に白磁トークンを集約定義（<code>canvas #f7fafb</code> / <code>ink #16242a</code> / <code>celadon #3d9aaf</code> / <code>hairline #e2e8ea</code> / semantic success・warning・error）。各画面のハードコード色を全廃（<strong>残0件・grep確認</strong>）。</p>
+  <ul>
+    <li>機能別に乱立していた色（青/緑/赤/紫/橙/amber/gray）→ 単一の青磁アクセント <code>celadon</code> に集約</li>
+    <li>主操作=celadon / 副操作=白＋hairline / 破壊操作=error / 状態=success・warning（低彩度・意味は保持）</li>
+    <li><code>font-bold</code>/<code>font-semibold</code> 全廃（残0件）→ 軽量タイポ（light/normal/medium）。純黒禁止・重い影禁止</li>
+    <li>ユーザープレゼンスの10色カーソルパレットはユーザー識別の機能上そのまま温存</li>
+    <li>manual.htmlはインライン<code>&lt;style&gt;</code>の<code>:root</code>変数で一括白磁化（#667eea/#764ba2グラデ廃止）</li>
+  </ul>
+
+  <h2>8. 敵対的レビューと修正（4エージェント）</h2>
+  <p>差分に対しレビューワークフローを実施。<strong>配信中核経路（オンデバイス→共有doc中継＋自動校正）・共同編集・AI編集の実行系は全てPASS</strong>（リリースをブロックする実行時バグなし）。判定 <span class="pill">GO-with-fixes</span>。指摘のmajor 5件はすべてドキュメント/ヘルプ表示の不整合で、以下を修正済み:</p>
+  <ul>
+    <li>manual.html の壊れた画像参照（<code>/images/*.png</code>・<code>public/images/</code>不在）を除去</li>
+    <li>manual.html の操作ラベルを実UIへ同期（「音声入力で文字起こし」→「録音開始」、「⏹停止」→「録音を停止」、セッション作成/接続手順を実フロー＝プルダウン＋「接続」/「共同校正セッションの作成」へ）</li>
+    <li>manual.html の存在しないAI編集テンプレ「日時挿入」を削除（実テンプレは9件）、「AIで再編集」→「AIで編集」</li>
+    <li>ショートカットヘルプの誤記修正: AI編集 <code>Cmd+Shift+R</code> → 実バインドの <code>Cmd+Shift+E</code></li>
+    <li>非機能ショートカット行を削除: <code>Cmd+U</code>（下線・extension未import）と <code>Cmd+Shift+H</code>「ハイライト」（実際は履歴切替と衝突）</li>
+    <li><code>useKeyboardShortcuts.ts</code> のdescription「AI再編を開く」→「AI編集を開く」</li>
+  </ul>
+
+  <h2>9. 検証</h2>
+  <ul>
+    <li><code>npm run build</code>（クリーン）✅ 成功（7ルート: <code>/</code> <code>/api/rewrite</code> <code>/editor/[sessionId]</code> <code>/realtime</code> 他）。<code>/realtime</code> バンドル縮小（10.1kB）。警告は既存の軽微2件のみ</li>
+    <li><code>node --check server.js</code> ✅</li>
+    <li>起動テスト: <code>/realtime</code> <code>/editor/[id]</code> <code>manual.html</code> いずれも <strong>HTTP 200</strong>、ランタイムエラーなし、WS（Hocuspocus共同編集 / realtime中継）とも稼働</li>
+    <li>残存OpenAI可視文言=0 / ハードコード色=0 / font-bold・semibold=0 / デッドルート参照=0</li>
+  </ul>
+
+  <h2>10. 既知の残事項（要望次第で対応）</h2>
+  <ul>
+    <li><code>public/page-flow.html</code>（未リンクの開発用フロー図）が削除済みルート(/dummy-recorder・/tab-capture)を図示。今回は未変更</li>
+    <li>server.js に到達不能な旧OpenAIプロキシcaseが残存（no-op無害化済み・深掘り削除は別タスク可能）</li>
+    <li>非可視コードコメント2件に「AI再編」表記が残存（<code>api/rewrite/route.ts:20</code>・<code>RealtimeClient.tsx:144</code>）</li>
+  </ul>
+
+  <p class="meta" style="margin-top:48px;">復元方法: バックアップ <code>/tmp/collarecox-removed-20260613/</code> から該当ファイルを戻すか、git履歴（このコミット前）から <code>git checkout</code> で復元。</p>
+</div>
+</body>
+</html>
