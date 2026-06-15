@@ -1,29 +1,128 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/*
+ * Hakuji (白磁) — porcelain-clean light-first theme.
+ * 明るい磁器調キャンバスに、単一の青磁(celadon)アクセント。軽量タイポと広い余白。
+ * 各画面は bg-canvas / text-ink / bg-celadon / border-hairline 等のトークンで参照する。
+ */
+@theme {
+  /* Surfaces */
+  --color-canvas: #f7fafb;        /* 明るい磁器調の床。nav/hero/body */
+  --color-surface: #ffffff;       /* 純白カード */
+  --color-surface-soft: #eef3f5;  /* 静かな灰のグルーピング面/フッター */
+  --color-surface-tint: #e3f1f4;  /* 青磁トーンの強調面 */
+  --color-surface-ink: #16242a;   /* 1ページ1回の濃いインク帯 */
+  --color-surface-ink-soft: #1e3138;
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  /* Text (純黒は使わない) */
+  --color-ink: #16242a;           /* 見出し/主要テキスト */
+  --color-body-strong: #243740;
+  --color-body: #46555c;          /* 既定本文色 */
+  --color-muted: #76858b;         /* キャプション/非アクティブ */
+  --color-muted-soft: #9aa6ab;    /* プレースホルダ */
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* Celadon (唯一の彩度あるアクセント) */
+  --color-celadon: #3d9aaf;
+  --color-celadon-active: #2f8094;
+  --color-celadon-bright: #54b3c8;
+  --color-celadon-soft: #e3f1f4;
+  --color-celadon-disabled: #c9d4d7;
+
+  /* Hairlines */
+  --color-hairline: #e2e8ea;
+  --color-hairline-soft: #eef2f4;
+
+  /* On-color text */
+  --color-on-celadon: #ffffff;
+  --color-on-ink: #f2f6f7;
+  --color-on-ink-soft: #9fb0b6;
+
+  /* Semantic (低彩度・磁器調に調和。意味は保持) */
+  --color-success: #3fa874;
+  --color-warning: #dca33a;
+  --color-error: #d75c4d;
+
+  /* Type */
+  --font-sans: var(--font-geist-sans, "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+  --font-mono: var(--font-geist-mono, "Geist Mono", "JetBrains Mono", ui-monospace, monospace);
+
+  /* 後方互換: 既存の bg-background / text-foreground 参照を白磁に橋渡し */
+  --color-background: #f7fafb;
+  --color-foreground: #16242a;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-canvas);
+  color: var(--color-body);
+  font-family: var(--font-sans);
+  /* 軽量タイポを基調にする（bold は使わない） */
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 見出しは軽量・締まったトラッキング（bold は使わない） */
+h1, h2, h3, h4 { color: var(--color-ink); font-weight: 400; letter-spacing: -0.01em; }
+::selection { background: rgba(61, 154, 175, 0.18); }
+
+/* ─── 青磁グレーズ（ヒーロー背景に薄く滲ませる） ─── */
+.glaze { position: relative; }
+.glaze::before {
+  content: "";
+  position: absolute;
+  inset: -25% -10% auto -10%;
+  height: 70%;
+  background: radial-gradient(58% 80% at 32% 0%, rgba(61,154,175,0.11), rgba(61,154,175,0) 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ─── ページロード時の段階的せり上がり ─── */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise   { animation: rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.rise-1 { animation-delay: 0.05s; }
+.rise-2 { animation-delay: 0.13s; }
+.rise-3 { animation-delay: 0.21s; }
+.rise-4 { animation-delay: 0.29s; }
+.rise-5 { animation-delay: 0.37s; }
+
+/* ─── 録音中の同心円パルス（青磁） ─── */
+@keyframes pulse-ring {
+  0%   { transform: scale(0.92); opacity: 0.5; }
+  70%  { transform: scale(1.75); opacity: 0; }
+  100% { transform: scale(1.75); opacity: 0; }
+}
+.pulse-ring::before,
+.pulse-ring::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: rgba(61,154,175,0.32);
+  animation: pulse-ring 2.1s cubic-bezier(0.2, 0.6, 0.2, 1) infinite;
+  z-index: -1;
+}
+.pulse-ring::after { animation-delay: 1.05s; }
+
+/* ─── トースト（コピー完了などの軽い通知） ─── */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast { animation: toast-in 0.24s ease-out both; }
+
+/* ─── カードの柔らかな浮き上がり ─── */
+.card-lift { transition: box-shadow .28s ease, transform .28s ease, border-color .28s ease; }
+.card-lift:hover { transform: translateY(-3px); box-shadow: 0 10px 30px rgba(22,36,42,0.08); }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .toast { animation: none; }
+  .pulse-ring::before, .pulse-ring::after { animation: none; opacity: 0; }
+  .card-lift:hover { transform: none; }
 }
 
 /* Collaboration Cursor Styles */
@@ -52,19 +151,19 @@ body {
   white-space: nowrap;
 }
 
-/* Remote Edit Highlight - shows other users' recent edits */
+/* Remote Edit Highlight - 他ユーザーの直近編集を青磁トーンで示す */
 .remote-edit-highlight {
-  background-color: rgba(59, 130, 246, 0.3); /* Blue with transparency */
+  background-color: rgba(61, 154, 175, 0.22);
   border-radius: 2px;
   animation: remote-edit-fade 3s ease-out forwards;
 }
 
 @keyframes remote-edit-fade {
   0% {
-    background-color: rgba(59, 130, 246, 0.4);
+    background-color: rgba(61, 154, 175, 0.30);
   }
   70% {
-    background-color: rgba(59, 130, 246, 0.2);
+    background-color: rgba(61, 154, 175, 0.15);
   }
   100% {
     background-color: transparent;
@@ -73,7 +172,7 @@ body {
 
 /* Selection highlight for other users (yjs-selection) */
 .ProseMirror .yjs-selection {
-  background-color: rgba(59, 130, 246, 0.25) !important; /* Blue selection for other users */
+  background-color: rgba(61, 154, 175, 0.20) !important;
 }
 
 /* Remote change indicator flash */
@@ -83,7 +182,7 @@ body {
 
 @keyframes remote-flash {
   0% {
-    box-shadow: inset 0 0 0 2px rgba(59, 130, 246, 0.6);
+    box-shadow: inset 0 0 0 2px rgba(61, 154, 175, 0.55);
   }
   100% {
     box-shadow: inset 0 0 0 0 transparent;

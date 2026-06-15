@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { EditorContent, useEditor, Mark, Extension } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
@@ -14,6 +14,8 @@ import { ySyncPluginKey } from 'y-prosemirror';
 import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
 import { getBasePath } from '@/lib/basePath';
+import { addRecentSession } from '@/lib/recentSessions';
+import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState } from '@/lib/browserLlm';
 import ShortcutHelpModal from './ShortcutHelpModal';
 
 // Custom UserUnderline Mark - スキーマ互換のため残すが、視覚効果はなし
@@ -55,6 +57,120 @@ const editTrackKey = new PluginKey('editTrack');
 // 確定テキストの直後にグレーで表示し、認識仮説の更新（バックトラック）をその場で反映する。
 // Decorationなので共有ドキュメント本体・編集履歴には一切影響しない
 const pendingTextKey = new PluginKey('pendingTextInline');
+
+// AI再補正で上書きされる末尾領域（編集禁止＋青字）用PluginKey
+const protectedTailKey = new PluginKey('protectedTail');
+
+// 利用者マーカー（緑/青の確認待ち領域へ付ける黄色ハイライト）用PluginKey
+const userMarkKey = new PluginKey('userMark');
+// マーカーが暴走的に伸びないよう1マークの最大文字長で丸める（best-effort）
+const USER_MARK_MAX_LEN = 400;
+
+// doc 末尾から n テキスト文字ぶんの開始 doc 座標（境界段落の途中になりうる）。
+// protectedTail（青ロック）と userMark（青領域への自動マーク判定）で共用する。
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const lockStartPos = (doc: any, n: number): number => {
+  if (n <= 0) return doc.content.size + 1; // ロックなし（番兵: どのステップにも一致しない）
+  let remaining = n;
+  let from = doc.content.size;
+  let pos = 0;
+  const starts: number[] = [];
+  for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
+  for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
+    const node = doc.child(i);
+    const textLen = node.textContent.length;
+    const nodeStart = starts[i];
+    if (textLen <= remaining) { from = nodeStart + 1; remaining -= textLen; }
+    else { from = nodeStart + 1 + (textLen - remaining); remaining = 0; }
+  }
+  return from;
+};
+
+// 未確定spanを、そとづけの区切り情報(breaks=改行オフセット配列)で複数行描画する。
+// テキストには \n を埋め込まず、breaksの位置で <br> を挿入して改行表示にする
+// （ProseMirrorのテキストノードでは \n が空白に潰れるため）。
+// 色分け: 先頭から greenLen 文字は緑（オンデバイス確定済・AI校正待ち）、以降はグレー（interim）。
+// breakBeforeFirst=true: 直前に確定テキストがある場合、緑領域の冒頭を必ず行頭から始める
+// （確定文の末尾に続けず <br> で改行する）。
+const PENDING_GREEN = '#3fa874'; // 緑: AI校正待ち（rawBuffer）
+const PENDING_GRAY = '#9ca3af';  // グレー: オンデバイス未確定（interim）
+
+// 緑の折返しを「画面の実描画幅」で行うためのテキスト幅測定（canvasで実測・使い回し）。
+let _measureCanvas: HTMLCanvasElement | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null;
+  if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
+  return _measureCanvas.getContext('2d');
+}
+// pauseCuts（ポーズ＝段落境界）を保ちつつ、描画幅 availWidth(px) を超える位置に改行オフセットを足す。
+// 文字数ではなく「見た目の1行ぴったり」で折り返す。
+function widthCutOffsets(text: string, pauseCuts: Set<number>, font: string, availWidth: number): Set<number> {
+  const cuts = new Set<number>(pauseCuts);
+  const ctx = getMeasureCtx();
+  if (!ctx || !(availWidth > 0)) return cuts;
+  ctx.font = font;
+  let acc = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (pauseCuts.has(i)) acc = 0; // ポーズ境界で行頭リセット
+    const w = ctx.measureText(text[i]).width;
+    if (acc > 0 && acc + w > availWidth) {
+      cuts.add(i); // 文字iの前で改行
+      acc = w;
+    } else {
+      acc += w;
+    }
+  }
+  return cuts;
+}
+
+function renderPendingSpan(span: HTMLSpanElement, text: string, breaks: number[], greenLen: number, breakBeforeFirst = false, wrap: { font: string; availWidth: number } | null = null) {
+  span.textContent = '';
+  if (!text) return;
+  const green = Math.max(0, Math.min(greenLen || 0, text.length));
+  const pauseCuts = new Set<number>(
+    Array.isArray(breaks) ? [...new Set(breaks)].filter((o) => o > 0 && o < text.length) : []
+  );
+  // 横幅での折返しを実測して足す（pauseCutsは保持）。wrapが無ければポーズ境界のみ。
+  const cutSet = wrap ? widthCutOffsets(text, pauseCuts, wrap.font, wrap.availWidth) : pauseCuts;
+  const cuts = [...cutSet].filter((o) => o > 0 && o < text.length).sort((a, b) => a - b);
+  const lines: Array<[number, number]> = [];
+  let s = 0;
+  for (const c of cuts) { lines.push([s, c]); s = c; }
+  lines.push([s, text.length]);
+  const addSeg = (str: string, color: string) => {
+    if (!str) return;
+    const seg = document.createElement('span');
+    seg.style.color = color;
+    seg.textContent = str;
+    span.appendChild(seg);
+  };
+  lines.forEach(([ls, le], i) => {
+    // 行頭の改行: 2行目以降は常に、1行目は直前に確定テキストがあるとき（緑の冒頭を行頭に揃える）。
+    if (i > 0 || breakBeforeFirst) span.appendChild(document.createElement('br'));
+    const gEnd = Math.min(le, green); // この行の緑部分の終端
+    if (gEnd > ls) {
+      addSeg(text.slice(ls, gEnd), PENDING_GREEN);
+      addSeg(text.slice(gEnd, le), PENDING_GRAY);
+    } else {
+      addSeg(text.slice(ls, le), PENDING_GRAY);
+    }
+  });
+}
+// オンデバイスLLM（Gemini Nano / Phi 等）の検出・DLゲートは @/lib/browserLlm に集約（録音画面と共有）。
+// AI編集の校正用システムプロンプト（サーバの /api/rewrite と同一。OpenAI/Nano 双方で使う）
+const buildRewriteSystemPrompt = (prompt: string): string => `あなたは日本語文章の校正アシスタントです。以下の文章を校正してください。
+
+校正のルール:
+1. 誤字脱字を修正
+2. 句読点を適切に整理
+3. 明らかに誤った専門用語があれば補完・修正
+4. 文の意味や内容は変更しない
+5. 原文の文体やトーンを維持
+
+${prompt ? `追加の指示: ${prompt}` : ''}
+
+修正した文章のみを出力してください。説明は不要です。`;
+
 // All yjs-related modules are dynamically imported to avoid SSR localStorage issues
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type YDocType = any;
@@ -110,6 +226,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [userCount, setUserCount] = useState(1);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingText, setPendingText] = useState(''); // Recognition in progress text
+  const [protectedTailChars, setProtectedTailChars] = useState(0); // AI再補正で上書きされる末尾文字数（編集禁止＋青字）
   const [changeHistory, setChangeHistory] = useState<ChangeEntry[]>([]);
   const [showHistory, setShowHistory] = useState(true);
   const lastContentRef = useRef<string>('');
@@ -124,6 +241,45 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [rewriteResult, setRewriteResult] = useState<{ original: string; rewritten: string } | null>(null);
   const [customPrompt, setCustomPrompt] = useState('');
   const [promptHistory, setPromptHistory] = useState<string[]>([]);
+  // AI編集のエンジン: 'openai'（サーバ経由）or 'nano'（ブラウザのGemini Nano・オンデバイス）。localStorageに保存
+  const [rewriteEngine, setRewriteEngine] = useState<'openai' | 'nano'>(() => {
+    if (typeof window === 'undefined') return 'openai';
+    try { return window.localStorage.getItem('collarecox-rewrite-engine') === 'nano' ? 'nano' : 'openai'; } catch { return 'openai'; }
+  });
+  const selectRewriteEngine = (engine: 'openai' | 'nano') => {
+    setRewriteEngine(engine);
+    try { window.localStorage.setItem('collarecox-rewrite-engine', engine); } catch { /* localStorage不可時は無視 */ }
+  };
+  // オンデバイスLLM（Gemini Nano 等）の対応状態。マウント時に検出し、対応時のみ nano を選べるようにする。
+  const [browserLlm, setBrowserLlm] = useState<BrowserLlmState>('unsupported');
+  const [nanoPreparing, setNanoPreparing] = useState(false); // モデルDL/準備中フラグ
+  const [nanoDlProgress, setNanoDlProgress] = useState<number | null>(null); // DL進捗(%)
+  useEffect(() => {
+    let alive = true;
+    probeBrowserLlm().then((s) => {
+      if (!alive) return;
+      setBrowserLlm(s);
+      // 未対応なのに保存値が 'nano' の場合は openai に矯正（ラジオが消えて未選択状態になるのを防ぐ）
+      if (s === 'unsupported' && rewriteEngine === 'nano') selectRewriteEngine('openai');
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // nano を選んだ瞬間にモデルDLを確認し、完了するまで確定させない（完了後に nano へ切替）。失敗時はフォールバックせず openai に戻す。
+  const chooseNanoEngine = async () => {
+    if (rewriteEngine === 'nano' || nanoPreparing) return;
+    setNanoPreparing(true); setNanoDlProgress(null);
+    try {
+      await ensureBrowserLlmReady((loaded) => setNanoDlProgress(Math.round(loaded * 100)));
+      setBrowserLlm('available');
+      selectRewriteEngine('nano');
+    } catch (e) {
+      alert('オンデバイスAIの準備に失敗しました: ' + (e instanceof Error ? e.message : '不明なエラー'));
+      selectRewriteEngine('openai');
+    } finally {
+      setNanoPreparing(false); setNanoDlProgress(null);
+    }
+  };
 
   // Markdown Edit states
   const [showMarkdownModal, setShowMarkdownModal] = useState(false);
@@ -131,6 +287,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Force Commit state
   const [isForceCommitPending, setIsForceCommitPending] = useState(false);
+
+  // 閲覧(リードオンリー)モード: URLクエリ ?mode=view のときだけ編集不可。
+  // 既定（mode=edit または未指定）は編集可。共有用の閲覧リンクを想定し、UIトグル・localStorage保存はしない。
+  const [isReadOnly] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('mode') === 'view';
+  });
 
   // Keyboard Shortcuts state
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -172,6 +335,11 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // 校正に参加した配信として履歴に記録（ホームの「最近のセッション」に出る）。
+  useEffect(() => {
+    if (sessionId) addRecentSession(sessionId, 'guest');
+  }, [sessionId]);
 
   // Load user info from localStorage on client side only
   useEffect(() => {
@@ -353,6 +521,15 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // 認識中（pending）インライン表示のspan要素（使い回してちらつきを防ぐ）
   const pendingSpanRef = useRef<HTMLSpanElement | null>(null);
+  const pendingBreaksRef = useRef<number[]>([]); // 未確定テキストの改行オフセット（そとづけ区切り情報）
+  const pendingGreenLenRef = useRef<number>(0); // 緑(AI校正待ち)で表示する先頭文字数。以降はグレー(interim)
+  const pendingWrapRef = useRef<{ font: string; availWidth: number } | null>(null); // 緑の実幅折返し用（描画幅・フォント）
+
+  // 本文スクロール領域: 自動追従スクロール＋手動操作時の停止＋▼ボタンで復帰
+  const editorScrollRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollRef = useRef<boolean>(true); // 自動追従モード（最下部に追従するか）
+  const lastScrollHeightRef = useRef<number>(0); // 直前のscrollHeight（内容が増えたかの判定用）
+  const [showScrollDown, setShowScrollDown] = useState(false); // ▼（最新へ移動）ボタンの表示
   const consumeSpeechAppendSeq = (lastSeenRef: { current: number }): boolean => {
     try {
       const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq') as number | undefined;
@@ -492,6 +669,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   if (doc.lastChild && doc.lastChild.isTextblock) {
                     pos = doc.content.size - 1;
                   }
+                  // 最終ブロックに確定テキストがあるなら、緑の冒頭を行頭に揃えるため先頭で改行する
+                  const lastChild = doc.lastChild;
+                  const breakBeforeFirst = !!(lastChild && lastChild.isTextblock && lastChild.textContent.trim().length > 0);
                   // キーを固定し、span要素を使い回す。テキストの更新はuseEffect側で
                   // 同じ要素のtextContentを直接書き換える（キーにテキストを含めると
                   // 追記のたびにウィジェットDOMが再生成され、表示がちらつくため）
@@ -502,10 +682,177 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       span.style.color = '#9ca3af';
                       pendingSpanRef.current = span;
                     }
-                    pendingSpanRef.current.textContent = ' ' + text;
+                    renderPendingSpan(pendingSpanRef.current, text, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst, pendingWrapRef.current);
                     return pendingSpanRef.current;
                   }, { side: 1, key: 'pending-inline' });
                   return DecorationSet.create(doc, [widget]);
+                },
+              },
+            }),
+          ];
+        },
+      }),
+      // AI再補正で上書きされる末尾領域: 青字＋人による編集(追加/変更/削除)を禁止。
+      // 段落単位ではなく「末尾ちょうど n 文字」を対象にする（段落をまたいで部分的に色付け／ロック）。
+      // 緑(AI待ち)は別Decorationで、ここは確定黒のうち再補正窓に入る末尾文字のみが対象。
+      Extension.create({
+        name: 'protectedTail',
+        addProseMirrorPlugins() {
+          return [
+            new Plugin({
+              key: protectedTailKey,
+              state: {
+                init: () => 0,
+                apply(tr, prev) {
+                  const meta = tr.getMeta(protectedTailKey);
+                  return typeof meta === 'number' ? meta : prev;
+                },
+              },
+              // 保護領域への「人による」編集を禁止。リモート(Yjs同期=音声追記/AI再補正)は許可する。
+              filterTransaction(tr, state) {
+                if (!tr.docChanged) return true;
+                const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+                if (ySyncMeta?.isChangeOrigin === true || tr.getMeta('addToHistory') === false) return true;
+                const n = (protectedTailKey.getState(state) as number) || 0;
+                if (n <= 0) return true;
+                const from = lockStartPos(state.doc, n);
+                let blocked = false;
+                tr.steps.forEach((step) => {
+                  step.getMap().forEach((oldStart: number, oldEnd: number) => {
+                    // 半開区間: oldEnd===from は保護範囲(from以降)に触れない（文脈側末尾の編集）ので許可。
+                    if (oldEnd > from) blocked = true;
+                  });
+                });
+                return !blocked;
+              },
+              props: {
+                decorations(state) {
+                  const n = (protectedTailKey.getState(state) as number) || 0;
+                  if (n <= 0) return DecorationSet.empty;
+                  const doc = state.doc;
+                  let remaining = n;
+                  const decos: Decoration[] = [];
+                  let pos = 0;
+                  const starts: number[] = [];
+                  for (let i = 0; i < doc.childCount; i++) { starts.push(pos); pos += doc.child(i).nodeSize; }
+                  // 末尾の段落から遡り、末尾 n 文字ぶんを inline で青字化（境界段落は途中から）
+                  for (let i = doc.childCount - 1; i >= 0 && remaining > 0; i--) {
+                    const node = doc.child(i);
+                    const textLen = node.textContent.length;
+                    const nodeStart = starts[i];
+                    const textStart = nodeStart + 1;
+                    const textEnd = nodeStart + 1 + textLen;
+                    const attrs = { style: 'color:#2563eb', title: 'AI再補正中のため編集できません' };
+                    if (textLen <= remaining) {
+                      if (textLen > 0) decos.push(Decoration.inline(textStart, textEnd, attrs));
+                      remaining -= textLen;
+                    } else {
+                      decos.push(Decoration.inline(textStart + (textLen - remaining), textEnd, attrs));
+                      remaining = 0;
+                    }
+                  }
+                  return DecorationSet.create(doc, decos);
+                },
+              },
+            }),
+          ];
+        },
+      }),
+      // 利用者マーカー: 緑/青の確認待ち領域をドラッグ選択すると黄色ハイライトを付ける（あとで見直すメモ）。
+      // AI再補正(削除→置換)に対しても from=前寄り / to=後寄り のマッピングで補正後テキストへ広がって残し(best-effort)、
+      // 暴走しないよう1マーク最大USER_MARK_MAX_LEN文字で丸める。Alt+クリックで個別解除。
+      // この校正画面セッション内で保持する(共有docには載せない=他者には出ない・リロードで消える)。
+      Extension.create({
+        name: 'userMark',
+        addProseMirrorPlugins() {
+          type UMark = { id: string; from: number; to: number };
+          return [
+            new Plugin({
+              key: userMarkKey,
+              state: {
+                init: (): UMark[] => [],
+                apply(tr, marks: UMark[], oldState): UMark[] {
+                  const ySyncMeta = tr.getMeta(ySyncPluginKey) as { isChangeOrigin?: boolean } | undefined;
+                  let mapped: UMark[];
+                  if (tr.docChanged && ySyncMeta?.isChangeOrigin === true) {
+                    // リモートYjs同期(音声追記/AI再補正のdelete→insert)は y-prosemirror が文書全体の
+                    // ReplaceStep を出すことがあり、tr.mapping をそのまま使うとマークが先頭(0..400)へ崩れる。
+                    // 実差分(findDiffStart/findDiffEnd)で「差分前=不変/差分後=シフト/差分内=新差分範囲へ寄せる」。
+                    const oldContent = oldState.doc.content;
+                    const newContent = tr.doc.content;
+                    const dStart = oldContent.findDiffStart(newContent);
+                    if (dStart === null) {
+                      mapped = marks; // 内容差分なし
+                    } else {
+                      const de = oldContent.findDiffEnd(newContent);
+                      const a = de ? de.a : oldState.doc.content.size; // 旧側の差分終端
+                      const b = de ? de.b : tr.doc.content.size;       // 新側の差分終端
+                      const delta = b - a;
+                      const remap = (p: number, isEnd: boolean) => {
+                        if (p <= dStart) return p;            // 差分の前 → 不変
+                        if (p >= a) return p + delta;         // 差分の後ろ → シフト
+                        return isEnd ? b : dStart;            // 差分内 → 終端は新差分末尾へ広げ、始端は差分先頭へ寄せる
+                      };
+                      mapped = marks.map((m) => ({ id: m.id, from: remap(m.from, false), to: remap(m.to, true) }));
+                    }
+                  } else {
+                    // ローカル編集/メタのみ: 精密なマッピング(from=前寄り/to=後寄りで置換後へ広がる)
+                    mapped = marks.map((m) => ({ id: m.id, from: tr.mapping.map(m.from, -1), to: tr.mapping.map(m.to, 1) }));
+                  }
+                  // 暴走防止クランプ + 範囲外/空の除去
+                  const size = tr.doc.content.size;
+                  let next: UMark[] = mapped
+                    .map((m) => ({ id: m.id, from: m.from, to: Math.min(m.to, m.from + USER_MARK_MAX_LEN) }))
+                    .filter((m) => m.from >= 0 && m.from < m.to && m.to <= size);
+                  const action = tr.getMeta(userMarkKey) as { type: string; id?: string; from?: number; to?: number } | undefined;
+                  if (action) {
+                    if (action.type === 'add' && typeof action.from === 'number' && typeof action.to === 'number' && action.from < action.to && action.id) {
+                      next = [...next.filter((m) => m.id !== action.id), { id: action.id, from: action.from, to: action.to }];
+                    } else if (action.type === 'remove') {
+                      next = next.filter((m) => m.id !== action.id);
+                    } else if (action.type === 'clear') {
+                      next = [];
+                    }
+                  }
+                  return next;
+                },
+              },
+              props: {
+                decorations(state) {
+                  const marks = (userMarkKey.getState(state) as UMark[]) || [];
+                  if (marks.length === 0) return DecorationSet.empty;
+                  const size = state.doc.content.size;
+                  const decos = marks
+                    .filter((m) => m.from < m.to && m.to <= size)
+                    .map((m) => Decoration.inline(m.from, m.to, {
+                      class: 'user-mark',
+                      style: 'background-color: rgba(250, 204, 21, 0.45);',
+                      title: 'Alt+クリックでこのマークを解除',
+                    }, { id: m.id }));
+                  return DecorationSet.create(state.doc, decos);
+                },
+                handleDOMEvents: {
+                  // ドラッグ選択を離した時、選択が青(再補正の上書き対象)領域に重なっていれば自動マーク
+                  mouseup(view) {
+                    const { from, to } = view.state.selection;
+                    if (from >= to) return false; // 空選択(クリック)は無視
+                    const n = (protectedTailKey.getState(view.state) as number) || 0;
+                    if (n <= 0) return false;       // 青領域なし→自動マークしない
+                    const lock = lockStartPos(view.state.doc, n);
+                    if (to <= lock) return false;   // 選択が青に重ならない(黒だけ)→マークしない
+                    const id = `m-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+                    view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'add', id, from, to }));
+                    return false; // 既定動作(選択)は妨げない
+                  },
+                },
+                // Alt+クリックでクリック位置のマークを解除
+                handleClick(view, pos, event) {
+                  if (!event.altKey) return false;
+                  const marks = (userMarkKey.getState(view.state) as UMark[]) || [];
+                  const hit = marks.find((m) => pos >= m.from && pos < m.to);
+                  if (!hit) return false;
+                  view.dispatch(view.state.tr.setMeta(userMarkKey, { type: 'remove', id: hit.id }));
+                  return true;
                 },
               },
             }),
@@ -517,7 +864,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         openOnClick: true,
         autolink: true,
         HTMLAttributes: {
-          class: 'text-blue-600 underline hover:text-blue-800',
+          class: 'text-celadon underline hover:text-celadon-active',
         },
       }),
       // Add Collaboration when extension is loaded
@@ -631,11 +978,19 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         console.log('[Collaborative Editor V2] 📊 Transcription status:', transcribing);
 
         // Also update pending text for recognition in progress display
+        // そとづけの区切り情報（改行オフセット）も取り込み、未確定表示を改行する
+        const pBreaks = statusMap.get('pendingBreaks');
+        pendingBreaksRef.current = Array.isArray(pBreaks) ? (pBreaks as number[]) : [];
+        const pGreen = statusMap.get('pendingGreenLen');
+        pendingGreenLenRef.current = typeof pGreen === 'number' ? pGreen : 0;
         const pending = statusMap.get('pendingText') as string;
         setPendingText(pending || '');
         if (pending) {
           console.log('[Collaborative Editor V2] 🔤 Pending text:', pending);
         }
+        // AI再補正で上書きされる末尾文字数（編集禁止＋青字の範囲）
+        const pTail = statusMap.get('proofreadTailChars');
+        setProtectedTailChars(typeof pTail === 'number' ? pTail : 0);
       };
 
       // Initial check
@@ -663,13 +1018,89 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // ウィジェットのDOM要素は使い回しているため、テキストは直接書き換える（ちらつき防止）。
       // Decorationのキーが固定でもこの書き換えで表示は即時更新される
       if (pendingSpanRef.current) {
-        pendingSpanRef.current.textContent = pendingText ? ' ' + pendingText : '';
+        // 直前に確定テキストがあれば緑の冒頭を行頭から始める（描画の都度、現在のdocから判定）
+        const lastChild = editor.state.doc.lastChild;
+        const breakBeforeFirst = !!(lastChild && lastChild.isTextblock && lastChild.textContent.trim().length > 0);
+        // 本文の実描画幅とフォントを測定して緑を「見た目の1行ぴったり」で折り返す。widget側でも使えるようrefへ保存。
+        let wrap: { font: string; availWidth: number } | null = null;
+        try {
+          const dom = editor.view.dom as HTMLElement;
+          const cs = getComputedStyle(dom);
+          const availWidth = dom.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+          wrap = { font: `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`, availWidth };
+        } catch { wrap = null; }
+        pendingWrapRef.current = wrap;
+        renderPendingSpan(pendingSpanRef.current, pendingText, pendingBreaksRef.current, pendingGreenLenRef.current, breakBeforeFirst, wrap);
       }
       editor.view.dispatch(editor.state.tr.setMeta(pendingTextKey, pendingText));
     } catch (error) {
       console.warn('[Collaborative Editor V2] ⚠️ Error updating pending decoration:', error);
     }
   }, [editor, pendingText]);
+
+  // AI再補正で上書きされる末尾文字数を Decoration/filterTransaction へ反映する（青字＋編集禁止）
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    try { editor.view.dispatch(editor.state.tr.setMeta(protectedTailKey, protectedTailChars)); }
+    catch (e) { console.warn('[Collaborative Editor V2] ⚠️ protectedTail update error:', e); }
+  }, [editor, protectedTailChars]);
+
+  // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.setEditable(!isReadOnly);
+  }, [editor, isReadOnly]);
+
+  // ===== 本文スクロール領域の自動追従 =====
+  // 最下部へスクロールし、自動追従モードに戻す
+  const scrollToBottom = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    autoScrollRef.current = true;
+    lastScrollHeightRef.current = el.scrollHeight;
+    setShowScrollDown(false);
+  }, []);
+
+  // 内容増加時: 自動追従中なら最下部へ、停止中なら▼ボタンを出す
+  const handleContentGrow = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    const grew = el.scrollHeight > lastScrollHeightRef.current + 1;
+    if (autoScrollRef.current) {
+      // DOM反映後に確実に最下部へ
+      requestAnimationFrame(() => {
+        const e2 = editorScrollRef.current;
+        if (e2) { e2.scrollTop = e2.scrollHeight; lastScrollHeightRef.current = e2.scrollHeight; }
+      });
+      setShowScrollDown(false);
+    } else {
+      lastScrollHeightRef.current = el.scrollHeight;
+      if (grew) setShowScrollDown(true); // 停止中に末尾が伸びた → ▼を表示
+    }
+  }, []);
+
+  // エディタ更新（リモート追記・ローカル編集・pending反映）で内容増加を検知
+  useEffect(() => {
+    if (!editor) return;
+    editor.on('update', handleContentGrow);
+    return () => { editor.off('update', handleContentGrow); };
+  }, [editor, handleContentGrow]);
+
+  // pending（緑/グレー）の更新でも追従
+  useEffect(() => { handleContentGrow(); }, [pendingText, handleContentGrow]);
+
+  // スクロール操作: 最下部なら自動追従ON、上方向にスクロールしたらOFF
+  const onEditorScroll = useCallback(() => {
+    const el = editorScrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (atBottom) { autoScrollRef.current = true; setShowScrollDown(false); }
+    else { autoScrollRef.current = false; }
+  }, []);
+
+  // 本文クリック（フォーカスがはずれたモード）で自動追従を停止
+  const onEditorMouseDown = useCallback(() => { autoScrollRef.current = false; }, []);
 
   // User registration in Yjs - register/unregister user in the shared users map
   useEffect(() => {
@@ -789,14 +1220,14 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // AI Rewrite - モーダルを開く
   const handleRewrite = () => {
-    if (!editor) return;
+    if (!editor || isReadOnly) return;
 
     // 選択されたテキストを取得
     const { from, to } = editor.state.selection;
     const selectedText = editor.state.doc.textBetween(from, to, ' ');
 
     if (!selectedText.trim()) {
-      alert('テキストを選択してAI再編の範囲を指定してください');
+      alert('テキストを選択してAI編集の範囲を指定してください');
       return;
     }
 
@@ -811,7 +1242,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setShowRewriteModal(true);
   };
 
-  // AI Rewrite - 実行
+  // Gemini Nano（ブラウザのオンデバイスLLM）でAI編集を実行する。Nodeは関与せず外部送信なし。
+  const rewriteWithNano = async (text: string, prompt: string): Promise<string> => {
+    const LM = getBrowserLanguageModel();
+    if (!LM) throw new Error('このブラウザはオンデバイスAI(Gemini Nano)に未対応です。Chrome 138+ と chrome://flags の prompt-api 有効化を確認してください');
+    const avail = await LM.availability();
+    if (avail === 'unavailable') throw new Error('Gemini Nano が利用できません（フラグ未設定・非対応環境・ディスク不足など）');
+    const session = await LM.create({
+      initialPrompts: [{ role: 'system', content: buildRewriteSystemPrompt(prompt) }],
+    });
+    try {
+      const out = await session.prompt(text);
+      return out || text;
+    } finally {
+      session.destroy?.();
+    }
+  };
+
+  // AI Rewrite - 実行（エンジンに応じて OpenAI(サーバ) か Gemini Nano(オンデバイス) を使う）
   const executeRewrite = async () => {
     if (!editor || isRewriting || !selectedTextForRewrite.trim()) return;
 
@@ -823,18 +1271,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
     setIsRewriting(true);
     try {
-      const response = await fetch(`${getBasePath()}/api/rewrite`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Rewrite failed');
+      let rewritten: string;
+      if (rewriteEngine === 'nano') {
+        // ブラウザ内のGemini Nanoで処理
+        rewritten = await rewriteWithNano(selectedTextForRewrite, customPrompt);
+      } else {
+        // 従来どおりサーバ(OpenAI)で処理
+        const response = await fetch(`${getBasePath()}/api/rewrite`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: selectedTextForRewrite, prompt: customPrompt }),
+        });
+        if (!response.ok) {
+          throw new Error('Rewrite failed');
+        }
+        const data = await response.json();
+        rewritten = data.rewritten;
       }
-
-      const data = await response.json();
-      setRewriteResult({ original: data.original, rewritten: data.rewritten });
+      setRewriteResult({ original: selectedTextForRewrite, rewritten });
       setRewriteModalPhase('result');
 
       // プロンプト履歴に保存（重複排除、最大10件）
@@ -844,7 +1298,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       localStorage.setItem('ai-rewrite-prompt-history', JSON.stringify(newHistory));
     } catch (error) {
       console.error('[AI Rewrite] Error:', error);
-      alert('AI再編に失敗しました');
+      alert(rewriteEngine === 'nano'
+        ? 'オンデバイスAI(Gemini Nano)での編集に失敗しました: ' + (error instanceof Error ? error.message : '不明なエラー')
+        : 'AI編集に失敗しました');
     } finally {
       setIsRewriting(false);
     }
@@ -876,7 +1332,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // Markdown Edit - 開く
   const handleMarkdownEdit = () => {
-    if (!editor) return;
+    if (!editor || isReadOnly) return;
 
     // 選択範囲のHTMLを取得してMarkdownに変換
     const selectedHtml = getSelectedHtml();
@@ -938,8 +1394,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">読み込み中...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-celadon mx-auto mb-4"></div>
+          <p className="text-body">読み込み中...</p>
         </div>
       </div>
     );
@@ -949,8 +1405,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">共同校正エディターを初期化中...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-celadon mx-auto mb-4"></div>
+          <p className="text-body">共同校正エディターを初期化中...</p>
         </div>
       </div>
     );
@@ -959,31 +1415,31 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   return (
     <div className="space-y-4">
       {/* 校正者マニュアルバナー */}
-      <div className="bg-indigo-600 text-white rounded-lg px-4 py-2 flex items-center justify-between">
+      <div className="bg-celadon text-on-celadon rounded-lg px-4 py-2 flex items-center justify-between">
         <span className="text-sm font-medium">初めての方へ: 校正の操作方法はマニュアルをご確認ください</span>
         <a
           href={`${getBasePath()}/manual.html#editor`}
           target="_blank"
           rel="noopener noreferrer"
-          className="bg-white text-indigo-600 px-3 py-1 rounded text-sm font-medium hover:bg-indigo-50 transition-colors flex-shrink-0"
+          className="bg-surface text-celadon-active px-3 py-1 rounded-md text-sm font-medium hover:bg-celadon-soft transition-colors flex-shrink-0"
         >
           校正者マニュアルを開く
         </a>
       </div>
       {/* Sticky Header - Connection Status + Toolbar */}
-      <div className="sticky top-0 z-10 bg-gray-50 space-y-2 pb-2">
+      <div className="sticky top-0 z-10 bg-canvas space-y-2 pb-2">
         {/* Connection Status */}
-        <div className="bg-white rounded-lg shadow-sm border p-4">
+        <div className="bg-surface rounded-lg shadow-sm border border-hairline p-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-4">
             <div className="flex items-center space-x-2">
-              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-              <span className="text-sm font-medium">
+              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-success' : 'bg-error'}`}></div>
+              <span className="text-sm font-medium text-ink">
                 {isConnected ? '接続済み' : '接続中...'}
               </span>
             </div>
             <div className="flex items-center space-x-2">
-              <span className="text-sm text-gray-600">
+              <span className="text-sm text-body">
                 {connectedUsers.length > 0 ? connectedUsers.length : userCount}人が参加中:
               </span>
               {/* Connected Users Avatars */}
@@ -992,7 +1448,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   connectedUsers.map((user) => (
                     <div
                       key={user.id}
-                      className="w-6 h-6 rounded-full border-2 border-white flex items-center justify-center text-xs text-white font-medium"
+                      className="w-6 h-6 rounded-full border-2 border-surface flex items-center justify-center text-xs text-white font-medium"
                       style={{ backgroundColor: user.color }}
                       title={`${user.name} (${user.id === userIdRef.current ? '自分' : '参加者'})`}
                     >
@@ -1001,7 +1457,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   ))
                 ) : (
                   <div
-                    className="w-6 h-6 rounded-full border-2 border-white flex items-center justify-center text-xs text-white font-medium"
+                    className="w-6 h-6 rounded-full border-2 border-surface flex items-center justify-center text-xs text-white font-medium"
                     style={{ backgroundColor: userInfo.color }}
                     title={userInfo.name}
                   >
@@ -1026,30 +1482,30 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                     if (e.key === 'Enter') saveUserName();
                     if (e.key === 'Escape') cancelEditUserName();
                   }}
-                  className="text-sm px-2 py-0.5 border border-gray-300 rounded w-24 focus:outline-none focus:border-blue-500"
+                  className="text-sm px-2 py-0.5 border border-hairline rounded-md w-24 focus:outline-none focus:border-celadon focus:ring-1 focus:ring-celadon"
                   autoFocus
                 />
                 <button
                   onClick={saveUserName}
-                  className="text-xs px-2 py-0.5 bg-blue-500 text-white rounded hover:bg-blue-600"
+                  className="text-xs px-2 py-0.5 bg-celadon text-on-celadon rounded-md hover:bg-celadon-active transition-colors"
                 >
                   保存
                 </button>
                 <button
                   onClick={cancelEditUserName}
-                  className="text-xs px-2 py-0.5 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+                  className="text-xs px-2 py-0.5 bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
                 >
                   取消
                 </button>
               </div>
             ) : (
               <div className="flex items-center space-x-1">
-                <span className="text-sm text-gray-500">
+                <span className="text-sm text-muted">
                   {userInfo.name} {provider ? '✓' : '⌛'}
                 </span>
                 <button
                   onClick={startEditingUserName}
-                  className="text-xs text-gray-400 hover:text-gray-600"
+                  className="text-xs text-muted hover:text-body transition-colors"
                   title="ユーザー名を編集"
                 >
                   ✏️
@@ -1061,47 +1517,65 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       </div>
 
       {/* Editor Toolbar */}
-      <div className="bg-white rounded-lg shadow-sm border p-3">
+      <div className="bg-surface rounded-lg shadow-sm border border-hairline p-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
+            {/* 閲覧(view)モードの表示。既定(edit)は何も表示しない。URL ?mode=view で有効 */}
+            {isReadOnly && (
+              <span
+                className="px-3 py-1 text-sm rounded-md bg-surface-soft text-muted border border-hairline"
+                title="URLの mode=view により閲覧専用（編集不可）です"
+              >
+                閲覧モード（編集不可）
+              </span>
+            )}
+            {!isReadOnly && (<>
             <button
               onClick={() => editor.chain().focus().toggleBold().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('bold') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('bold') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               太字
             </button>
             <button
               onClick={() => editor.chain().focus().toggleItalic().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('italic') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('italic') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               斜体
             </button>
             <button
               onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('heading', { level: 2 }) ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('heading', { level: 2 }) ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               見出し
             </button>
             <button
               onClick={() => editor.chain().focus().toggleBulletList().run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('bulletList') ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('bulletList') ? 'bg-celadon text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
             >
               箇条書き
             </button>
             <button
               onClick={() => editor.chain().focus().toggleHighlight({ color: userInfo.color }).run()}
-              className={`px-3 py-1 text-sm rounded ${editor.isActive('highlight') ? 'bg-yellow-500 text-white' : 'bg-gray-200 text-gray-700'}`}
+              className={`px-3 py-1 text-sm rounded-md transition-colors ${editor.isActive('highlight') ? 'text-on-celadon' : 'bg-surface text-ink border border-hairline hover:bg-surface-soft'}`}
               style={editor.isActive('highlight') ? { backgroundColor: userInfo.color } : {}}
               title="選択したテキストをハイライト"
             >
               🖍 ハイライト
             </button>
-            <label className="flex items-center space-x-1 text-sm text-gray-600" title="他者の編集を下線で表示">
+            <button
+              onClick={() => { if (editor) editor.view.dispatch(editor.state.tr.setMeta(userMarkKey, { type: 'clear' })); }}
+              className="px-3 py-1 text-sm rounded-md transition-colors bg-surface text-ink border border-hairline hover:bg-surface-soft"
+              title="確認マーカー(黄)をすべて消去します。個別に消すにはマーカーをAlt+クリック"
+            >
+              🧹 マーカー消去
+            </button>
+            </>)}
+            <label className="flex items-center space-x-1 text-sm text-body" title="他者の編集を下線で表示">
               <input
                 type="checkbox"
                 checked={highlightEdits}
                 onChange={(e) => setHighlightEdits(e.target.checked)}
-                className="rounded"
+                className="rounded accent-celadon"
               />
               <span>下線表示</span>
             </label>
@@ -1109,7 +1583,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             <select
               value={fontSize}
               onChange={(e) => setFontSize(e.target.value as 'xs' | 'sm' | 'base' | 'lg')}
-              className="px-2 py-1 text-sm border border-gray-300 rounded bg-white"
+              className="px-2 py-1 text-sm border border-hairline rounded-md bg-surface text-ink focus:outline-none focus:ring-1 focus:ring-celadon"
               title="文字サイズ"
             >
               <option value="xs">極小</option>
@@ -1126,25 +1600,27 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   alert('テキストをクリップボードにコピーしました');
                 });
               }}
-              className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
+              className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
             >
               テキストをコピー
             </button>
+            {!isReadOnly && (<>
             <button
               onClick={handleRewrite}
               disabled={isRewriting}
-              title="AIでテキストを再編します"
-              className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
+              title="AIでテキストを編集します"
+              className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
             >
-              {isRewriting ? '処理中...' : 'AI再編'}
+              {isRewriting ? '処理中...' : 'AI編集'}
             </button>
             <button
               onClick={handleMarkdownEdit}
               title="選択箇所をMarkdownで編集します"
-              className="px-3 py-1 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors"
+              className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active transition-colors"
             >
               Markdown編集
             </button>
+            </>)}
           </div>
         </div>
       </div>
@@ -1154,50 +1630,58 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       <div className="flex gap-4">
         {/* Editor */}
         <div className="flex-1">
-          <div className={`bg-white rounded-lg shadow-sm border min-h-[600px] editor-font-${fontSize}`}>
-            <EditorContent editor={editor} />
-            {/* 手動認識確定ボタン - エディター最下段・右寄せ */}
-            <div className="px-4 py-2 border-t border-gray-100 flex justify-end">
-              <button
-                onClick={handleForceCommit}
-                disabled={!isTranscribing || isForceCommitPending}
-                title="現在の認識バッファを強制的に確定します"
-                className={`px-3 py-1 text-sm rounded transition-colors ${
-                  !isTranscribing || isForceCommitPending
-                    ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
-                    : 'bg-orange-500 text-white hover:bg-orange-600'
-                }`}
+          <div className={`bg-surface rounded-lg shadow-sm border border-hairline editor-font-${fontSize}`}>
+            {/* スクロール可能な本文ボックス（末尾自動追従／本文クリックで停止） */}
+            <div className="relative">
+              <div
+                ref={editorScrollRef}
+                onScroll={onEditorScroll}
+                onMouseDown={onEditorMouseDown}
+                className="h-[60vh] min-h-[320px] overflow-y-auto"
               >
-                {isForceCommitPending ? '送信中...' : '🎤 手動認識確定'}
-              </button>
-            </div>
-            {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration）に変更 */}
-            {isTranscribing && !pendingText && (
-              <div className="px-4 pb-4">
-                <p className="text-gray-400 italic animate-pulse">
-                  認識中...
-                </p>
+                <EditorContent editor={editor} />
+                {/* 認識中テキストは本文末尾にインライン表示（pendingTextInline Decoration） */}
+                {isTranscribing && !pendingText && (
+                  <div className="px-4 pb-4">
+                    <p className="text-muted italic animate-pulse">
+                      認識中...
+                    </p>
+                  </div>
+                )}
               </div>
-            )}
+              {/* ▼ 最新へ移動（自動追従停止中に末尾が伸びたとき表示） */}
+              {showScrollDown && (
+                <button
+                  onClick={scrollToBottom}
+                  title="最新へ移動して自動追従を再開"
+                  aria-label="最新へ移動"
+                  className="absolute bottom-4 right-4 flex h-10 w-10 items-center justify-center rounded-full bg-celadon text-on-celadon shadow-lg ring-1 ring-celadon-active/30 transition-colors hover:bg-celadon-active"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
         {/* Change History Sidebar */}
         {showHistory && (
           <div className="w-80 flex-shrink-0">
-            <div className="bg-white rounded-lg shadow-sm border p-4 sticky top-4">
+            <div className="bg-surface rounded-lg shadow-sm border border-hairline p-4 sticky top-4">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-medium text-gray-900">変更履歴</h3>
+                <h3 className="text-lg font-medium text-ink">変更履歴</h3>
                 <button
                   onClick={() => setShowHistory(false)}
-                  className="text-gray-400 hover:text-gray-600"
+                  className="text-muted hover:text-body transition-colors"
                 >
                   ×
                 </button>
               </div>
               <div className="space-y-3 max-h-[500px] overflow-y-auto">
                 {changeHistory.length === 0 ? (
-                  <p className="text-gray-500 text-sm">変更履歴はありません</p>
+                  <p className="text-muted text-sm">変更履歴はありません</p>
                 ) : (
                   changeHistory.map((entry) => (
                     <div key={entry.id} className="border-l-2 pl-3 py-1" style={{ borderColor: entry.userColor }}>
@@ -1207,21 +1691,21 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             className="w-2 h-2 rounded-full"
                             style={{ backgroundColor: entry.userColor }}
                           ></div>
-                          <span className="text-xs font-medium text-gray-500">{entry.userName}</span>
+                          <span className="text-xs font-medium text-muted">{entry.userName}</span>
                         </div>
-                        <span className="text-xs text-gray-400">
+                        <span className="text-xs text-muted">
                           {entry.timestamp.toLocaleTimeString('ja-JP')}
                         </span>
                       </div>
                       <div className="text-sm mt-0.5">
                         <span className={`text-xs font-medium px-1 py-0.5 rounded ${
-                          entry.action === 'insert' ? 'bg-green-100 text-green-700' :
-                          entry.action === 'delete' ? 'bg-red-100 text-red-700' :
-                          'bg-blue-100 text-blue-700'
+                          entry.action === 'insert' ? 'bg-success/10 text-success' :
+                          entry.action === 'delete' ? 'bg-error/10 text-error' :
+                          'bg-celadon-soft text-celadon-active'
                         }`}>
                           {entry.action === 'insert' ? '追加' : entry.action === 'delete' ? '削除' : '変更'}
                         </span>
-                        <span className="ml-1.5 text-gray-700 text-sm break-all">{entry.content}</span>
+                        <span className="ml-1.5 text-body text-sm break-all">{entry.content}</span>
                       </div>
                     </div>
                   ))
@@ -1236,32 +1720,20 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       {!showHistory && (
         <button
           onClick={() => setShowHistory(true)}
-          className="fixed right-4 top-1/2 transform -translate-y-1/2 px-2 py-4 bg-blue-600 text-white rounded-l-lg shadow-lg hover:bg-blue-700 transition-colors"
+          className="fixed right-4 top-1/2 transform -translate-y-1/2 px-2 py-4 bg-celadon text-on-celadon rounded-l-lg shadow-sm hover:bg-celadon-active transition-colors"
         >
           履歴
         </button>
       )}
 
-      {/* Instructions */}
-      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-        <h3 className="text-lg font-medium text-blue-900 mb-2">共同校正</h3>
-        <ul className="text-blue-800 space-y-1 text-sm">
-          <li>• このURLを他の人と共有して、一緒に校正できます</li>
-          <li>• リアルタイム文字起こしの結果が自動的にここに追加されます</li>
-          <li>• 複数の人が同時に校正でき、変更がリアルタイムで同期されます</li>
-          <li>• 右のサイドバーで変更履歴を確認できます</li>
-          <li>• 「AI再編」で誤字修正や句読点整理ができます</li>
-        </ul>
-      </div>
-
-      {/* AI Rewrite Modal */}
+      {/* AI Edit Modal */}
       {showRewriteModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden">
+          <div className="bg-surface border border-hairline rounded-lg shadow-sm max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden">
             {/* ヘッダー */}
-            <div className="p-4 border-b">
-              <h3 className="text-lg font-medium text-gray-900">
-                {rewriteModalPhase === 'selection' ? 'AI再編 - テキスト選択' : 'AI再編 - プレビュー'}
+            <div className="p-4 border-b border-hairline">
+              <h3 className="text-lg font-light text-ink">
+                {rewriteModalPhase === 'selection' ? 'AI編集 - テキスト選択' : 'AI編集 - プレビュー'}
               </h3>
             </div>
 
@@ -1271,17 +1743,17 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 /* 選択フェーズ */
                 <>
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       以下の箇所を選択しています
                     </label>
-                    <div className="p-3 bg-yellow-50 rounded border border-yellow-200 text-sm whitespace-pre-wrap max-h-40 overflow-y-auto">
+                    <div className="p-3 bg-surface-soft rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-40 overflow-y-auto">
                       {selectedTextForRewrite}
                     </div>
                   </div>
 
                   {/* テンプレート選択 */}
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       テンプレートから選択
                     </label>
                     <div className="flex flex-wrap gap-2">
@@ -1289,7 +1761,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                         <button
                           key={index}
                           onClick={() => setCustomPrompt(prev => prev ? `${prev}\n${template.prompt}` : template.prompt)}
-                          className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
+                          className="px-2 py-1 text-xs bg-celadon-soft text-celadon-active rounded-md hover:bg-surface-tint transition-colors"
                         >
                           {template.label}
                         </button>
@@ -1300,7 +1772,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   {/* 履歴選択 */}
                   {promptHistory.length > 0 && (
                     <div className="mb-4">
-                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                      <label className="block text-sm font-medium text-body-strong mb-2">
                         履歴から選択
                       </label>
                       <div className="flex flex-wrap gap-2">
@@ -1308,7 +1780,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                           <button
                             key={index}
                             onClick={() => setCustomPrompt(prompt)}
-                            className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200 transition-colors max-w-xs truncate"
+                            className="px-2 py-1 text-xs bg-surface-soft text-body rounded-md hover:bg-surface-tint transition-colors max-w-xs truncate"
                             title={prompt}
                           >
                             {prompt.length > 20 ? prompt.substring(0, 20) + '...' : prompt}
@@ -1320,19 +1792,53 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
                   {/* プロンプト入力 */}
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      編集プロンプト <span className="text-red-500">*</span>
+                    <label className="block text-sm font-medium text-body-strong mb-2">
+                      編集プロンプト <span className="text-error">*</span>
                     </label>
                     <textarea
                       value={customPrompt}
                       onChange={(e) => setCustomPrompt(e.target.value)}
                       placeholder="どのように編集するか指示を入力してください"
-                      className={`w-full px-3 py-2 border rounded-md text-sm h-24 ${
-                        !customPrompt.trim() ? 'border-red-300 bg-red-50' : 'border-gray-300'
+                      className={`w-full px-3 py-2 border rounded-md text-sm h-24 text-ink focus:outline-none focus:ring-1 focus:ring-celadon ${
+                        !customPrompt.trim() ? 'border-error bg-error/5' : 'border-hairline'
                       }`}
                     />
                     {!customPrompt.trim() && (
-                      <p className="text-xs text-red-500 mt-1">編集プロンプトは必須です</p>
+                      <p className="text-xs text-error mt-1">編集プロンプトは必須です</p>
+                    )}
+                  </div>
+
+                  {/* エンジン選択: OpenAI（サーバ）/ オンデバイス（ブラウザLLM）。後者は対応ブラウザでのみ表示 */}
+                  <div className="mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">エンジン</label>
+                    <div className="flex items-center gap-4 text-sm text-body">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="rewrite-engine"
+                          checked={rewriteEngine === 'openai' || browserLlm === 'unsupported'}
+                          onChange={() => selectRewriteEngine('openai')}
+                          className="accent-celadon"
+                        />
+                        OpenAI（サーバ）
+                      </label>
+                      {browserLlm !== 'unsupported' && (
+                        <label className={`flex items-center gap-1.5 ${nanoPreparing ? 'opacity-60 cursor-wait' : 'cursor-pointer'}`}>
+                          <input
+                            type="radio"
+                            name="rewrite-engine"
+                            checked={rewriteEngine === 'nano'}
+                            disabled={nanoPreparing}
+                            onChange={chooseNanoEngine}
+                            className="accent-celadon"
+                          />
+                          オンデバイス（ブラウザLLM）
+                          {nanoPreparing && <span className="text-xs text-muted">（モデル準備中… {nanoDlProgress ?? 0}%）</span>}
+                        </label>
+                      )}
+                    </div>
+                    {rewriteEngine === 'nano' && (
+                      <p className="text-xs text-muted mt-1">ブラウザ内蔵のオンデバイスLLM（Chrome=Gemini Nano／Edge=Phi 等）で処理（外部送信なし）。選択時にモデルの準備（初回はDL）を確認します。</p>
                     )}
                   </div>
                 </>
@@ -1340,20 +1846,20 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 /* 結果フェーズ */
                 <>
                   <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
                       使用した編集プロンプト
                     </label>
-                    <div className="p-2 bg-purple-50 border border-purple-200 rounded text-sm text-purple-800">
+                    <div className="p-2 bg-celadon-soft border border-hairline rounded-md text-sm text-celadon-active">
                       {customPrompt}
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                      <h4 className="text-sm font-medium text-body-strong mb-2">
                         元のテキスト
-                        <span className="ml-2 text-xs text-red-500">（削除部分に<span className="line-through">取り消し線</span>）</span>
+                        <span className="ml-2 text-xs text-error">（削除部分に<span className="line-through">取り消し線</span>）</span>
                       </h4>
-                      <div className="p-3 bg-gray-50 rounded border text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                      <div className="p-3 bg-surface-soft rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-80 overflow-y-auto">
                         {rewriteResult && (() => {
                           const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
                           return diff.map((part, index) => {
@@ -1362,7 +1868,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             }
                             if (part.removed) {
                               return (
-                                <span key={index} className="bg-red-100 text-red-800 line-through">
+                                <span key={index} className="bg-error/10 text-error line-through">
                                   {part.value}
                                 </span>
                               );
@@ -1373,11 +1879,11 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       </div>
                     </div>
                     <div>
-                      <h4 className="text-sm font-medium text-gray-700 mb-2">
+                      <h4 className="text-sm font-medium text-body-strong mb-2">
                         修正後のテキスト
-                        <span className="ml-2 text-xs text-green-600">（追加部分に<span className="underline decoration-green-500 decoration-2">下線</span>）</span>
+                        <span className="ml-2 text-xs text-success">（追加部分に<span className="underline decoration-success decoration-2">下線</span>）</span>
                       </h4>
-                      <div className="p-3 bg-green-50 rounded border border-green-200 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
+                      <div className="p-3 bg-success/5 rounded-md border border-hairline text-sm text-body whitespace-pre-wrap max-h-80 overflow-y-auto">
                         {rewriteResult && (() => {
                           const diff = Diff.diffWords(rewriteResult.original, rewriteResult.rewritten);
                           return diff.map((part, index) => {
@@ -1386,7 +1892,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                             }
                             if (part.added) {
                               return (
-                                <span key={index} className="bg-green-100 text-green-800 underline decoration-green-500 decoration-2">
+                                <span key={index} className="bg-success/10 text-success underline decoration-success decoration-2">
                                   {part.value}
                                 </span>
                               );
@@ -1397,15 +1903,28 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                       </div>
                     </div>
                   </div>
+                  {/* 適用前に変換結果を手直しできる編集欄。上の差分プレビューはこの内容に追従する */}
+                  <div className="mt-4">
+                    <label className="block text-sm font-medium text-body-strong mb-2">
+                      適用するテキスト（編集できます）
+                    </label>
+                    <textarea
+                      value={rewriteResult?.rewritten ?? ''}
+                      onChange={(e) => setRewriteResult(rewriteResult ? { ...rewriteResult, rewritten: e.target.value } : null)}
+                      rows={6}
+                      className="w-full p-3 border border-hairline rounded-md text-sm text-body whitespace-pre-wrap focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
+                    />
+                    <p className="mt-1 text-xs text-muted">上の差分プレビューはこの内容に追従します。「適用」でこのテキストを反映します。</p>
+                  </div>
                 </>
               )}
             </div>
 
             {/* フッター */}
-            <div className="p-4 border-t flex justify-end space-x-3">
+            <div className="p-4 border-t border-hairline flex justify-end space-x-3">
               <button
                 onClick={closeRewriteModal}
-                className="px-4 py-2 text-sm text-gray-700 bg-gray-200 rounded hover:bg-gray-300"
+                className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft transition-colors"
               >
                 キャンセル
               </button>
@@ -1413,22 +1932,22 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                 <button
                   onClick={executeRewrite}
                   disabled={isRewriting || !customPrompt.trim()}
-                  className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
                 >
-                  {isRewriting ? '処理中...' : 'AI再編を実行'}
+                  {isRewriting ? '処理中...' : 'AI編集を実行'}
                 </button>
               ) : (
                 <>
                   <button
                     onClick={() => setRewriteModalPhase('selection')}
                     disabled={isRewriting}
-                    className="px-4 py-2 text-sm text-white bg-purple-600 rounded hover:bg-purple-700 disabled:bg-gray-400"
+                    className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft disabled:opacity-50 transition-colors"
                   >
                     {isRewriting ? '処理中...' : '再実行'}
                   </button>
                   <button
                     onClick={applyRewrite}
-                    className="px-4 py-2 text-sm text-white bg-blue-600 rounded hover:bg-blue-700"
+                    className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active transition-colors"
                   >
                     適用
                   </button>
@@ -1442,13 +1961,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       {/* Markdown Edit Modal */}
       {showMarkdownModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
+          <div className="bg-surface border border-hairline rounded-lg shadow-sm w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
             {/* ヘッダー */}
-            <div className="p-4 border-b flex justify-between items-center">
-              <h3 className="text-lg font-medium text-gray-900">Markdown編集</h3>
+            <div className="p-4 border-b border-hairline flex justify-between items-center">
+              <h3 className="text-lg font-light text-ink">Markdown編集</h3>
               <button
                 onClick={closeMarkdownModal}
-                className="text-gray-400 hover:text-gray-600"
+                className="text-muted hover:text-body transition-colors"
               >
                 ✕
               </button>
@@ -1456,31 +1975,31 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
             {/* コンテンツ */}
             <div className="p-4 overflow-y-auto flex-1">
-              <p className="text-sm text-gray-600 mb-3">
+              <p className="text-sm text-body mb-3">
                 選択箇所をMarkdown形式で編集できます。リンクや基本的なHTMLタグの挿入が可能です。
               </p>
               <textarea
                 value={markdownText}
                 onChange={(e) => setMarkdownText(e.target.value)}
-                className="w-full h-64 px-3 py-2 border border-gray-300 rounded-md font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="w-full h-64 px-3 py-2 border border-hairline rounded-md font-mono text-sm text-ink resize-none focus:outline-none focus:ring-2 focus:ring-celadon"
                 placeholder="Markdownを入力..."
               />
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-muted mt-2">
                 例: **太字**, *斜体*, [リンク](URL), # 見出し, - リスト
               </p>
             </div>
 
             {/* フッター */}
-            <div className="p-4 border-t flex justify-end gap-2">
+            <div className="p-4 border-t border-hairline flex justify-end gap-2">
               <button
                 onClick={closeMarkdownModal}
-                className="px-4 py-2 text-sm text-gray-700 bg-gray-100 rounded hover:bg-gray-200"
+                className="px-4 py-2 text-sm text-ink bg-surface border border-hairline rounded-md hover:bg-surface-soft transition-colors"
               >
                 キャンセル
               </button>
               <button
                 onClick={applyMarkdownEdit}
-                className="px-4 py-2 text-sm text-white bg-indigo-600 rounded hover:bg-indigo-700"
+                className="px-4 py-2 text-sm text-on-celadon bg-celadon rounded-md hover:bg-celadon-active transition-colors"
               >
                 適用
               </button>
