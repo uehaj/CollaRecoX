@@ -11,12 +11,8 @@ import {
   relativeTime,
   type RecentSession,
 } from "@/lib/recentSessions";
+import { createBroadcastSession } from "@/lib/session";
 import packageJson from "../../package.json";
-
-/** 新しいセッションIDを生成（既存の /realtime と同形式）。 */
-function newSessionId(): string {
-  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-}
 
 export default function Home() {
   const router = useRouter();
@@ -30,10 +26,16 @@ export default function Home() {
   }, []);
 
   // 代表者として新しい配信を開始する。
-  const startBroadcast = () => {
-    const id = newSessionId();
-    addRecentSession(id, "host");
-    router.push(`/realtime?session=${id}`);
+  // サーバーに配信権(hostToken)付きのセッションを発行させてから配信画面へ遷移する。
+  const startBroadcast = async () => {
+    try {
+      const { sessionId } = await createBroadcastSession();
+      addRecentSession(sessionId, "host");
+      router.push(`/realtime?session=${encodeURIComponent(sessionId)}`);
+    } catch (e) {
+      console.error("[Home] failed to start broadcast:", e);
+      alert("セッションの作成に失敗しました。もう一度お試しください。");
+    }
   };
 
   // 履歴のセッションを開く（代表者は配信画面へ、参加者は校正画面へ）。
