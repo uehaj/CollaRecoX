@@ -15,6 +15,7 @@ import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
+import { useLeaveConfirmation } from '@/lib/useLeaveConfirmation';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState } from '@/lib/browserLlm';
 import ShortcutHelpModal from './ShortcutHelpModal';
 
@@ -224,6 +225,9 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [provider, setProvider] = useState<HocuspocusProviderType | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [userCount, setUserCount] = useState(1);
+
+  // 自分が最後の接続のとき、画面を閉じる/リロードすると共有文書が失われるため確認する。
+  useLeaveConfirmation(() => providerRef.current, isConnected);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [pendingText, setPendingText] = useState(''); // Recognition in progress text
   const [protectedTailChars, setProtectedTailChars] = useState(0); // 青: AI再補正で上書きされる末尾文字数（編集禁止＋青字）

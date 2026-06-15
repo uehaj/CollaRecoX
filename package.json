@@ -11,6 +11,7 @@
     "lint": "next lint",
     "test": "node --test tests/smoke/*.test.js",
     "test:smoke": "node --test tests/smoke/*.test.js",
+    "test:e2e": "node --test tests/e2e/*.test.js",
     "server": "node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
     "server:prod": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
     "version:patch": "npm version patch -m 'chore: bump version to %s'",
@@ -56,12 +57,14 @@
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
+    "@sparticuz/chromium": "^149.0.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "15.3.3",
+    "puppeteer-core": "^25.1.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

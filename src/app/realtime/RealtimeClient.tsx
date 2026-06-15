@@ -8,6 +8,7 @@ type YDocType = any;
 type HocuspocusProviderType = any;
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
+import { useLeaveConfirmation } from '@/lib/useLeaveConfirmation';
 import { newSessionId } from '@/lib/sessionId';
 import { createBroadcastSession, getHostToken } from '@/lib/session';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState, type NanoPromptSession } from '@/lib/browserLlm';
@@ -131,6 +132,7 @@ export default function RealtimeClient() {
 
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false); // 共有ドキュメント中継WebSocketの接続状態
+  const [collabConnected, setCollabConnected] = useState(false); // 共有文書(Hocuspocus)への接続状態
   const [error, setError] = useState<string | null>(null);
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
@@ -1045,6 +1047,15 @@ export default function RealtimeClient() {
 
       hocuspocusProviderRef.current = provider;
 
+      // 自分のプレゼンスを awareness に publish する。
+      // これにより離脱確認フックが「自分が最後の接続か」を接続数で判定できる
+      // （ブロードキャスタは CollaborationCursor を持たないため明示的に設定する）。
+      try {
+        provider.awareness?.setLocalStateField('presence', { role: 'host' });
+      } catch (e) {
+        console.warn('[Hocuspocus Client] failed to set awareness presence:', e);
+      }
+
       // サーバが配信する rawBuffer長(pendingGreenLen)を購読し、認識画面の3色表示に使う。
       // 黒=確定済(sentRaw先頭) / 緑=AI校正待ち(sentRaw末尾greenLen分) / グレー=interim
       try {
@@ -1061,10 +1072,12 @@ export default function RealtimeClient() {
 
       provider.on('connect', () => {
         console.log('[Hocuspocus Client] Connected to collaborative session');
+        setCollabConnected(true);
       });
 
       provider.on('disconnect', () => {
         console.log('[Hocuspocus Client] Disconnected from collaborative session');
+        setCollabConnected(false);
       });
 
       provider.on('error', (error: unknown) => {
@@ -1085,7 +1098,11 @@ export default function RealtimeClient() {
     if (hocuspocusDocRef.current) {
       hocuspocusDocRef.current = null;
     }
+    setCollabConnected(false);
   }, []);
+
+  // 自分が最後の接続のとき、画面を閉じる/リロードすると共有文書が失われるため確認する。
+  useLeaveConfirmation(() => hocuspocusProviderRef.current, collabConnected);
 
   // Initialize Hocuspocus when session changes
   useEffect(() => {

@@ -18,11 +18,42 @@ export default function Home() {
   const router = useRouter();
   const [recent, setRecent] = useState<RecentSession[]>([]);
   const [mounted, setMounted] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
 
   // 履歴はクライアントでのみ読む（SSR不一致を避ける）。
+  // 表示後に棚卸しを行い、Yjs文書が空（＝消失/存在しない）セッションを一覧から除く。
+  // 共有文書は非永続で、配信画面が唯一の接続だとリロードで消えるため、死んだ履歴が残りうる。
   useEffect(() => {
     setMounted(true);
-    setRecent(getRecentSessions());
+    const sessions = getRecentSessions();
+    setRecent(sessions);
+    if (sessions.length === 0) return;
+
+    let cancelled = false;
+    setReconciling(true);
+    (async () => {
+      try {
+        const { probeSessionContent } = await import("@/lib/sessionLiveness");
+        const results = await Promise.all(
+          sessions.map(async (s) => ({ id: s.id, result: await probeSessionContent(s.id) }))
+        );
+        if (cancelled) return;
+        // 同期できて「空」と確認できたものだけ除去する。
+        // "unknown"（通信エラー/タイムアウト/認証失敗）は誤削除を避けて残す。
+        results
+          .filter((r) => r.result === "empty")
+          .forEach((r) => removeRecentSession(r.id));
+        setRecent(getRecentSessions());
+      } catch (e) {
+        console.error("[Home] session reconciliation failed:", e);
+      } finally {
+        if (!cancelled) setReconciling(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 代表者として新しい配信を開始する。
@@ -107,7 +138,15 @@ export default function Home() {
                 <path d="M12 7v5l3 2M21 12a9 9 0 1 1-3-6.7M21 4v4h-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </div>
-            <h2 className="text-xl font-medium text-ink">最近のセッション</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-xl font-medium text-ink">最近のセッション</h2>
+              {reconciling && (
+                <span className="inline-flex items-center gap-1.5 text-xs text-muted-soft" aria-live="polite">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-celadon" />
+                  確認中…
+                </span>
+              )}
+            </div>
             <p className="mt-2 mb-5 text-sm leading-relaxed text-body">
               参加した配信をもう一度ひらきます。共有リンクからはいつでも参加できます。
             </p>
