@@ -77,6 +77,23 @@ interface ProofreadRequestMessage {
 
 type WebSocketMessage = AutoProofreadMessage | ProofreadRequestMessage;
 
+// design(リアルタイム文字起こし.dc.html)のinlineスタイルを忠実移植するためのヘルパー。
+// "a:b;c:d" 形式のCSS文字列を React.CSSProperties に変換する（kebab→camel、-webkit対応）。
+const css = (s: string): React.CSSProperties => {
+  const o: Record<string, string> = {};
+  for (const decl of s.split(';')) {
+    const i = decl.indexOf(':');
+    if (i < 0) continue;
+    const k = decl.slice(0, i).trim().replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
+    if (k) o[k] = decl.slice(i + 1).trim();
+  }
+  return o as React.CSSProperties;
+};
+// 白カードの共通スタイル（design）。
+const DC_CARD = 'background:#fff;border:1px solid #e4e7eb;border-radius:16px;padding:26px;box-shadow:0 1px 2px rgba(16,24,40,.04);';
+const DC_LABEL = 'display:block;font-size:12px;font-weight:500;color:#7b8794;margin-bottom:8px;';
+const DC_SECTITLE = 'margin:0;font-size:15px;font-weight:700;';
+
 export default function RealtimeClient() {
   const websocketRef = useRef<WebSocket | null>(null);
   const recordingStateRef = useRef<boolean>(false);
@@ -165,7 +182,7 @@ export default function RealtimeClient() {
   const [existingSessionInput, setExistingSessionInput] = useState<string>('');
   const [isEditingSessionId, setIsEditingSessionId] = useState<boolean>(false);
   const [showClearConfirmDialog, setShowClearConfirmDialog] = useState<boolean>(false); // テキストクリア確認ダイアログ
-  const [showDebugDialog, setShowDebugDialog] = useState<boolean>(false); // 取りこぼし検証ダイアログ
+  const [showDebugDialog, setShowDebugDialog] = useState<boolean>(false); // 差分検証ダイアログ
   const [debugDocText, setDebugDocText] = useState<string>(''); // 確定doc本文（取りこぼし比較の対象）
   const [debugRaw, setDebugRaw] = useState<string>(''); // 生テキスト（共有 raw-<id> Y.Text。校正画面と同一ソース）
   const [autoProofread, setAutoProofread] = useState<boolean>(true); // 自動校正（誤字修正+パラグラフ整理）デフォルト: 有効
@@ -889,7 +906,7 @@ export default function RealtimeClient() {
     }
   }, [sentRaw, error]);
 
-  // 取りこぼし/文字落ち検証: 共有docの確定本文(content-<id>)と、共有の生テキスト(raw-<id> Y.Text)を取り出してダイアログを開く。
+  // 差分検証: 共有docの確定本文(content-<id>)と、共有の生テキスト(raw-<id> Y.Text)を取り出してダイアログを開く。
   // 生は校正画面と同一の共有ソース(raw-<id>)を使う（単一の真実源。ローカルのsentRawではなくdoc側を比較）。
   const openDebugDialog = useCallback(async () => {
     let docText = '';
@@ -1135,530 +1152,307 @@ export default function RealtimeClient() {
   }, [stopAudioStream, disconnectWebSocket, cleanupHocuspocusClient]);
 
   return (
-    <div className="min-h-screen bg-canvas">
-      {/* Header - editorと同様の構造 */}
-      <header className="bg-surface border-b border-hairline">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex items-center justify-between">
+    <div className="dc-realtime" style={css("min-height:100vh;background:#f4f6f7;font-family:'Noto Sans JP',sans-serif;color:#1f2933;-webkit-font-smoothing:antialiased;")}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        @keyframes recPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.78)}}
+        @keyframes barFlow{0%{transform:scaleY(.35)}50%{transform:scaleY(1)}100%{transform:scaleY(.5)}}
+        .dc-realtime ::placeholder{color:#9aa5b1}
+        @media(max-width:880px){.dc-grid{grid-template-columns:1fr!important}.dc-main{padding:24px 16px 48px!important}.dc-head{padding:18px 16px!important}}`}</style>
+
+      {/* Header (design) */}
+      <header style={css("background:#ffffff;border-bottom:1px solid #e4e7eb;")}>
+        <div className="dc-head" style={css("max-width:1240px;margin:0 auto;padding:22px 40px;display:flex;align-items:center;justify-content:space-between;gap:24px;")}>
+          <div style={css("display:flex;align-items:center;gap:16px;")}>
+            <div style={css("width:42px;height:42px;border-radius:11px;background:#157a8c;display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 4px 12px rgba(21,122,140,.28);")}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" fill="#fff"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3" stroke="#fff" strokeWidth="1.8" strokeLinecap="round"/></svg>
+            </div>
             <div>
-              <h1 className="text-2xl font-light text-ink">リアルタイム文字起こし</h1>
-              <p className="text-sm text-body mt-1">オンデバイス音声認識（Chrome・端末内処理）</p>
+              <h1 style={css("margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;line-height:1.3;")}>リアルタイム文字起こし・共同校正システムCollaReco</h1>
+              <p style={css("margin:3px 0 0;font-size:12.5px;color:#7b8794;")}>オンデバイス音声認識 ・ Chrome 端末内処理</p>
             </div>
-            <div className="flex items-center space-x-3">
-              <div className="text-xs text-muted">
-                v{packageJson.version}
-              </div>
-              <a
-                href={`${getBasePath()}/manual.html`}
-                className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                マニュアル
-              </a>
-            </div>
+          </div>
+          <div style={css("display:flex;align-items:center;gap:14px;")}>
+            <span style={css("font-size:11px;font-weight:500;color:#9aa5b1;font-family:'IBM Plex Mono',monospace;")}>v{packageJson.version}</span>
+            <a href={`${getBasePath()}/manual.html`} target="_blank" rel="noopener noreferrer" style={css("font-size:13px;font-weight:500;color:#3e4c59;background:#fff;border:1px solid #d2d9e0;border-radius:8px;padding:8px 16px;cursor:pointer;text-decoration:none;")}>マニュアル</a>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="space-y-6">
+      <main className="dc-main" style={css("max-width:1240px;margin:0 auto;padding:32px 40px 56px;")}>
 
-        {/* Session Management */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-          {/* Session Management */}
-          <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
-          <h3 className="text-lg font-light text-ink mb-4">
-            共同校正セッション管理
-          </h3>
+        {/* Error */}
+        {error && (
+          <div style={css("background:#fdeceb;border:1px solid #f6c9c5;border-radius:12px;padding:13px 18px;margin-bottom:20px;color:#c0392b;font-size:13px;line-height:1.6;")}>
+            <span style={css("font-weight:700;")}>エラー: </span>{error}
+          </div>
+        )}
 
-          {/* Current Session Display */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-body mb-2">
-              現在のセッションID:
-            </label>
+        {/* Top row: session + transcription source */}
+        <div className="dc-grid" style={css("display:grid;grid-template-columns:1fr 1.15fr;gap:24px;align-items:start;")}>
+
+          {/* Session management (design) */}
+          <section style={css(DC_CARD)}>
+            <div style={css("display:flex;align-items:center;gap:9px;margin-bottom:20px;")}>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M16 4h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" stroke="#157a8c" strokeWidth="1.7" strokeLinecap="round"/><rect x="9" y="3" width="6" height="3.5" rx="1.2" stroke="#157a8c" strokeWidth="1.7"/><path d="M8.5 12h7M8.5 15.5h4.5" stroke="#157a8c" strokeWidth="1.7" strokeLinecap="round"/></svg>
+              <h2 style={css(DC_SECTITLE)}>共同校正セッション</h2>
+            </div>
+
+            <label style={css(DC_LABEL)}>現在のセッションID</label>
             {isEditingSessionId ? (
-              <div className="flex space-x-2">
-                <input
-                  type="text"
-                  value={sessionIdInput}
-                  onChange={(e) => setSessionIdInput(e.target.value)}
-                  className="flex-1 px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
-                  placeholder="セッションIDを入力..."
-                />
-                <button
-                  onClick={saveSessionId}
-                  className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active"
-                >
-                  保存
-                </button>
-                <button
-                  onClick={cancelEditSessionId}
-                  className="px-4 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft"
-                >
-                  キャンセル
-                </button>
+              <div style={css("display:flex;gap:8px;margin-bottom:22px;")}>
+                <input type="text" value={sessionIdInput} onChange={(e) => setSessionIdInput(e.target.value)} placeholder="セッションIDを入力..." style={css("flex:1;font-size:13px;color:#1f2933;background:#fff;border:1px solid #d2d9e0;border-radius:9px;padding:11px 13px;outline:none;")} />
+                <button onClick={saveSessionId} style={css("font-size:13px;font-weight:500;color:#fff;background:#157a8c;border:1px solid #157a8c;border-radius:9px;padding:0 16px;cursor:pointer;white-space:nowrap;")}>保存</button>
+                <button onClick={cancelEditSessionId} style={css("font-size:13px;font-weight:500;color:#3e4c59;background:#fff;border:1px solid #d2d9e0;border-radius:9px;padding:0 14px;cursor:pointer;white-space:nowrap;")}>キャンセル</button>
               </div>
             ) : (
-              <div className="flex items-center space-x-2">
-                <div className="flex-1 px-3 py-2 bg-surface-soft border border-hairline rounded-md">
-                  <span className="text-body">
-                    {currentSessionId || 'セッションが作成されていません'}
-                  </span>
-                </div>
-                <button
-                  onClick={editSessionId}
-                  className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active"
-                >
-                  変更
-                </button>
+              <div style={css("display:flex;gap:8px;margin-bottom:22px;")}>
+                <div style={css("flex:1;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#3e4c59;background:#f4f6f7;border:1px solid #e4e7eb;border-radius:9px;padding:11px 13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;")}>{currentSessionId || 'セッションが作成されていません'}</div>
+                <button onClick={editSessionId} style={css("font-size:13px;font-weight:500;color:#157a8c;background:#eef6f7;border:1px solid #cfe6ea;border-radius:9px;padding:0 16px;cursor:pointer;white-space:nowrap;")}>変更</button>
               </div>
             )}
-          </div>
 
-          {/* Connect to Session */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-body mb-2">
-              セッションに接続:
-            </label>
-            <div className="flex space-x-2">
-              <input
-                type="text"
-                value={existingSessionInput}
-                onChange={(e) => setExistingSessionInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') connectToExistingSession(); }}
-                placeholder="共有されたセッションID または リンクを貼り付け"
-                className="flex-1 px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon"
-              />
-              <button
-                onClick={createNewSession}
-                className="px-3 py-2 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft whitespace-nowrap"
-                title="推測不能なIDで新しいセッションを作成"
-              >
-                ＋ 新規
-              </button>
-              <button
-                onClick={connectToExistingSession}
-                disabled={!existingSessionInput.trim()}
-                className="px-4 py-2 text-sm bg-celadon text-on-celadon rounded-md hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed"
-              >
-                接続
-              </button>
-              {/* 接続を切断（接続中のみ表示・接続ボタンの右） */}
+            <label style={css(DC_LABEL)}>セッションに接続</label>
+            <div style={css("display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;")}>
+              <input type="text" value={existingSessionInput} onChange={(e) => setExistingSessionInput(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') connectToExistingSession(); }} placeholder="共有されたID または リンクを貼り付け" style={css("flex:1;min-width:150px;font-size:13px;color:#1f2933;background:#fff;border:1px solid #d2d9e0;border-radius:9px;padding:11px 13px;outline:none;")} />
+              <button onClick={createNewSession} title="推測不能なIDで新しいセッションを作成" style={css("font-size:13px;font-weight:500;color:#3e4c59;background:#fff;border:1px solid #d2d9e0;border-radius:9px;padding:0 13px;cursor:pointer;white-space:nowrap;")}>＋新規</button>
+              <button onClick={connectToExistingSession} disabled={!existingSessionInput.trim()} style={css("font-size:13px;font-weight:500;border-radius:9px;padding:0 16px;white-space:nowrap;" + (!existingSessionInput.trim() ? "color:#b9c3cd;background:#f4f6f7;border:1px solid #e4e7eb;cursor:not-allowed;" : "color:#fff;background:#157a8c;border:1px solid #157a8c;cursor:pointer;"))}>接続</button>
               {isConnected && (
-                <button
-                  onClick={disconnectWebSocket}
-                  className="px-4 py-2 text-sm bg-surface text-error border border-error/50 rounded-md hover:bg-error/10 transition-colors whitespace-nowrap"
-                >
-                  接続を切断
-                </button>
+                <button onClick={disconnectWebSocket} style={css("font-size:13px;font-weight:500;color:#c0392b;background:#fff;border:1px solid #f0cdc8;border-radius:9px;padding:0 13px;cursor:pointer;white-space:nowrap;")}>切断</button>
               )}
             </div>
-            <p className="text-xs text-muted mt-1">
-              他の参加者のセッションは一覧表示されません。アクセスには共有されたリンク（ID）が必要です。
-            </p>
-          </div>
+            <p style={css("margin:0 0 22px;font-size:11.5px;line-height:1.6;color:#9aa5b1;")}>他の参加者のセッションは一覧表示されません。アクセスには共有リンク（ID）が必要です。</p>
 
-          {/* Session Status */}
-          {currentSessionId && isConnected && (
-            <div className="space-y-3">
-              <div className="p-3 bg-success/10 border border-success/40 rounded-md">
-                <div className="flex items-center space-x-2">
-                  <div className="w-2.5 h-2.5 bg-success rounded-full"></div>
-                  <span className="text-sm font-medium text-success">
-                    セッション接続中: {currentSessionId}
-                  </span>
+            {currentSessionId && isConnected && (
+              <div style={css("background:#f0f8f4;border:1px solid #cfeada;border-radius:12px;padding:13px 15px;margin-bottom:18px;")}>
+                <div style={css("display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;")}>
+                  <span style={css("font-size:12px;font-weight:700;color:#157a4a;")}>● 接続中・このURLを共有して招待</span>
+                  <button onClick={() => { const editorUrl = `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`; navigator.clipboard.writeText(editorUrl); const b = document.activeElement as HTMLButtonElement; const t = b.textContent; b.textContent = 'コピー完了！'; setTimeout(() => { b.textContent = t; }, 2000); }} style={css("font-size:12px;font-weight:500;color:#fff;background:#157a8c;border:none;border-radius:7px;padding:6px 12px;cursor:pointer;white-space:nowrap;")}>URLをコピー</button>
                 </div>
+                <div style={css("font-family:'IBM Plex Mono',monospace;font-size:11px;color:#3e6b54;word-break:break-all;")}>{typeof window !== 'undefined' && `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`}</div>
               </div>
+            )}
 
-              {/* Share Session URL */}
-              <div className="p-3 bg-celadon-soft border border-celadon/30 rounded-md">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm text-celadon-active">
-                    このURLを共有して他の人を招待
-                  </div>
-                  <button
-                    onClick={() => {
-                      const editorUrl = `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`;
-                      navigator.clipboard.writeText(editorUrl);
-                      // Optional: Show feedback (could add a toast notification here)
-                      const button = document.activeElement as HTMLButtonElement;
-                      const originalText = button.textContent;
-                      button.textContent = 'コピー完了！';
-                      setTimeout(() => {
-                        button.textContent = originalText;
-                      }, 2000);
-                    }}
-                    className="px-3 py-1 text-sm bg-celadon text-on-celadon rounded hover:bg-celadon-active transition-colors"
-                  >
-                    URLをコピー
-                  </button>
-                </div>
-                <div className="mt-2 text-xs text-celadon-active font-mono">
-                  {typeof window !== 'undefined' && `${window.location.origin}${getBasePath()}/editor/${currentSessionId}`}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Create/Open Session Button */}
-          <div className="flex justify-center space-x-4">
-            <button
-              onClick={createOrOpenEditingSession}
-              className="px-6 py-3 rounded-lg font-medium bg-celadon text-on-celadon hover:bg-celadon-active transition-colors"
-            >
+            <button onClick={createOrOpenEditingSession} style={css("width:100%;font-size:14px;font-weight:700;color:#fff;background:#157a8c;border:none;border-radius:11px;padding:14px;cursor:pointer;box-shadow:0 4px 12px rgba(21,122,140,.24);display:flex;align-items:center;justify-content:center;gap:8px;")}>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M17 7 7 17M9 7h8v8" stroke="#fff" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"/></svg>
               {currentSessionId ? '共同校正セッションを開く' : '共同校正セッションの作成'}
             </button>
-          </div>
-          </div>
+          </section>
 
-          {/* Controls（音声入力からの文字起こし）。セッション管理と横並びにする */}
-          <div className={`p-6 rounded-lg border transition-colors ${
-          isRecording
-            ? "bg-celadon-soft border-celadon/30"
-            : "bg-surface border-hairline shadow-sm"
-        }`}>
-          <div className="max-w-2xl mx-auto">
-            {/* Main Recording Controls */}
-            <div className="space-y-4 bg-surface p-4 rounded-lg border border-hairline shadow-sm">
-              <h4 className="text-md font-medium text-ink text-center">
-                音声入力からの文字起こし
-              </h4>
+          {/* Transcription source (design) */}
+          <section style={css(DC_CARD)}>
+            <div style={css("display:flex;align-items:center;gap:9px;margin-bottom:20px;")}>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" stroke="#157a8c" strokeWidth="1.7"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3" stroke="#157a8c" strokeWidth="1.7" strokeLinecap="round"/></svg>
+              <h2 style={css(DC_SECTITLE)}>音声入力からの文字起こし</h2>
+            </div>
 
-              {/* Audio Source Selection */}
-              <div className="px-4">
-                <label className="block text-sm font-medium text-body mb-2">
-                  音声ソース:
-                </label>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setAudioSource('microphone')}
-                    disabled={isRecording}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                      audioSource === 'microphone'
-                        ? 'bg-celadon text-on-celadon'
-                        : 'bg-surface-soft text-body hover:bg-celadon-soft'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    <span>🎤</span> マイク
+            {/* Audio source */}
+            <label style={css(DC_LABEL)}>音声ソース</label>
+            {(() => {
+              const segBase = 'font-size:13.5px;font-weight:500;border-radius:10px;padding:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:all .12s;';
+              const on = segBase + 'color:#fff;background:#157a8c;border:1px solid #157a8c;box-shadow:0 2px 8px rgba(21,122,140,.22);';
+              const off = segBase + 'color:#52606d;background:#fff;border:1px solid #d2d9e0;';
+              const dim: React.CSSProperties = isRecording ? { opacity: 0.5, cursor: 'not-allowed' } : {};
+              return (
+                <div style={css("display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:9px;")}>
+                  <button type="button" onClick={() => setAudioSource('microphone')} disabled={isRecording} style={{ ...css(audioSource === 'microphone' ? on : off), ...dim }}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" stroke="currentColor" strokeWidth="1.7"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                    マイク
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setAudioSource('tab-capture')}
-                    disabled={isRecording}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                      audioSource === 'tab-capture'
-                        ? 'bg-celadon text-on-celadon'
-                        : 'bg-surface-soft text-body hover:bg-celadon-soft'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    <span>🖥️</span> タブ音声キャプチャ
+                  <button type="button" onClick={() => setAudioSource('tab-capture')} disabled={isRecording} style={{ ...css(audioSource === 'tab-capture' ? on : off), ...dim }}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="14" rx="2" stroke="currentColor" strokeWidth="1.7"/><path d="M9 21h6M12 18v3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                    タブ音声キャプチャ
                   </button>
                 </div>
-                {audioSource === 'tab-capture' && (
-                  <p className="text-xs text-muted mt-1">
-                    開始時にタブ選択ダイアログが表示されます。「タブの音声も共有」を有効にしてください。
-                  </p>
-                )}
+              );
+            })()}
+            <p style={css("margin:0 0 18px;font-size:11.5px;line-height:1.6;color:#9aa5b1;")}>{audioSource === 'tab-capture' ? '開始時にタブ選択ダイアログが表示されます。「タブの音声も共有」を有効にしてください。' : '開始時にマイクへのアクセス許可を求められます。静かな環境での利用を推奨します。'}</p>
 
-                {/* オンデバイス認識ステータス */}
-                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
-                  <label className="block text-sm font-medium text-body mb-1">
-                    オンデバイス認識:
-                  </label>
-                  <div className="mt-1 text-xs text-muted flex items-center gap-2 flex-wrap">
-                    {localAsrStatus === 'checking' && <span>オンデバイス認識の対応状況を確認中...</span>}
-                    {localAsrStatus === 'unsupported' && <span className="text-warning">このブラウザでは利用できません。Chrome 139以降でこのページを開いてください</span>}
-                    {localAsrStatus === 'unavailable' && <span className="text-warning">日本語のオンデバイス認識が利用できません。Chrome 139以降でお試しください</span>}
-                    {localAsrStatus === 'downloadable' && (
-                      <>
-                        <span>日本語の言語パック（約60MB）が未インストール</span>
-                        <button
-                          onClick={installLocalAsr}
-                          disabled={isRecording}
-                          className="px-2 py-0.5 text-xs bg-celadon text-on-celadon rounded hover:bg-celadon-active disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          インストール
-                        </button>
-                      </>
-                    )}
-                    {localAsrStatus === 'downloading' && <span>言語パックをインストール中...（数分かかる場合があります）</span>}
-                    {localAsrStatus === 'available' && (
-                      <span className="text-success">
-                        ✓ Chromeオンデバイス認識で文字起こしします（音声の外部送信なし）。認識途中のテキストは薄色で表示されます
-                      </span>
-                    )}
-                  </div>
-                  {localAsrStatus === 'available' && (
-                    <div className="mt-2 flex items-center gap-2 text-xs text-body flex-wrap">
-                      <label htmlFor="force-finalize-select" className="font-medium">部分確定間隔:</label>
-                      <select
-                        id="force-finalize-select"
-                        value={localForceFinalizeSec}
-                        onChange={(e) => setLocalForceFinalizeSec(parseInt(e.target.value))}
-                        disabled={isRecording}
-                        className="px-2 py-0.5 border border-hairline rounded text-xs disabled:bg-surface-soft focus:outline-none focus:ring-2 focus:ring-celadon"
-                      >
-                        <option value="3">3秒</option>
-                        <option value="5">5秒</option>
-                        <option value="8">8秒</option>
-                        <option value="10">10秒</option>
-                        <option value="0">なし（自然な区切りのみ）</option>
-                      </select>
-                      <span className="text-muted">
-                        話が続いていても、この間隔で安定した前半部分を順次確定します（揺れやすい末尾は未確定のまま残ります）
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                {/* 自動校正設定 */}
-                <div className="mt-3 p-2 bg-surface-soft rounded-md border border-hairline">
-                  <label className="flex items-center gap-2 text-sm font-medium text-body">
-                    <input
-                      type="checkbox"
-                      checked={autoProofread}
-                      onChange={(e) => {
-                        setAutoProofread(e.target.checked);
-                        setAutoProofreadStatus('');
-                        if (websocketRef.current?.readyState === WebSocket.OPEN) {
-                          websocketRef.current.send(JSON.stringify({
-                            type: 'set_auto_proofread',
-                            enabled: e.target.checked,
-                            model: rewriteModel,
-                            engine: proofreadEngineRef.current
-                          }));
-                        }
-                      }}
-                      className="rounded accent-celadon"
-                    />
-                    🪄 自動校正（誤字修正＋パラグラフ整理）
-                  </label>
-                  <p className="mt-1 ml-6 text-xs text-muted">
-                    ONにすると、認識テキストはAI校正（誤字修正・句読点補完・段落分け）を経てから校正画面に確定反映されます。
-                    校正前のテキストはグレーの未確定表示のまま見えます（100文字以上たまり次第・最短15秒間隔で処理、録音停止後は残りも自動処理）。
-                  </p>
-                  {/* 校正エンジン: サーバOpenAI / オンデバイス（ブラウザLLM）。対応ブラウザでのみ後者を表示 */}
-                  {browserLlm !== 'unsupported' && (
-                    <div className="mt-2 ml-6">
-                      <span className="block text-xs font-medium text-body mb-1">校正エンジン</span>
-                      <div className="flex items-center gap-4 text-xs text-body">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="proofread-engine"
-                            checked={proofreadEngine === 'server'}
-                            onChange={() => applyProofreadEngine('server')}
-                            className="accent-celadon"
-                          />
-                          サーバ（OpenAI）
-                        </label>
-                        <label className={`flex items-center gap-1.5 ${nanoPreparing ? 'opacity-60 cursor-wait' : 'cursor-pointer'}`}>
-                          <input
-                            type="radio"
-                            name="proofread-engine"
-                            checked={proofreadEngine === 'on-device'}
-                            disabled={nanoPreparing}
-                            onChange={chooseOnDeviceEngine}
-                            className="accent-celadon"
-                          />
-                          オンデバイス（ブラウザLLM）
-                          {nanoPreparing && <span className="text-muted">（モデル準備中… {nanoDlProgress ?? 0}%）</span>}
-                        </label>
-                      </div>
-                      {proofreadEngine === 'on-device' && (
-                        <p className="mt-1 text-xs text-muted">
-                          録音端末のブラウザ内蔵LLM（Chrome=Gemini Nano／Edge=Phi 等）で校正します（外部送信なし）。
-                          選択時にモデルの準備（初回はDL）を確認します。録音中の同端末で実行するため、長文では認識表示が一瞬もたつくことがあります。
-                          校正できなかった分はOpenAIへ送らず、未校正のまま追記して警告を表示します。
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {autoProofreadStatus && (
-                    <p className="mt-1 ml-6 text-xs text-celadon-active">{autoProofreadStatus}</p>
-                  )}
-                </div>
+            {/* on-device badge (status-adaptive) */}
+            <div style={css("background:#f0f8f4;border:1px solid #cfeada;border-radius:12px;padding:14px 16px;margin-bottom:14px;")}>
+              <div style={css("display:flex;align-items:center;gap:7px;margin-bottom:6px;")}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="#1f9d63" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                <span style={css("font-size:13px;font-weight:700;color:#157a4a;")}>オンデバイス認識</span>
               </div>
+              <div style={css("font-size:11.5px;line-height:1.65;color:#3e6b54;")}>
+                {localAsrStatus === 'checking' && <span>オンデバイス認識の対応状況を確認中...</span>}
+                {localAsrStatus === 'unsupported' && <span style={css("color:#c0392b;")}>このブラウザでは利用できません。Chrome 139以降でこのページを開いてください。</span>}
+                {localAsrStatus === 'unavailable' && <span style={css("color:#c0392b;")}>日本語のオンデバイス認識が利用できません。Chrome 139以降でお試しください。</span>}
+                {localAsrStatus === 'downloadable' && (
+                  <span>日本語の言語パック（約60MB）が未インストールです。
+                    <button onClick={installLocalAsr} disabled={isRecording} style={css("font-size:11px;font-weight:500;color:#fff;background:#157a8c;border:none;border-radius:6px;padding:3px 10px;cursor:pointer;margin-left:6px;")}>インストール</button>
+                  </span>
+                )}
+                {localAsrStatus === 'downloading' && <span>言語パックをインストール中...（数分かかる場合があります）</span>}
+                {localAsrStatus === 'available' && <span>Chrome 端末内エンジンで文字起こし（音声の外部送信なし）。認識途中のテキストは薄色で表示されます。</span>}
+              </div>
+              {localAsrStatus === 'available' && (
+                <div style={css("display:flex;align-items:center;gap:10px;margin-top:12px;")}>
+                  <span style={css("font-size:12px;color:#52606d;white-space:nowrap;")}>部分確定間隔</span>
+                  <select value={localForceFinalizeSec} onChange={(e) => setLocalForceFinalizeSec(parseInt(e.target.value))} disabled={isRecording} style={css("flex:1;font-size:12.5px;color:#1f2933;background:#fff;border:1px solid #cfeada;border-radius:8px;padding:8px 12px;cursor:pointer;outline:none;")}>
+                    <option value="3">3秒</option>
+                    <option value="5">5秒</option>
+                    <option value="8">8秒</option>
+                    <option value="10">10秒</option>
+                    <option value="0">なし（自然な区切りのみ）</option>
+                  </select>
+                </div>
+              )}
+            </div>
 
-              {/* Audio Input Device Selection */}
-              {audioSource === 'microphone' && (
-              <div className="px-4">
-                <label htmlFor="device-select" className="block text-sm font-medium text-body mb-2">
-                  音声入力デバイス:
-                </label>
-                <select
-                  id="device-select"
-                  value={selectedDeviceId}
-                  onChange={(e) => setSelectedDeviceId(e.target.value)}
-                  disabled={isRecording}
-                  className="block w-full px-3 py-2 border border-hairline rounded-md focus:outline-none focus:ring-2 focus:ring-celadon focus:border-celadon disabled:bg-surface-soft"
-                >
+            {/* device select (mic only) */}
+            {audioSource === 'microphone' && (
+              <div style={css("margin-bottom:14px;")}>
+                <label style={css(DC_LABEL)}>音声入力デバイス</label>
+                <select value={selectedDeviceId} onChange={(e) => setSelectedDeviceId(e.target.value)} disabled={isRecording} style={css("width:100%;font-size:12.5px;color:#1f2933;background:#fff;border:1px solid #d2d9e0;border-radius:9px;padding:9px 12px;cursor:pointer;outline:none;")}>
                   {audioDevices.length === 0 ? (
                     <option value="">デバイスを読み込み中...</option>
                   ) : (
                     audioDevices.map((device) => (
-                      <option key={device.deviceId} value={device.deviceId}>
-                        {device.label || `マイク ${device.deviceId.slice(0, 8)}...`}
-                      </option>
+                      <option key={device.deviceId} value={device.deviceId}>{device.label || `マイク ${device.deviceId.slice(0, 8)}...`}</option>
                     ))
                   )}
                 </select>
-                <div className="mt-2 flex items-center space-x-2">
-                  <button
-                    onClick={getAudioDevices}
-                    disabled={isRecording}
-                    className="px-3 py-1 text-xs bg-surface text-ink border border-hairline hover:bg-surface-soft rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    デバイス更新
-                  </button>
-                  <p className="text-xs text-muted">
-                    {audioDevices.length} 個のデバイス
-                  </p>
+                <div style={css("display:flex;align-items:center;gap:10px;margin-top:8px;")}>
+                  <button onClick={getAudioDevices} disabled={isRecording} style={css("font-size:11px;color:#3e4c59;background:#fff;border:1px solid #d2d9e0;border-radius:7px;padding:5px 10px;cursor:pointer;")}>デバイス更新</button>
+                  <span style={css("font-size:11px;color:#9aa5b1;")}>{audioDevices.length} 個のデバイス</span>
                 </div>
               </div>
+            )}
+
+            {/* auto correct */}
+            <div style={css(autoProofread ? 'background:#f7fafb;border:1px solid #dde7ea;border-radius:12px;padding:16px;' : 'background:#fafbfc;border:1px solid #e4e7eb;border-radius:12px;padding:16px;')}>
+              <label style={css("display:flex;align-items:flex-start;gap:10px;cursor:pointer;")}>
+                <input
+                  type="checkbox"
+                  checked={autoProofread}
+                  onChange={(e) => {
+                    setAutoProofread(e.target.checked);
+                    setAutoProofreadStatus('');
+                    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+                      websocketRef.current.send(JSON.stringify({ type: 'set_auto_proofread', enabled: e.target.checked, model: rewriteModel, engine: proofreadEngineRef.current }));
+                    }
+                  }}
+                  style={css("margin-top:3px;accent-color:#157a8c;width:16px;height:16px;")}
+                />
+                <span>
+                  <span style={css("font-size:13.5px;font-weight:700;color:#1f2933;")}>自動校正（誤字修正＋パラグラフ整理）</span>
+                  <span style={css("display:block;margin-top:5px;font-size:11.5px;line-height:1.65;color:#7b8794;")}>ONにすると認識テキストをAI校正してから校正画面に反映します。校正前テキストはグレーの未確定表示。100文字以上たまり次第・最短15秒間隔で処理します。</span>
+                </span>
+              </label>
+              {autoProofread && browserLlm !== 'unsupported' && (
+                <div style={css("margin-top:14px;padding-top:14px;border-top:1px dashed #d2d9e0;")}>
+                  <span style={css("display:block;font-size:12px;font-weight:500;color:#52606d;margin-bottom:9px;")}>校正エンジン</span>
+                  {(() => {
+                    const eb = 'flex:1;font-size:12.5px;font-weight:500;border-radius:9px;padding:10px;cursor:pointer;transition:all .12s;';
+                    const eon = eb + 'color:#157a8c;background:#eef6f7;border:1px solid #157a8c;';
+                    const eoff = eb + 'color:#52606d;background:#fff;border:1px solid #d2d9e0;';
+                    return (
+                      <div style={css("display:flex;gap:9px;")}>
+                        <button onClick={() => applyProofreadEngine('server')} style={css(proofreadEngine === 'server' ? eon : eoff)}>サーバ（OpenAI）</button>
+                        <button onClick={chooseOnDeviceEngine} disabled={nanoPreparing} style={css(proofreadEngine === 'on-device' ? eon : eoff)}>オンデバイス（ブラウザLLM）{nanoPreparing && `（準備中 ${nanoDlProgress ?? 0}%）`}</button>
+                      </div>
+                    );
+                  })()}
+                  <p style={css("margin:11px 0 0;font-size:11px;line-height:1.6;color:#9aa5b1;")}>{proofreadEngine === 'on-device' ? '録音端末のブラウザ内蔵LLM（Chrome=Gemini Nano / Edge=Phi 等）で校正します（外部送信なし）。初回はモデルDLを確認します。校正できなかった分は未校正のまま追記し警告を表示します。' : 'OpenAI サーバへ送信して校正します。長文でも安定した精度ですが、テキストが外部に送信されます。'}</p>
+                </div>
               )}
+              {autoProofreadStatus && (<p style={css("margin:11px 0 0;font-size:11px;color:#157a8c;")}>{autoProofreadStatus}</p>)}
+            </div>
 
-              {/* Start/Stop Button */}
-              <div className="flex justify-center pt-2">
-                <button
-                  onClick={isRecording ? stopRecording : startRecording}
-                  className={`px-6 py-3 rounded-lg font-medium transition-colors ${
-                    isRecording
-                      ? "bg-surface text-error border border-error/50 hover:bg-error/10"
-                      : "bg-celadon text-on-celadon hover:bg-celadon-active"
-                  }`}
-                >
-                  {isRecording ? "録音を停止" : "録音開始"}
-                </button>
+            {/* record button */}
+            <button onClick={isRecording ? stopRecording : startRecording} style={css(isRecording
+              ? 'width:100%;margin-top:18px;font-size:15px;font-weight:700;color:#fff;background:#c0392b;border:none;border-radius:12px;padding:15px;cursor:pointer;box-shadow:0 4px 14px rgba(192,57,43,.26);display:flex;align-items:center;justify-content:center;gap:9px;'
+              : 'width:100%;margin-top:18px;font-size:15px;font-weight:700;color:#fff;background:#157a8c;border:none;border-radius:12px;padding:15px;cursor:pointer;box-shadow:0 4px 14px rgba(21,122,140,.26);display:flex;align-items:center;justify-content:center;gap:9px;')}>
+              <span style={isRecording ? css("width:11px;height:11px;border-radius:3px;background:#fff;display:inline-block;") : css("width:11px;height:11px;border-radius:50%;background:#fff;display:inline-block;animation:recPulse 1.6s ease-in-out infinite;")}></span>
+              {isRecording ? '録音を停止' : '録音開始'}
+            </button>
+
+            {isRecording && (
+              <div style={css("display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;color:#52606d;")}>
+                <span style={css("width:8px;height:8px;border-radius:50%;background:#157a8c;display:inline-block;animation:recPulse 1.4s ease-in-out infinite;")}></span>
+                <span style={css("font-size:13px;font-weight:500;")}>認識中</span>
+                <span style={css("font-size:18px;font-weight:300;font-variant-numeric:tabular-nums;color:#1f2933;")}>{Math.floor(recordingElapsedTime / 60).toString().padStart(2, '0')}:{Math.floor(recordingElapsedTime % 60).toString().padStart(2, '0')}</span>
+                <span style={css("font-size:12px;color:#9aa5b1;")}>経過</span>
               </div>
+            )}
+          </section>
+        </div>
 
-              {/* Recording Status Display */}
+        {/* Result panel (design) */}
+        <section style={css(DC_CARD + 'margin-top:24px;')}>
+          <div style={css("display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;flex-wrap:wrap;")}>
+            <div style={css("display:flex;align-items:center;gap:11px;flex-wrap:wrap;")}>
+              <h2 style={css(DC_SECTITLE)}>文字起こし結果</h2>
               {isRecording && (
-                <div className="flex flex-col items-center justify-center space-y-2 text-celadon-active pt-3">
-                  <div className="flex items-center space-x-2">
-                    <div className="w-3 h-3 bg-celadon rounded-full animate-pulse"></div>
-                    <span className="font-medium">認識中...</span>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-2xl font-light tabular-nums text-ink">
-                      {Math.floor(recordingElapsedTime / 60).toString().padStart(2, '0')}:
-                      {Math.floor(recordingElapsedTime % 60).toString().padStart(2, '0')}
-                    </span>
-                    <span className="text-sm text-muted">経過</span>
-                  </div>
-                </div>
+                <span style={css("display:inline-flex;align-items:center;gap:6px;background:#fdeceb;border:1px solid #f6c9c5;border-radius:999px;padding:4px 11px;")}>
+                  <span style={css("width:7px;height:7px;border-radius:50%;background:#e0584f;display:inline-block;animation:recPulse 1.4s ease-in-out infinite;")}></span>
+                  <span style={css("font-size:11px;font-weight:700;color:#c0392b;")}>録音中</span>
+                </span>
               )}
+              <span style={css("font-size:11.5px;color:#9aa5b1;")}>自動校正・改行挿入なし</span>
             </div>
-          </div>
-        </div>
-        </div>
-
-        {/* Error Display */}
-        {error && (
-          <div className="p-4 bg-error/10 border border-error/40 rounded-lg">
-            <div className="flex">
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-error">エラー</h3>
-                <div className="mt-2 text-sm text-error">
-                  {error}
+            {(() => {
+              const ab = 'font-size:13px;font-weight:500;border-radius:9px;padding:9px 14px;display:flex;align-items:center;gap:7px;transition:all .12s;';
+              const aOn = ab + 'color:#3e4c59;background:#fff;border:1px solid #d2d9e0;cursor:pointer;';
+              const aOff = ab + 'color:#b9c3cd;background:#f4f6f7;border:1px solid #e4e7eb;cursor:not-allowed;';
+              const clearOn = ab + 'color:#c0392b;background:#fff;border:1px solid #f0cdc8;cursor:pointer;';
+              const noText = !sentRaw;
+              return (
+                <div style={css("display:flex;gap:9px;flex-wrap:wrap;")}>
+                  <button onClick={copyText} disabled={noText} style={css(noText ? aOff : aOn)}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.7"/><path d="M5 15V5a2 2 0 0 1 2-2h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                    コピー
+                  </button>
+                  <button onClick={openDebugDialog} disabled={noText} title="生テキスト(認識結果)と確定doc本文を文字単位で比較し、差分を検出します" style={css(noText ? aOff : aOn)}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.7"/><path d="m20 20-4-4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
+                    差分検証
+                  </button>
+                  <button onClick={() => setShowClearConfirmDialog(true)} disabled={isRecording || noText} style={css((isRecording || noText) ? aOff : clearOn)}>テキストをクリア</button>
                 </div>
-              </div>
-            </div>
+              );
+            })()}
           </div>
-        )}
 
-        {/* Transcription Output */}
-        <div className="bg-surface p-6 rounded-lg border border-hairline shadow-sm">
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-lg font-light text-ink">
-              文字起こし結果（自動校正、改行挿入なし）
-            </h2>
-            <div className="flex gap-2">
-              <button
-                onClick={copyText}
-                disabled={!sentRaw}
-                className="px-4 py-2 rounded-lg font-medium bg-celadon text-on-celadon hover:bg-celadon-active disabled:bg-celadon-disabled disabled:cursor-not-allowed transition-colors"
-              >
-                📋 コピー
-              </button>
-              <button
-                onClick={openDebugDialog}
-                disabled={!sentRaw}
-                title="生テキスト(認識結果)と確定doc本文を文字単位で比較し、取りこぼしを検出します"
-                className="px-4 py-2 rounded-lg font-medium bg-surface text-ink border border-hairline hover:bg-surface-soft disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              >
-                🔍 取りこぼし検証
-              </button>
-              <button
-                onClick={() => setShowClearConfirmDialog(true)}
-                disabled={isRecording || !sentRaw}
-                className="px-4 py-2 rounded-lg font-medium bg-surface text-error border border-error/50 hover:bg-error/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              >
-                テキストをクリア
-              </button>
-            </div>
-          </div>
-          <div
-            ref={transcriptScrollRef}
-            onScroll={() => {
-              const el = transcriptScrollRef.current;
-              if (el) {
-                // 最下部から40px以内なら「最下部にいる」とみなして自動追従を有効にする
-                transcriptAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-              }
-            }}
-            className="h-[300px] min-h-[160px] resize-y overflow-y-auto p-4 border border-hairline rounded-md bg-surface-soft"
-          >
+          <div ref={transcriptScrollRef} onScroll={() => { const el = transcriptScrollRef.current; if (el) { transcriptAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40; } }} style={css("position:relative;border:1px solid #e4e7eb;border-radius:12px;background:#fafbfc;min-height:300px;max-height:60vh;overflow-y:auto;resize:vertical;")}>
             {(sentRaw || (isRecording && draftText)) ? (
-              <p className="whitespace-pre-wrap leading-relaxed">
-                {/* 黒: 完全確定（サーバがAI校正して共有ドキュメントに確定した分） */}
-                <span className="text-ink">{sentRaw.slice(0, Math.max(0, sentRaw.length - pendingGreenLen))}</span>
-                {/* 緑: サーバのAI校正待ち（オンデバイス確定済・rawBuffer） */}
-                <span style={{ color: '#3fa874' }}>{sentRaw.slice(Math.max(0, sentRaw.length - pendingGreenLen))}</span>
-                {/* グレー: オンデバイス未確定（interim） */}
-                {isRecording && draftText && (
-                  <span className="text-muted-soft">{draftText}</span>
-                )}
-              </p>
+              <div style={css("padding:20px 22px;font-size:14.5px;line-height:1.9;white-space:pre-wrap;")}>
+                <span style={css("color:#1f2933;")}>{sentRaw.slice(0, Math.max(0, sentRaw.length - pendingGreenLen))}</span>
+                <span style={css("color:#3fa874;")}>{sentRaw.slice(Math.max(0, sentRaw.length - pendingGreenLen))}</span>
+                {isRecording && draftText && (<span style={css("color:#9aa5b1;")}>{draftText}</span>)}
+                {isRecording && (<span style={css("display:inline-block;width:2px;height:18px;background:#157a8c;margin-left:2px;vertical-align:text-bottom;animation:recPulse 1s step-end infinite;")}></span>)}
+              </div>
             ) : (
-              <p className="text-muted italic">
-                録音を開始すると、ここに文字起こしが表示されます...
-              </p>
-            )}
-            {/* 認識中表示（オンデバイス認識の暫定テキストがある間だけ表示） */}
-            {isRecording && draftText && (
-              <div className="flex items-center space-x-1 mt-2">
-                <div className="w-2 h-2 bg-celadon rounded-full animate-pulse"></div>
-                <span className="text-celadon-active text-sm font-medium">認識中</span>
+              <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:20px;")}>
+                <div style={css("display:flex;align-items:flex-end;gap:4px;height:30px;")}>
+                  {[0, 1, 2, 3, 4].map((i) => {
+                    const dur = [1.1, 0.8, 1.3, 0.9, 1.05][i];
+                    const delay = [0, .2, .4, .15, .35][i];
+                    return (<span key={i} style={{ ...css("width:4px;height:100%;background:#cfe6ea;border-radius:2px;transform-origin:bottom;"), animation: `barFlow ${dur}s ease-in-out ${delay}s infinite` }}></span>);
+                  })}
+                </div>
+                <p style={css("margin:0;font-size:13.5px;color:#9aa5b1;")}>録音を開始すると、ここに文字起こしが表示されます</p>
               </div>
             )}
           </div>
-          {sentRaw && (
-            <div className="mt-4 text-sm text-body">
-              文字数: {sentRaw.length}
-            </div>
-          )}
-        </div>
+          {sentRaw && (<div style={css("margin-top:14px;font-size:12.5px;color:#7b8794;")}>文字数: {sentRaw.length}</div>)}
+        </section>
 
-        {/* Instructions */}
-        <div className="bg-celadon-soft p-6 rounded-lg border border-celadon/30">
-          <h3 className="text-lg font-light text-celadon-active mb-3">
-            使い方
-          </h3>
-          <ol className="list-decimal list-inside space-y-2 text-body">
-            <li>音声ソース（マイク／タブ音声）を選ぶ</li>
-            <li>「録音開始」をクリック（共有ドキュメントへ自動接続されます）</li>
-            <li>マイクまたはタブ音声へのアクセスを許可し、自然に話す</li>
-            <li>端末内のオンデバイス認識でリアルタイムに文字起こしが表示される</li>
-            <li>終了時は「録音を停止」をクリック</li>
-          </ol>
-          <div className="mt-4 text-sm text-body">
-            <strong className="font-medium">オンデバイス認識について:</strong> 音声はChromeの端末内エンジンで処理され、外部サーバーへは送信されません。初回利用時は日本語の言語パック（約60MB）のインストールが必要です。Chrome 139以降が必要です。
+        {/* How to use (design) */}
+        <section style={css("background:#eef6f7;border:1px solid #d6e9ec;border-radius:16px;padding:26px 30px;margin-top:24px;")}>
+          <div style={css("display:flex;align-items:center;gap:9px;margin-bottom:18px;")}>
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#157a8c" strokeWidth="1.7"/><path d="M12 11v5M12 8h.01" stroke="#157a8c" strokeWidth="1.9" strokeLinecap="round"/></svg>
+            <h2 style={css("margin:0;font-size:15px;font-weight:700;color:#0f5f6e;")}>使い方</h2>
           </div>
-        </div>
-        </div>
+          <div style={css("display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px 22px;")}>
+            {['音声ソース（マイク／タブ音声）を選ぶ', '「録音開始」をクリック（共有ドキュメントへ自動接続）', 'アクセスを許可し、自然に話す', '端末内認識でリアルタイムに表示される', '終了時は「録音を停止」をクリック'].map((t, i) => (
+              <div key={i} style={css("display:flex;gap:11px;")}>
+                <span style={css("flex-shrink:0;width:23px;height:23px;border-radius:50%;background:#157a8c;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;")}>{i + 1}</span>
+                <span style={css("font-size:13px;line-height:1.55;color:#3e4c59;")}>{t}</span>
+              </div>
+            ))}
+          </div>
+          <p style={css("margin:18px 0 0;padding-top:16px;border-top:1px solid #d6e9ec;font-size:11.5px;line-height:1.7;color:#5a7a80;")}>オンデバイス認識について: 音声は Chrome の端末内エンジンで処理され、外部サーバーへは送信されません。初回利用時は日本語の言語パック（約60MB）のインストールが必要です。Chrome 139 以降が必要です。</p>
+        </section>
       </main>
 
       {/* テキストクリア確認ダイアログ */}
@@ -1692,7 +1486,7 @@ export default function RealtimeClient() {
         </div>
       )}
 
-      {/* 取りこぼし検証ダイアログ（生テキスト vs 確定doc・文字単位diff） */}
+      {/* 差分検証ダイアログ（生テキスト vs 確定doc・文字単位diff） */}
       {showDebugDialog && (
         <div
           className="fixed inset-0 bg-surface-ink/40 flex items-center justify-center z-50"
@@ -1703,7 +1497,7 @@ export default function RealtimeClient() {
             onClick={(e) => e.stopPropagation()}
           >
             <h3 className="text-lg font-medium text-ink mb-2">
-              🔍 取りこぼし検証（生テキスト vs 確定doc・文字単位diff）
+              🔍 差分検証（生テキスト vs 確定doc・文字単位diff）
             </h3>
             {!debugRaw ? (
               <p className="text-body py-6">
@@ -1711,7 +1505,7 @@ export default function RealtimeClient() {
               </p>
             ) : (
               (() => {
-                // old=確定doc / new=生テキスト(共有raw)。added=生にあってdocに無い(取りこぼし候補)、removed=docにあって生に無い(AI付加/変更)。
+                // old=確定doc / new=生テキスト(共有raw)。added=生にあってdocに無い(差分候補)、removed=docにあって生に無い(AI付加/変更)。
                 const parts = Diff.diffChars(debugDocText, debugRaw);
                 const dropped = parts.filter((p) => p.added).reduce((n, p) => n + p.value.length, 0);
                 const aiAdded = parts.filter((p) => p.removed).reduce((n, p) => n + p.value.length, 0);
@@ -1720,14 +1514,14 @@ export default function RealtimeClient() {
                     <div className="text-sm text-body mb-2">
                       生(認識): <b>{debugRaw.length}</b>字 / 確定doc: <b>{debugDocText.length}</b>字
                       <span className="ml-3" style={{ color: '#b91c1c' }}>
-                        取りこぼし候補(赤): {dropped}字
+                        差分候補(赤): {dropped}字
                       </span>
                       <span className="ml-3" style={{ color: '#2563eb' }}>
                         AI付加/変更(青): {aiAdded}字
                       </span>
                     </div>
                     <p className="text-xs text-muted mb-3 leading-relaxed">
-                      赤＝生にあって確定docに無い文字（取りこぼし候補）。青＝確定docにあって生に無い文字（AIの整形・かな→漢字等）。
+                      赤＝生にあって確定docに無い文字（差分候補）。青＝確定docにあって生に無い文字（AIの整形・かな→漢字等）。
                       ※「文字単位の厳密diff」のため、AIの言い換え・漢字変換も差分として現れます。
                     </p>
                     <div className="flex-1 overflow-y-auto p-3 border border-hairline rounded-md bg-surface-soft whitespace-pre-wrap leading-relaxed text-sm">

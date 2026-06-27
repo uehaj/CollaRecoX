@@ -4,7 +4,7 @@ import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Collarecox — 話して、みんなで仕上げる文字起こし",
+  title: "リアルタイム文字起こし・共同校正システムCollaReco",
   description: "オンデバイス音声認識による、ブラウザ完結のリアルタイム文字起こしと共同校正",
 };
 
