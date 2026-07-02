@@ -1167,7 +1167,7 @@ export default function RealtimeClient() {
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" fill="#fff"/><path d="M6 11a6 6 0 0 0 12 0M12 17v3" stroke="#fff" strokeWidth="1.8" strokeLinecap="round"/></svg>
             </div>
             <div>
-              <h1 style={css("margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;line-height:1.3;")}>リアルタイム文字起こし・共同校正システムCollaReco</h1>
+              <h1 style={css("margin:0;font-size:20px;font-weight:700;letter-spacing:.01em;line-height:1.3;")}>リアルタイム文字起こし・共同校正システムCollaRecoX</h1>
               <p style={css("margin:3px 0 0;font-size:12.5px;color:#7b8794;")}>オンデバイス音声認識 ・ Chrome 端末内処理</p>
             </div>
           </div>

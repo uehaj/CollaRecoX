@@ -12,7 +12,7 @@ export function EditorHeader({ sessionId }: EditorHeaderProps) {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-light text-ink">リアルタイム文字起こし・共同校正システムCollaReco</h1>
+            <h1 className="text-lg font-light text-ink">リアルタイム文字起こし・共同校正システムCollaRecoX</h1>
             <p className="text-sm text-body mt-1">共同校正画面 ・ Session ID: {sessionId}</p>
           </div>
           <div className="flex items-center space-x-4">
