@@ -17,7 +17,6 @@ export function useKeyboardShortcuts(options: UseKeyboardShortcutsOptions): void
     onRewrite,
     onMarkdownEdit,
     onForceCommit,
-    onToggleHistory,
     onShowHelp,
     isInputFocused = false,
   } = options;
@@ -50,20 +49,12 @@ export function useKeyboardShortcuts(options: UseKeyboardShortcutsOptions): void
       category: 'feature',
     },
     {
-      key: 'h',
-      ctrl: true,
-      shift: true,
-      description: '編集履歴の表示切り替え',
-      handler: () => onToggleHistory?.(),
-      category: 'view',
-    },
-    {
       key: '?',
       description: 'ショートカットヘルプを表示',
       handler: () => onShowHelp?.(),
       category: 'view',
     },
-  ], [onRewrite, onMarkdownEdit, onForceCommit, onToggleHistory, onShowHelp]);
+  ], [onRewrite, onMarkdownEdit, onForceCommit, onShowHelp]);
 
   /**
    * ショートカットがマッチするかチェック

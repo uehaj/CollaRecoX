@@ -28,8 +28,6 @@ export interface UseKeyboardShortcutsOptions {
   onMarkdownEdit?: () => void;
   /** 強制コミットを実行するハンドラ */
   onForceCommit?: () => void;
-  /** 編集履歴の表示をトグルするハンドラ */
-  onToggleHistory?: () => void;
   /** ショートカットヘルプを表示するハンドラ */
   onShowHelp?: () => void;
   /** input/textarea要素にフォーカスがあるか（ショートカットを無効化するため） */

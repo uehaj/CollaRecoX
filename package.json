@@ -11,6 +11,7 @@
     "lint": "next lint",
     "test": "node --test tests/smoke/*.test.js",
     "test:smoke": "node --test tests/smoke/*.test.js",
+    "test:unit": "node --test tests/unit/*.test.js",
     "test:e2e": "node --test tests/e2e/*.test.js",
     "server": "node --localstorage-file=/tmp/node-localstorage server.js -p 5001",
     "server:prod": "NODE_ENV=production node --localstorage-file=/tmp/node-localstorage server.js -p 5001",

@@ -10,14 +10,20 @@ import { marked } from 'marked';
 import { DOMSerializer } from '@tiptap/pm/model';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
-import { ySyncPluginKey } from 'y-prosemirror';
+import { ySyncPluginKey, absolutePositionToRelativePosition, relativePositionToAbsolutePosition } from 'y-prosemirror';
 import * as Diff from 'diff';
 import { useKeyboardShortcuts } from '@/lib/hooks/useKeyboardShortcuts';
+import { useDictionary } from '@/lib/hooks/useDictionary';
 import { getBasePath } from '@/lib/basePath';
 import { addRecentSession } from '@/lib/recentSessions';
 import { useLeaveConfirmation } from '@/lib/useLeaveConfirmation';
 import { getBrowserLanguageModel, probeBrowserLlm, ensureBrowserLlmReady, type BrowserLlmState } from '@/lib/browserLlm';
+import { MINUTE_KINDS, MINUTE_KIND_ORDER, MinuteMark, isMinuteKind, type MinuteKind } from '@/lib/tiptap/minuteMark';
 import ShortcutHelpModal from './ShortcutHelpModal';
+import CorrectionDialog from './CorrectionDialog';
+import DictionaryModal from './DictionaryModal';
+import MinutesPane from './MinutesPane';
+import MinuteMarkPalette from './MinuteMarkPalette';
 
 // Custom UserUnderline Mark - スキーマ互換のため残すが、視覚効果はなし
 // 下線表示はProseMirror Decorationで管理する（Yjsとの干渉回避）
@@ -41,15 +47,6 @@ const UserUnderline = Mark.create({
     return ['span', {}, 0];
   },
 });
-
-// 2つの文字列の差分テキストを先頭一致で抽出（変更履歴プレビュー用）
-// base=短い方、changed=長い方、diffLength=長さの差
-const extractDiffPreview = (base: string, changed: string, diffLength: number): string => {
-  let start = 0;
-  while (start < base.length && changed[start] === base[start]) start++;
-  const extracted = changed.slice(start, start + diffLength);
-  return extracted.length > 30 ? extracted.slice(0, 30) + '...' : extracted;
-};
 
 // 編集追跡Decoration用PluginKey
 const editTrackKey = new PluginKey('editTrack');
@@ -195,16 +192,6 @@ interface CollaborativeEditorV2Props {
   sessionId: string;
 }
 
-// Change history entry type
-interface ChangeEntry {
-  id: string;
-  userName: string;
-  userColor: string;
-  action: 'insert' | 'delete' | 'modify';
-  content: string;
-  timestamp: Date;
-}
-
 // Connected user type
 interface ConnectedUser {
   id: string;
@@ -233,9 +220,24 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   const [protectedTailChars, setProtectedTailChars] = useState(0); // 青: AI再補正で上書きされる末尾文字数（編集禁止＋青字）
   const [greenTailChars, setGreenTailChars] = useState(0); // 緑: doc本文に入った校正待ち末尾文字数（編集禁止＋緑字。青の手前=末尾側）
   const [markMenu, setMarkMenu] = useState<{ x: number; y: number; id: string } | null>(null); // ハイライト右クリックメニュー（クリア/修正入力）
-  const [changeHistory, setChangeHistory] = useState<ChangeEntry[]>([]);
-  const [showHistory, setShowHistory] = useState(true);
-  const lastContentRef = useRef<string>('');
+  // 選択範囲の右クリックメニュー（「訂正して辞書登録」「議事録マーカー」。将来項目が増えても対応しやすいよう配列で描画する）
+  const [selectionMenu, setSelectionMenu] = useState<{
+    x: number; y: number; from: number; to: number; text: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    relFrom: any; relTo: any;
+    locked: boolean; // 編集ロック領域（緑+青の末尾レンジ）と交差しているか
+  } | null>(null);
+  // 議事録マーカー上の右クリックメニュー（解除のみ）
+  const [minuteMenu, setMinuteMenu] = useState<{ x: number; y: number; id: string; kind: MinuteKind } | null>(null);
+  // 「訂正して辞書登録」ダイアログの対象（選択メニューを閉じたあとも適用まで保持する）
+  const [correctionTarget, setCorrectionTarget] = useState<{
+    from: number; to: number; text: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    relFrom: any; relTo: any;
+  } | null>(null);
+  const [showDictionaryModal, setShowDictionaryModal] = useState(false);
+  const dictionary = useDictionary(); // 固有名詞辞書（collareco-dictionary doc）
+  const [showMinutes, setShowMinutes] = useState(true); // 議事録ペインの表示トグル（既定ON）
   const [connectedUsers, setConnectedUsers] = useState<ConnectedUser[]>([]);
   const userIdRef = useRef<string | null>(null);
 
@@ -477,13 +479,12 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       // 初期同期完了時に音声追記seqの基準値を現在値へ合わせる。
       // これをしないと、接続前にサーバ側で進んでいたseq（過去の音声追記分）を
       // 接続後の最初の編集で誤って消費してしまう。接続後に進んだ分だけが
-      // 下線・履歴の除外対象になるよう、両方のlastSeenをここで初期化する。
+      // 下線の除外対象になるよう、lastSeenをここで初期化する。
       hocusProvider.on('synced', () => {
         try {
           const seq = ydocRef.current?.getMap(`status-${sessionId}`)?.get('speechAppendSeq');
           if (typeof seq === 'number') {
             speechSeqUnderlineRef.current = seq;
-            speechSeqHistoryRef.current = seq;
             console.log('[EditTracker] 🔢 speechAppendSeq baseline initialized:', seq);
           }
         } catch (e) {
@@ -518,15 +519,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
   // サーバは音声由来の本文変更（確定テキスト追記・段落区切り）のたびに、その変更と
   // 同一Yjsトランザクションで status-map の speechAppendSeq を +1 する。
   // リモート変更の処理時に未消費のseq増分が残っていれば、その変更は音声認識からの
-  // 自動追記と確定でき、下線・変更履歴の対象から除外する。
+  // 自動追記と確定でき、下線の対象から除外する。
   //
   // 重要: 1回の発話でサーバが追記と段落区切りを連続して呼ぶとseqが+2以上進み、
   // editor側には複数のリモートtrが届く。そのため「seqが変わったか」ではなく
   // 「未消費の増分を1つずつ消費する」方式にする（変化検知方式だと2つ目以降の
   // リモートtrがすり抜けて下線が付いてしまう）。
-  // （下線用と履歴用は処理タイミングが別のため、最後に見たseqを個別に持つ）
   const speechSeqUnderlineRef = useRef<number>(-1);
-  const speechSeqHistoryRef = useRef<number>(-1);
 
   // 認識中（pending）インライン表示のspan要素（使い回してちらつきを防ぐ）
   const pendingSpanRef = useRef<HTMLSpanElement | null>(null);
@@ -536,6 +535,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
 
   // 本文スクロール領域: 自動追従スクロール＋手動操作時の停止＋▼ボタンで復帰
   const editorScrollRef = useRef<HTMLDivElement | null>(null);
+  // スクロール領域を包む相対配置コンテナ（議事録マーカーの段落ホバーパレットの絶対配置の基準）
+  const editorRelativeRef = useRef<HTMLDivElement | null>(null);
   const autoScrollRef = useRef<boolean>(true); // 自動追従モード（最下部に追従するか）
   const lastScrollHeightRef = useRef<number>(0); // 直前のscrollHeight（内容が増えたかの判定用）
   const [showScrollDown, setShowScrollDown] = useState(false); // ▼（最新へ移動）ボタンの表示
@@ -889,6 +890,8 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
           ];
         },
       }),
+      // 議事録マーカー: 校正エディタの本文に決定事項/宿題などの種別を付けるcustom mark（doc本体に載りYjsで自動共有される）
+      MinuteMark,
       // Add Link extension for handling links
       Link.configure({
         openOnClick: true,
@@ -940,51 +943,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
           console.warn('[EditTracker] ⚠️ Mark cleanup failed:', e);
         }
       }, 3000); // Yjs同期完了を待つ
-    },
-    onUpdate: ({ editor, transaction }) => {
-      const currentContent = editor.getText();
-
-      // 音声認識からの自動追記は変更履歴に残さない
-      // （比較基準だけ進めて、次の人の編集の差分計算に音声分が混ざらないようにする）
-      if (transaction.getMeta('addToHistory') === false && consumeSpeechAppendSeq(speechSeqHistoryRef)) {
-        lastContentRef.current = currentContent;
-        return;
-      }
-
-      const previousContent = lastContentRef.current;
-
-      if (currentContent !== previousContent) {
-        // Determine action type based on content length difference
-        let action: 'insert' | 'delete' | 'modify' = 'modify';
-        let content = '';
-
-        if (currentContent.length > previousContent.length) {
-          action = 'insert';
-          const diffLength = currentContent.length - previousContent.length;
-          const preview = extractDiffPreview(previousContent, currentContent, diffLength);
-          content = preview ? `"${preview}" (+${diffLength}文字)` : `+${diffLength}文字`;
-        } else if (currentContent.length < previousContent.length) {
-          action = 'delete';
-          const diffLength = previousContent.length - currentContent.length;
-          const preview = extractDiffPreview(currentContent, previousContent, diffLength);
-          content = preview ? `"${preview}" (-${diffLength}文字)` : `-${diffLength}文字`;
-        } else {
-          content = '内容を変更';
-        }
-
-        // Add to history (only for local changes)
-        const newEntry: ChangeEntry = {
-          id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          userName: userInfo.name,
-          userColor: userInfo.color,
-          action,
-          content,
-          timestamp: new Date(),
-        };
-
-        setChangeHistory(prev => [newEntry, ...prev].slice(0, 50)); // Keep last 50 entries
-        lastContentRef.current = currentContent;
-      }
     },
   }, [provider, userInfo, CollaborationExtension, CollaborationCursorExtension, modulesLoaded, sessionId]);
 
@@ -1078,30 +1036,80 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     catch (e) { console.warn('[Collaborative Editor V2] ⚠️ protectedTail update error:', e); }
   }, [editor, protectedTailChars, greenTailChars]);
 
-  // ハイライト(マーカー)上の右クリックでメニュー(クリア/修正入力)を開く。マーカー以外は通常の右クリック。
+  // 右クリックメニューの優先順位: 黄マーカー(data-mark-id) → 議事録マーカー(data-minute-id) → 選択範囲。
+  // 黄マーカー上はクリア/修正入力、議事録マーカー上は解除、選択範囲(非空)があれば「訂正して辞書登録」+議事録マーカー付与。
+  // 選択範囲が編集ロック領域(末尾の緑+青。protectedTailと同じ境界計算)と交差する場合は項目を無効化する。
+  // 閲覧モードでは議事録マーカー・選択メニューを出さない(黄マーカーメニューの既存動作は変えない)。
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
     const dom = editor.view.dom as HTMLElement;
     const onCtx = (e: MouseEvent) => {
       const el = (e.target as HTMLElement)?.closest?.('[data-mark-id]') as HTMLElement | null;
       const id = el?.getAttribute('data-mark-id');
-      if (!id) return;
+      if (id) {
+        e.preventDefault();
+        setSelectionMenu(null);
+        setMinuteMenu(null);
+        setMarkMenu({ x: e.clientX, y: e.clientY, id });
+        return;
+      }
+
+      const minuteEl = (e.target as HTMLElement)?.closest?.('[data-minute-id]') as HTMLElement | null;
+      const minuteId = minuteEl?.getAttribute('data-minute-id');
+      if (minuteId && !isReadOnly) {
+        const rawKind = minuteEl?.getAttribute('data-minute-kind');
+        const kind: MinuteKind = isMinuteKind(rawKind) ? rawKind : 'info';
+        e.preventDefault();
+        setMarkMenu(null);
+        setSelectionMenu(null);
+        setMinuteMenu({ x: e.clientX, y: e.clientY, id: minuteId, kind });
+        return;
+      }
+
+      if (isReadOnly) return;
+      const { from, to } = editor.state.selection;
+      if (from >= to) return; // 選択なし → ブラウザ既定メニュー
+      const text = editor.state.doc.textBetween(from, to, '\n');
+      if (!text.trim()) return;
+
+      // ロック領域(緑+青の末尾レンジ)との交差判定。protectedTailのfilterTransactionと同じ境界・同じ比較演算子。
+      const tailSt = (protectedTailKey.getState(editor.state) as { green?: number; blue?: number } | undefined) || {};
+      const lockFrom = lockStartPos(editor.state.doc, (tailSt.green || 0) + (tailSt.blue || 0));
+      const locked = to > lockFrom;
+
+      // 他ユーザーの編集があっても対象を追従できるよう、可能ならrelative positionも保持する(best-effort)。
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let relFrom: any = null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let relTo: any = null;
+      try {
+        const ystate = ySyncPluginKey.getState(editor.state);
+        if (ystate) {
+          relFrom = absolutePositionToRelativePosition(from, ystate.type, ystate.binding.mapping);
+          relTo = absolutePositionToRelativePosition(to, ystate.type, ystate.binding.mapping);
+        }
+      } catch (err) {
+        console.warn('[Dictionary] ⚠️ relative position計算に失敗:', err);
+      }
+
       e.preventDefault();
-      setMarkMenu({ x: e.clientX, y: e.clientY, id });
+      setMarkMenu(null);
+      setMinuteMenu(null);
+      setSelectionMenu({ x: e.clientX, y: e.clientY, from, to, text, relFrom, relTo, locked });
     };
     dom.addEventListener('contextmenu', onCtx);
     return () => dom.removeEventListener('contextmenu', onCtx);
-  }, [editor]);
+  }, [editor, isReadOnly]);
 
-  // メニューを開いている間: 画面クリック/Escで閉じる。
+  // メニュー(マーカー/選択/議事録マーカー)を開いている間: 画面クリック/Escで閉じる。
   useEffect(() => {
-    if (!markMenu) return;
-    const close = () => setMarkMenu(null);
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMarkMenu(null); };
+    if (!markMenu && !selectionMenu && !minuteMenu) return;
+    const close = () => { setMarkMenu(null); setSelectionMenu(null); setMinuteMenu(null); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
     window.addEventListener('click', close);
     window.addEventListener('keydown', onKey);
     return () => { window.removeEventListener('click', close); window.removeEventListener('keydown', onKey); };
-  }, [markMenu]);
+  }, [markMenu, selectionMenu, minuteMenu]);
 
   // 閲覧(リードオンリー)モード: Tiptapを編集不可にする。音声追記などのリモート更新は引き続き反映される。
   useEffect(() => {
@@ -1425,6 +1433,70 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     setMarkdownText('');
   };
 
+  // 訂正して辞書登録 - ダイアログの「適用」実行。
+  // 適用直前に対象範囲のテキストが選択時と一致するか検証し(他ユーザーの編集で変わっていないか)、
+  // 一致すれば本文を置換する。relative positionが取得できていれば、それで現在位置へ追従してから検証する。
+  const applyCorrection = (
+    target: { from: number; to: number; text: string; relFrom: unknown; relTo: unknown },
+    correctText: string,
+    registerToDictionary: boolean
+  ) => {
+    if (!editor) return;
+    let { from, to } = target;
+    try {
+      const ystate = ySyncPluginKey.getState(editor.state);
+      if (ystate && target.relFrom && target.relTo) {
+        const af = relativePositionToAbsolutePosition(ystate.doc, ystate.type, target.relFrom, ystate.binding.mapping);
+        const at = relativePositionToAbsolutePosition(ystate.doc, ystate.type, target.relTo, ystate.binding.mapping);
+        if (af !== null && at !== null && af < at) { from = af; to = at; }
+      }
+    } catch (err) {
+      console.warn('[Dictionary] ⚠️ relative position解決に失敗:', err);
+    }
+
+    const currentText = editor.state.doc.textBetween(from, to, '\n');
+    if (currentText !== target.text) {
+      // 他ユーザーの編集で対象範囲が変わっていた → 置換はスキップし、辞書登録のみ選べる
+      const stillRegister = registerToDictionary && window.confirm(
+        '対象の本文が他の編集で変わったため置換できません。「誤」の語句のみで辞書登録しますか？'
+      );
+      if (stillRegister) {
+        const result = dictionary.addEntry(target.text, correctText);
+        if (!result.ok) alert(`辞書登録に失敗しました: ${result.reason}`);
+      }
+      setCorrectionTarget(null);
+      return;
+    }
+
+    editor.chain().focus().insertContentAt({ from, to }, correctText).run();
+    if (registerToDictionary) {
+      const result = dictionary.addEntry(target.text, correctText);
+      if (!result.ok) alert(`本文は置換しましたが、辞書登録に失敗しました: ${result.reason}`);
+    }
+    setCorrectionTarget(null);
+  };
+
+  // 議事録マーカーの解除(右クリック→解除)。同じdata-minute-id(=mark.attrs.id)を持つ範囲全体を
+  // doc全体から収集し、1つのtransactionでまとめてremoveMarkする(MinutesPaneの×ボタンと同じアルゴリズム)。
+  // removeMarkは文字の挿入削除を伴わないため、ユーザーの選択位置は変更せずそのまま保持される。
+  const removeMinuteMarkById = (id: string) => {
+    if (!editor || isReadOnly) return;
+    const minuteMarkType = editor.state.schema.marks.minuteMark;
+    if (!minuteMarkType) return;
+    const ranges: Array<{ from: number; to: number }> = [];
+    editor.state.doc.descendants((node, pos) => {
+      if (!node.isText) return;
+      const hasMark = node.marks.some((mark) => mark.type.name === 'minuteMark' && mark.attrs.id === id);
+      if (hasMark) ranges.push({ from: pos, to: pos + node.nodeSize });
+    });
+    if (ranges.length === 0) return;
+    let tr = editor.state.tr;
+    for (const range of ranges) {
+      tr = tr.removeMark(range.from, range.to, minuteMarkType);
+    }
+    editor.view.dispatch(tr);
+  };
+
   // Force Commit - 音声バッファを強制的にコミット
   const handleForceCommit = () => {
     if (!ydocRef.current || isForceCommitPending || !isTranscribing) return;
@@ -1443,7 +1515,6 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
     onRewrite: handleRewrite,
     onMarkdownEdit: handleMarkdownEdit,
     onForceCommit: handleForceCommit,
-    onToggleHistory: () => setShowHistory(!showHistory),
     onShowHelp: () => setShowShortcutHelp(true),
   });
 
@@ -1469,6 +1540,61 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
       </div>
     );
   }
+
+  // 選択範囲の右クリックメニューの項目一覧(配列にしておくことで、今後の項目追加に対応しやすくする)。
+  // labelはReactNode(議事録マーカー項目は色チップ付きラベルにするため)。separatorBeforeは直前の項目との区切り線。
+  const selectionMenuItems: Array<{
+    key: string;
+    label: React.ReactNode;
+    disabled?: boolean;
+    disabledHint?: string;
+    separatorBefore?: boolean;
+    onSelect: () => void;
+  }> = selectionMenu ? [
+    {
+      key: 'correct-and-register',
+      label: '✏ 訂正して辞書登録',
+      disabled: selectionMenu.locked,
+      disabledHint: selectionMenu.locked ? '校正が確定してから訂正できます' : undefined,
+      onSelect: () => {
+        setCorrectionTarget({ from: selectionMenu.from, to: selectionMenu.to, text: selectionMenu.text, relFrom: selectionMenu.relFrom, relTo: selectionMenu.relTo });
+        setSelectionMenu(null);
+      },
+    },
+    // 議事録マーカー7種(MINUTE_KIND_ORDER順)。選択範囲全体にsetMinuteMarkを適用する(既存選択を明示的に再指定してから適用)。
+    ...MINUTE_KIND_ORDER.map((kind, index) => {
+      const kindMeta = MINUTE_KINDS[kind];
+      return {
+        key: `minute-${kind}`,
+        label: (
+          <span className={`flex items-center gap-1.5 ${selectionMenu.locked ? 'opacity-50' : ''}`}>
+            <span
+              className="inline-block w-2.5 h-2.5 rounded-full flex-shrink-0"
+              style={{ backgroundColor: kindMeta.border }}
+              aria-hidden
+            />
+            {kindMeta.label}
+          </span>
+        ),
+        disabled: selectionMenu.locked,
+        disabledHint: selectionMenu.locked ? '校正が確定してからマークできます' : undefined,
+        separatorBefore: index === 0,
+        onSelect: () => {
+          // relFrom/relTo から現在の絶対位置を解決し直す（コンテキストメニュー表示中に共同編集で位置がずれた場合に備える）
+          let from = selectionMenu.from;
+          let to = selectionMenu.to;
+          const ystate = ySyncPluginKey.getState(editor.state);
+          if (ystate && selectionMenu.relFrom && selectionMenu.relTo) {
+            const af = relativePositionToAbsolutePosition(ystate.doc, ystate.type, selectionMenu.relFrom, ystate.binding.mapping);
+            const at = relativePositionToAbsolutePosition(ystate.doc, ystate.type, selectionMenu.relTo, ystate.binding.mapping);
+            if (af != null && at != null) { from = af; to = at; }
+          }
+          editor.chain().focus().setTextSelection({ from, to }).setMinuteMark(kind).run();
+          setSelectionMenu(null);
+        },
+      };
+    }),
+  ] : [];
 
   return (
     <div className="space-y-4">
@@ -1678,6 +1804,13 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             >
               🔍 差分検証
             </button>
+            <button
+              onClick={() => setShowDictionaryModal(true)}
+              title="固有名詞辞書を管理します"
+              className="px-3 py-1 text-sm bg-surface text-ink border border-hairline rounded-md hover:bg-surface-soft transition-colors"
+            >
+              📖 辞書
+            </button>
             {!isReadOnly && (<>
             <button
               onClick={handleRewrite}
@@ -1714,7 +1847,7 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
         <div className="flex-1">
           <div className={`bg-surface rounded-lg shadow-sm border border-hairline editor-font-${fontSize}`}>
             {/* スクロール可能な本文ボックス（末尾自動追従／本文クリックで停止） */}
-            <div className="relative">
+            <div className="relative" ref={editorRelativeRef}>
               <div
                 ref={editorScrollRef}
                 onScroll={onEditorScroll}
@@ -1744,67 +1877,42 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
                   </svg>
                 </button>
               )}
+              {/* 段落ホバーで「＋」チップ→議事録マーカーの種別ポップオーバー（編集可能時のみ） */}
+              {!isReadOnly && (
+                <MinuteMarkPalette
+                  editor={editor}
+                  containerRef={editorRelativeRef}
+                  scrollRef={editorScrollRef}
+                  greenTailChars={greenTailChars}
+                  protectedTailChars={protectedTailChars}
+                />
+              )}
             </div>
           </div>
         </div>
 
-        {/* Change History Sidebar */}
-        {showHistory && (
-          <div className="w-80 flex-shrink-0">
-            <div className="bg-surface rounded-lg shadow-sm border border-hairline p-4 sticky top-4">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-medium text-ink">変更履歴</h3>
-                <button
-                  onClick={() => setShowHistory(false)}
-                  className="text-muted hover:text-body transition-colors"
-                >
-                  ×
-                </button>
-              </div>
-              <div className="space-y-3 max-h-[500px] overflow-y-auto">
-                {changeHistory.length === 0 ? (
-                  <p className="text-muted text-sm">変更履歴はありません</p>
-                ) : (
-                  changeHistory.map((entry) => (
-                    <div key={entry.id} className="border-l-2 pl-3 py-1" style={{ borderColor: entry.userColor }}>
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-2">
-                          <div
-                            className="w-2 h-2 rounded-full"
-                            style={{ backgroundColor: entry.userColor }}
-                          ></div>
-                          <span className="text-xs font-medium text-muted">{entry.userName}</span>
-                        </div>
-                        <span className="text-xs text-muted">
-                          {entry.timestamp.toLocaleTimeString('ja-JP')}
-                        </span>
-                      </div>
-                      <div className="text-sm mt-0.5">
-                        <span className={`text-xs font-medium px-1 py-0.5 rounded ${
-                          entry.action === 'insert' ? 'bg-success/10 text-success' :
-                          entry.action === 'delete' ? 'bg-error/10 text-error' :
-                          'bg-celadon-soft text-celadon-active'
-                        }`}>
-                          {entry.action === 'insert' ? '追加' : entry.action === 'delete' ? '削除' : '変更'}
-                        </span>
-                        <span className="ml-1.5 text-body text-sm break-all">{entry.content}</span>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
+        {/* 議事録ペイン（右・既定表示。閲覧モードでも閲覧・コピーは可能なので常に描画対象） */}
+        {showMinutes && (
+          <div className="w-96 flex-shrink-0">
+            <MinutesPane
+              editor={editor}
+              sessionId={sessionId}
+              participants={connectedUsers.map((user) => user.name)}
+              isReadOnly={isReadOnly}
+              onClose={() => setShowMinutes(false)}
+            />
           </div>
         )}
       </div>
 
-      {/* Toggle History Button (when hidden) */}
-      {!showHistory && (
+      {/* 議事録ペインの再表示ボタン（非表示中のみ。旧・履歴ペインのトグルと同じ操作感） */}
+      {!showMinutes && (
         <button
-          onClick={() => setShowHistory(true)}
-          className="fixed right-4 top-1/2 transform -translate-y-1/2 px-2 py-4 bg-celadon text-on-celadon rounded-l-lg shadow-sm hover:bg-celadon-active transition-colors"
+          onClick={() => setShowMinutes(true)}
+          title="議事録を表示"
+          className="fixed right-4 top-1/2 -translate-y-1/2 px-2 py-4 bg-celadon text-on-celadon rounded-l-lg shadow-sm hover:bg-celadon-active transition-colors"
         >
-          履歴
+          議事録
         </button>
       )}
 
@@ -1840,6 +1948,71 @@ export default function CollaborativeEditorV2({ sessionId }: CollaborativeEditor
             🗑 クリア（マーカー削除）
           </button>
         </div>
+      )}
+
+      {/* 選択範囲の右クリックメニュー（訂正して辞書登録＋議事録マーカー7種。将来項目が増えても対応しやすい配列駆動） */}
+      {selectionMenu && editor && (
+        <div
+          className="fixed z-[60] bg-surface border border-hairline rounded-md shadow-md py-1 text-sm text-body"
+          style={{ left: selectionMenu.x, top: selectionMenu.y, minWidth: '220px' }}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {selectionMenuItems.map((item) => (
+            <React.Fragment key={item.key}>
+              {item.separatorBefore && <div className="my-1 border-t border-hairline" />}
+              <button
+                disabled={item.disabled}
+                title={item.disabled ? item.disabledHint : undefined}
+                className={`block w-full text-left px-3 py-1.5 ${item.disabled ? 'text-muted-soft cursor-not-allowed' : 'hover:bg-surface-soft'}`}
+                onClick={() => { if (!item.disabled) item.onSelect(); }}
+              >
+                {item.label}
+              </button>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
+
+      {/* 議事録マーカー上の右クリックメニュー（解除のみ） */}
+      {minuteMenu && editor && (
+        <div
+          className="fixed z-[60] bg-surface border border-hairline rounded-md shadow-md py-1 text-sm text-body"
+          style={{ left: minuteMenu.x, top: minuteMenu.y, minWidth: '200px' }}
+          onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            className="block w-full text-left px-3 py-1.5 hover:bg-surface-soft text-error"
+            onClick={() => {
+              removeMinuteMarkById(minuteMenu.id);
+              setMinuteMenu(null);
+            }}
+          >
+            {MINUTE_KINDS[minuteMenu.kind].label}のマーカーを解除
+          </button>
+        </div>
+      )}
+
+      {/* 訂正して辞書登録ダイアログ */}
+      {correctionTarget && (
+        <CorrectionDialog
+          wrongText={correctionTarget.text}
+          onCancel={() => setCorrectionTarget(null)}
+          onApply={(correctText, registerToDictionary) => applyCorrection(correctionTarget, correctText, registerToDictionary)}
+        />
+      )}
+
+      {/* 辞書管理モーダル */}
+      {showDictionaryModal && (
+        <DictionaryModal
+          entries={dictionary.entries}
+          addEntry={dictionary.addEntry}
+          removeEntry={dictionary.removeEntry}
+          status={dictionary.status}
+          isReadOnly={isReadOnly}
+          onClose={() => setShowDictionaryModal(false)}
+        />
       )}
 
       {/* AI Edit Modal */}

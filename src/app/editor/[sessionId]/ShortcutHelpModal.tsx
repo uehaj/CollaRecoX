@@ -109,10 +109,6 @@ export default function ShortcutHelpModal({
                 keys={[modifierKey, 'Enter']}
                 description="強制コミット（手動区切り）"
               />
-              <ShortcutRow
-                keys={[modifierKey, 'Shift', 'H']}
-                description="編集履歴の表示切り替え"
-              />
             </div>
           </section>
 

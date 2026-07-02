@@ -237,3 +237,20 @@ h1, h2, h3, h4 { color: var(--color-ink); font-weight: 400; letter-spacing: -0.0
   margin-top: 1em;
   margin-bottom: 0.5em;
 }
+
+/* ─── 議事録マーカー（minuteMark） ─── */
+/* 種別・配色の真実源は src/lib/tiptap/minuteMark.ts の MINUTE_KINDS（bg/border と対応）。
+   淡背景＋下ボーダーで種別を示す。緑 #3fa874（校正待ち）・青 #2563eb（再補正対象）・
+   黄（利用者マーカー）・青磁（選択色）と目視で区別できる配色にしている。 */
+.ProseMirror .minute-mark {
+  border-radius: 2px;
+  padding-bottom: 1px;
+  border-bottom: 2px solid transparent;
+}
+.ProseMirror .minute-mark--decision { background-color: #fde8e8; border-bottom-color: #d64545; } /* 決定事項: 赤 */
+.ProseMirror .minute-mark--action   { background-color: #ffe9d6; border-bottom-color: #e07020; } /* 宿題: 橙 */
+.ProseMirror .minute-mark--concern  { background-color: #fce4ef; border-bottom-color: #d6499b; } /* 懸案事項: 桃 */
+.ProseMirror .minute-mark--plan     { background-color: #ece6fb; border-bottom-color: #7a5cd0; } /* 予定: 紫 */
+.ProseMirror .minute-mark--actual   { background-color: #f0e7db; border-bottom-color: #96703d; } /* 実績: 茶 */
+.ProseMirror .minute-mark--next     { background-color: #f9e4fb; border-bottom-color: #b249c4; } /* 次回予定: 赤紫 */
+.ProseMirror .minute-mark--info     { background-color: #e9edf0; border-bottom-color: #64748b; } /* 報告・共有: 灰 */

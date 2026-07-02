@@ -5,6 +5,7 @@
 ## 概要
 
 各セッションは `transcribe-editor-v2-{sessionId}` という名前のYJSドキュメントとして管理されます。
+このほかに、全セッション共通のグローバルな辞書ドキュメント `collareco-dictionary` があります。
 
 ## データ構造
 
@@ -13,18 +14,51 @@
 │
 ├── content-{sessionId}   : XmlFragment
 │   └── Tiptap/ProseMirrorのドキュメントコンテンツ
+│       （議事録マーカー minuteMark を含む。下記「議事録マーカー」参照）
 │
 ├── status-{sessionId}    : Map
 │   └── isTranscribing: boolean  // 文字起こし中かどうか
 │
-└── users-{sessionId}     : Map
-    └── {userId}: {
-          id: string,         // ユーザーID
-          name: string,       // ユーザー表示名
-          color: string,      // ユーザー色（カーソル表示用）
-          joinedAt: number    // 接続時刻（UNIX timestamp）
+├── users-{sessionId}     : Map
+│   └── {userId}: {
+│         id: string,         // ユーザーID
+│         name: string,       // ユーザー表示名
+│         color: string,      // ユーザー色（カーソル表示用）
+│         joinedAt: number    // 接続時刻（UNIX timestamp）
+│       }
+│
+└── raw-{sessionId}       : Text
+    └── 校正前の確定生テキスト（差分検証用の原本。追記専用）
+
+グローバル: collareco-dictionary（全セッション共通・固有名詞辞書）
+│
+└── entries : Map
+    └── {誤（wrong）}: {
+          correct: string,    // 正しい表記
+          createdAt: number   // 登録日時（UNIX timestamp ms）
         }
 ```
+
+### 固有名詞辞書（collareco-dictionary）
+
+- 校正画面の「✏ 訂正して辞書登録」や「📖 辞書」モーダルから編集され、
+  server.js がAI校正プロンプトに注入する（`src/lib/dictionaryCore.js` が単一の共有ロジック）。
+- server.js が起動時に direct connection で常駐させ、変更をデバウンスして
+  `data/dictionary.json` に永続化する（サーバー再起動後も復元される。git管理外）。
+- 上限1000件（超過時は古い順に削除）。プロンプト注入は新しい順100件まで。
+
+### 議事録マーカー（minuteMark）
+
+`content-{sessionId}` 内の Tiptap カスタム mark として保持される（＝本文と一緒に全参加者へ同期）。
+
+| 属性 | 型 | 説明 |
+|------|------|------|
+| `kind` | string | 種別: decision / action / concern / plan / actual / next / info（`src/lib/tiptap/minuteMark.ts` の `MINUTE_KINDS` が真実源） |
+| `id` | string | 項目のグルーピング用の一意ID（同一idのランを議事録の1項目に結合） |
+| `createdAt` | number | 付与日時（UNIX timestamp ms） |
+
+校正画面右の議事録ペイン（MinutesPane）は、この mark を本文出現順に走査して
+種別セクションへ投影する純粋なビューであり、独自のYjs構造は持たない。
 
 ## 各フィールドの説明
 
