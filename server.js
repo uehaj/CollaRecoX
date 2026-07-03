@@ -7,6 +7,8 @@ const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 if (!process.env.OPENAI_API_KEY) {
   console.error('❌ ERROR: OPENAI_API_KEY environment variable is required');
@@ -719,6 +721,144 @@ app.prepare().then(() => {
     }
   }
 
+  // ===== 固有名詞辞書（永続化 + AI校正プロンプトへの注入） =====
+  // 設計: docs/superpowers/specs/2026-07-02-dictionary-and-minutes-design.html セクション1.2/1.3
+  // 共有方法: 専用のグローバル Yjs doc 'collareco-dictionary' の Y.Map('entries')
+  //           （キー=誤wrong、値={correct, createdAt}）。新規RESTルートは追加しない。
+  // doc常駐: openDirectConnection したまま二度と disconnect しない。Hocuspocus は
+  //          document.getConnectionsCount()===0 のときのみ unloadDocument するため
+  //          （@hocuspocus/server v3.2.3 Hocuspocus.ts unloadDocument 参照）、この
+  //          direct connection を1本保持し続けるだけで、利用者WS接続の有無に関わらず
+  //          docがアンロード・GCされることはない。onAuthenticateは direct connection には
+  //          呼ばれず（ClientConnection経由のWS接続のみ）、既存実装もdocumentNameで
+  //          拒否していないため辞書doc名を明示的に許可する変更は不要（確認済み）。
+  const dictionaryCore = require('./src/lib/dictionaryCore.js');
+  const DICTIONARY_DOC_NAME = 'collareco-dictionary';
+  const DICTIONARY_DIR = path.join(__dirname, 'data');
+  const DICTIONARY_FILE = path.join(DICTIONARY_DIR, 'dictionary.json');
+  const DICTIONARY_SAVE_DEBOUNCE_MS = 1000;
+  const DICTIONARY_PRUNE_ORIGIN = 'dictionary-prune'; // pruneの自己delete transactionの目印（observer内の再prune抑止用）
+
+  let dictionaryEntriesMap = null;       // Y.Map('entries')（初期化後は常駐）
+  let dictionaryEntriesMirror = [];      // プロンプト注入用ミラー（DictionaryEntry[]）。校正のたびにY.Mapは舐めない
+  let dictionarySaveTimer = null;
+  let dictionarySaveSeq = 0;             // 一時ファイル名のユニーク化
+  let saveQueue = Promise.resolve();     // 保存を直列化するPromiseチェーン（古い rename が新しい結果を上書きしないようにする）
+  let dictionaryDirectConnection = null; // 保持したまま disconnect しない（doc常駐のため）
+
+  // Y.Map('entries') の内容を平易な配列ミラーへ再構築する（変更のたびにO(n)。上限1000件なので軽量）
+  function rebuildDictionaryMirror() {
+    if (!dictionaryEntriesMap) { dictionaryEntriesMirror = []; return; }
+    const next = [];
+    dictionaryEntriesMap.forEach((value, wrong) => {
+      if (value && typeof value.correct === 'string' && typeof value.createdAt === 'number') {
+        next.push({ wrong, correct: value.correct, createdAt: value.createdAt });
+      }
+    });
+    dictionaryEntriesMirror = next;
+  }
+
+  // 約1秒デバウンスして data/dictionary.json へ保存する（保存はキューで直列化）
+  function scheduleDictionarySave() {
+    if (dictionarySaveTimer) clearTimeout(dictionarySaveTimer);
+    dictionarySaveTimer = setTimeout(() => {
+      dictionarySaveTimer = null;
+      // スナップショットと seq をここで確定してから saveQueue に連結する（古いスナップショットで上書きしない）
+      const snapshot = JSON.stringify(dictionaryEntriesMirror, null, 2);
+      const seq = (dictionarySaveSeq = (dictionarySaveSeq + 1) | 0);
+      saveQueue = saveQueue.catch(() => {}).then(() => saveSnapshot(snapshot, seq));
+    }, DICTIONARY_SAVE_DEBOUNCE_MS);
+  }
+
+  // 一時ファイル書き込み→rename のアトミック書き込みで保存する。失敗してもログのみ（辞書はメモリ上のdocで動作継続）
+  async function saveSnapshot(snapshot, seq) {
+    const tmpFile = `${DICTIONARY_FILE}.${process.pid}.${seq}.tmp`;
+    try {
+      await fs.promises.mkdir(DICTIONARY_DIR, { recursive: true });
+      await fs.promises.writeFile(tmpFile, snapshot, 'utf8');
+      await fs.promises.rename(tmpFile, DICTIONARY_FILE);
+      const count = JSON.parse(snapshot).length;
+      console.log(`[Dictionary] 💾 ${count}件を保存しました`);
+    } catch (e) {
+      console.error('[Dictionary] ❌ 辞書ファイルの保存に失敗しました（動作は継続）:', e.message);
+      fs.promises.unlink(tmpFile).catch(() => {}); // 書きかけの一時ファイルの残骸を片付ける（失敗は無視）
+    }
+  }
+
+  // 上限(DICT_LIMITS.maxEntries)超過分をcreatedAtの古い順にY.Mapから削除する。
+  // 削除トランザクションにDICTIONARY_PRUNE_ORIGINを付け、observer側で自己トリガーの再prune判定をスキップする
+  // （ガードが無くても drop で必ず上限内に収まるため無限ループにはならないが、無駄な再帰呼び出しを避ける）。
+  function pruneDictionaryIfNeeded() {
+    if (!dictionaryEntriesMap) return;
+    const { maxEntries } = dictionaryCore.DICT_LIMITS;
+    if (dictionaryEntriesMirror.length <= maxEntries) return;
+    const { drop } = dictionaryCore.pruneOldest(dictionaryEntriesMirror, maxEntries);
+    if (drop.length === 0) return;
+    console.warn(`[Dictionary] ⚠️ 上限(${maxEntries}件)超過のため古い${drop.length}件を削除します`);
+    dictionaryDirectConnection.document.transact(() => {
+      for (const entry of drop) {
+        dictionaryEntriesMap.delete(entry.wrong);
+      }
+    }, DICTIONARY_PRUNE_ORIGIN);
+  }
+
+  // Y.Map('entries') の変更監視: ミラー更新 → 保存デバウンス → （自己トリガーでなければ）上限チェックの順で行う
+  function onDictionaryEntriesChanged(_event, transaction) {
+    rebuildDictionaryMirror();
+    scheduleDictionarySave();
+    if (transaction && transaction.origin === DICTIONARY_PRUNE_ORIGIN) return; // prune自身の削除で再度pruneを呼ばない
+    pruneDictionaryIfNeeded();
+  }
+
+  // data/dictionary.json（[{wrong, correct, createdAt}, ...]）を読み込む。存在しない/壊れている場合は空配列で継続する。
+  async function loadDictionaryFromDisk() {
+    let raw;
+    try {
+      raw = await fs.promises.readFile(DICTIONARY_FILE, 'utf8');
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        console.warn('[Dictionary] ⚠️ 辞書ファイルの読込に失敗したため空辞書で起動します:', e.message);
+      }
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) throw new Error('JSON root is not an array');
+      return parsed.filter((e) =>
+        e && typeof e.wrong === 'string' && typeof e.correct === 'string' && typeof e.createdAt === 'number'
+      );
+    } catch (e) {
+      console.warn('[Dictionary] ⚠️ 辞書ファイルの形式が不正なため空辞書で起動します:', e.message);
+      return [];
+    }
+  }
+
+  // 起動時に辞書docを開いて常駐させ、data/dictionary.json から復元する。
+  async function initDictionary() {
+    dictionaryDirectConnection = await hocuspocus.openDirectConnection(DICTIONARY_DOC_NAME, {});
+    const dictDocument = dictionaryDirectConnection.document;
+    dictionaryEntriesMap = dictDocument.getMap('entries');
+
+    // observerを先に登録してからロードする（ロードもobserver経由でミラー構築・上限チェックを受ける）
+    rebuildDictionaryMirror();
+    dictionaryEntriesMap.observe(onDictionaryEntriesChanged);
+
+    if (dictionaryEntriesMap.size === 0) {
+      const loaded = await loadDictionaryFromDisk();
+      if (loaded.length > 0) {
+        dictDocument.transact(() => {
+          for (const entry of loaded) {
+            dictionaryEntriesMap.set(entry.wrong, { correct: entry.correct, createdAt: entry.createdAt });
+          }
+        });
+      }
+    }
+
+    console.log(`[Dictionary] 📖 初期化完了: ${dictionaryEntriesMirror.length}件（doc=${DICTIONARY_DOC_NAME}）`);
+  }
+
+  initDictionary().catch((e) => console.error('[Dictionary] ❌ 初期化に失敗しました（辞書機能なしで続行）:', e));
+
   // ===== 自動校正 =====
   // 前回校正済み位置から「最後から2番目」までの段落範囲に対して、誤字修正と
   // 冪等なパラグラフ整理を行う。最後の段落は音声の追記中のため対象に含めない。
@@ -776,6 +916,8 @@ app.prepare().then(() => {
   function buildProofreadMessages(text, overlapText = '') {
     // 役割: 段落分割は機械処理(mechanicalSplit)が済ませている。AIは「誤って割れた行の結合」と
     // 「誤字・句読点」だけを担い、新たな分割はしない（ミス分割の結合に特化したプロンプト）。
+    // 固有名詞辞書（あれば）をプロンプトへ独立節として注入する（空なら空文字列＝節を追加しない）。
+    const dictionarySection = dictionaryCore.buildDictionaryPromptSection(dictionaryEntriesMirror);
     const systemPrompt = `あなたは日本語の会議文字起こしを整える校正アシスタントです。
 【校正対象】には、機械処理で改行（段落区切り）が挿入されています。改行が正しい位置とは限らず、一文の途中で割れていることがあります。
 
@@ -792,7 +934,7 @@ app.prepare().then(() => {
 - 認識ミスらしく、正しい語を文脈から確信を持って復元できない語句は、推測で別の語に書き換えたり削除したりせず、その語の認識結果（実際に入力された文字列）をそのまま半角の [ ] で囲んで残す。このとき「元の語」のような語句は絶対に書かず、必ず実際の文字列を [ ] の中に入れること（具体例は下記「不明瞭語の扱いの例」を参照）。文の枠（「〜というところ」等）の中にあっても、その語自体に確信が持てなければ囲む。明確に直せる誤字脱字だけ修正する
 - すでに [ ] で囲まれている箇所は変更せず、そのまま維持する（二重に囲まない）
 - 末尾が文の途中なら勝手に完結させない（続きは次回送られてくる）
-
+${dictionarySection ? `\n${dictionarySection}\n` : ''}
 不明瞭語の扱いの例（認識ミスらしく正しい語が復元できない部分は [ ] で囲んで原文保持。削除も推測書き換えもしない）:
 - 入力: それでですねぐぬぐぬあーっていう仕組みについて話します
 - 出力: それでですね[ぐぬぐぬあー]という仕組みについて話します

@@ -92,6 +92,9 @@ transcribe@*
 *.pid
 workdir/
 
+# Dictionary persistence data（固有名詞辞書の永続化ファイル）
+data/
+
 # Claude Code
 .claude/
 !.claude/skills/
